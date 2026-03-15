@@ -179,7 +179,7 @@ static std::wstring             g_nodeName;
 // Forward declarations
 static void TogglePanel();
 static void ClosePanel();
-static void RefreshEdits();
+static void RefreshEdits(bool forceAll = false);
 static void ApplyEdit(HWND h);
 
 // ── Mouse side-button hook ──────────────────────────────────────
@@ -350,7 +350,9 @@ static void FormatValue(const EditField& ef, TimeValue t, TCHAR* buf, int len) {
     }
 }
 
-static void RefreshEdits() {
+// forceAll=true: update every field including focused (used after wheel/toggle)
+// forceAll=false: skip focused field (used by timer, so we don't clobber typing)
+static void RefreshEdits(bool forceAll) {
     Interface* ip = GetCOREInterface();
     if (!ip) return;
     if (ip->GetSelNodeCount() == 0) { ClosePanel(); return; }
@@ -362,11 +364,28 @@ static void RefreshEdits() {
     TimeValue t = ip->GetTime();
     HWND focused = GetFocus();
     for (auto& ef : g_edits) {
-        if (ef.hwnd == focused) continue;
+        if (!forceAll && ef.hwnd == focused) continue;
         TCHAR buf[64];
         FormatValue(ef, t, buf, 64);
         SetWindowText(ef.hwnd, buf);
     }
+}
+
+// ── Notify scene after param change ─────────────────────────────
+static void NotifyParamChanged() {
+    Interface* ip = GetCOREInterface();
+    if (!ip) return;
+    TimeValue t = ip->GetTime();
+
+    // Invalidate the selected node so geometry recalculates
+    if (ip->GetSelNodeCount() > 0) {
+        INode* node = ip->GetSelNode(0);
+        if (node) {
+            node->InvalidateWS();
+            node->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
+        }
+    }
+    ip->RedrawViews(t);
 }
 
 // ── Apply edited value ──────────────────────────────────────────
@@ -388,7 +407,7 @@ static void ApplyEdit(HWND h) {
         } else {
             ef.pb->SetValue(ef.id, t, _wtoi(txt));
         }
-        ip->RedrawViews(t);
+        NotifyParamChanged();
         break;
     }
 }
@@ -399,7 +418,7 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
     switch (msg) {
     case WM_KEYDOWN:
-        if (wp == VK_RETURN)  { ApplyEdit(h); RefreshEdits(); return 0; }
+        if (wp == VK_RETURN)  { ApplyEdit(h); RefreshEdits(true); return 0; }
         if (wp == VK_ESCAPE)  { ClosePanel(); return 0; }
         if (wp == VK_TAB)     { SetFocus(GetNextDlgTabItem(g_panel, h, GetKeyState(VK_SHIFT) < 0)); return 0; }
         break;
@@ -432,8 +451,8 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (intStep == 0) intStep = step > 0 ? 1 : -1;
             ef->pb->SetValue(ef->id, t, cur + intStep);
         }
-        RefreshEdits();
-        ip->RedrawViews(t);
+        RefreshEdits(true);   // forceAll — update the field we're scrolling on
+        NotifyParamChanged();
         return 0;
     }
 
@@ -442,8 +461,8 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             Interface* ip = GetCOREInterface();
             TimeValue t = ip->GetTime();
             ef->pb->SetValue(ef->id, t, ef->pb->GetInt(ef->id, t) ? 0 : 1);
-            RefreshEdits();
-            ip->RedrawViews(t);
+            RefreshEdits(true);
+            NotifyParamChanged();
             return 0;
         }
         break;
