@@ -174,16 +174,17 @@ static RECT     g_closeRect  = {};
 
 static const UINT WM_WALKER_TOGGLE = WM_USER + 100;
 
-// EPoly undo+reapply state
-static int          g_epolyOp  = -1;       // last detected operation ID
-static FPInterface* g_epolyFP  = nullptr;  // EPoly FP interface for re-executing
+// EPoly undo+reapply state — one-shot, killed on close
+static int          g_epolyOp    = -1;
+static FPInterface* g_epolyFP    = nullptr;
+static bool         g_tryEPoly   = true;    // gate: only try EPoly detection once
 
 static std::vector<EditField>   g_edits;
 static std::vector<GroupHeader> g_groups;
 static std::wstring             g_nodeName;
 
 // Forward declarations
-static void TogglePanel();
+static void TogglePanel(bool fresh = false);
 static void ClosePanel();
 static void RefreshEdits(bool forceAll = false);
 static void ApplyEdit(HWND h);
@@ -197,7 +198,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             HWND fg = GetForegroundWindow();
             Interface* ip = GetCOREInterface();
             if (ip && (fg == ip->GetMAXHWnd() || IsChild(ip->GetMAXHWnd(), fg) || fg == g_panel)) {
-                PostMessage(g_panel, WM_WALKER_TOGGLE, 0, 0);
+                PostMessage(g_panel, WM_WALKER_TOGGLE, 1, 0);  // 1 = fresh EPoly detection
                 return 1;
             }
         }
@@ -306,20 +307,20 @@ static void GatherParams() {
     Object* obj = node->GetObjectRef();
     if (!obj) return;
 
-    // ── Priority: EPoly last-operation params ───────────────────
-    // Check modifiers first (Edit Poly modifier)
-    Object* walk = obj;
-    while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-        IDerivedObject* d = static_cast<IDerivedObject*>(walk);
-        for (int m = 0; m < d->NumModifiers(); m++) {
-            if (TryEPolyParams(d->GetModifier(m))) return;
+    // ── One-shot EPoly detection (only on first open) ──────────
+    if (g_tryEPoly) {
+        Object* walk = obj;
+        while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+            IDerivedObject* d = static_cast<IDerivedObject*>(walk);
+            for (int m = 0; m < d->NumModifiers(); m++) {
+                if (TryEPolyParams(d->GetModifier(m))) return;
+            }
+            walk = d->GetObjRef();
         }
-        walk = d->GetObjRef();
+        if (walk && TryEPolyParams(walk)) return;
     }
-    // Check base object (Editable Poly)
-    if (walk && TryEPolyParams(walk)) return;
 
-    // ── Fallback: generic all-params ────────────────────────────
+    // ── Generic all-params ──────────────────────────────────────
     obj = node->GetObjectRef();
     while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
         IDerivedObject* d = static_cast<IDerivedObject*>(obj);
@@ -600,6 +601,16 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND:
         return 1;
 
+    case WM_ACTIVATE:
+        if (LOWORD(wp) == WA_INACTIVE && g_open) {
+            // Click outside → close and forget everything
+            PostMessage(hwnd, WM_USER + 101, 0, 0);
+        }
+        return 0;
+
+    case WM_USER + 101:
+        ClosePanel(); return 0;
+
     case WM_NCHITTEST: {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         ScreenToClient(hwnd, &pt);
@@ -658,7 +669,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
 
     case WM_WALKER_TOGGLE:
-        TogglePanel(); return 0;
+        TogglePanel(wp != 0); return 0;  // wp=1 from mouse hook = fresh
     }
     return DefWindowProc(hwnd, msg, wp, lp);
 }
@@ -748,6 +759,7 @@ static void ClosePanel() {
     g_hoverClose = false;
     g_epolyOp = -1;
     g_epolyFP = nullptr;
+    g_tryEPoly = false;   // killed — next open always goes generic
 
     EnableAccelerators();
 
@@ -755,15 +767,19 @@ static void ClosePanel() {
     if (ip) SetFocus(ip->GetMAXHWnd());
 }
 
-static void TogglePanel() {
-    if (g_open) ClosePanel(); else OpenPanel();
+// fresh=true re-arms EPoly detection (mouse side button)
+// fresh=false opens generic only (keyboard shortcut re-open)
+static void TogglePanel(bool fresh) {
+    if (g_open) { ClosePanel(); return; }
+    if (fresh) g_tryEPoly = true;
+    OpenPanel();
 }
 
 // ── Action system ───────────────────────────────────────────────
 class WalkerAction : public ActionItem {
 public:
     int   GetId() override { return kToggleId; }
-    BOOL  ExecuteAction() override { TogglePanel(); return TRUE; }
+    BOOL  ExecuteAction() override { TogglePanel(true); return TRUE; }
     void  GetButtonText(MSTR& t) override { t = WALKER_NAME; }
     void  GetMenuText(MSTR& t) override { t = _T("Toggle Walker Panel"); }
     void  GetDescriptionText(MSTR& t) override { t = _T("Show/hide Walker floating parameter panel"); }
@@ -777,7 +793,7 @@ public:
 class WalkerActionCB : public ActionCallback {
 public:
     BOOL ExecuteAction(int id) override {
-        if (id == kToggleId) { TogglePanel(); return TRUE; }
+        if (id == kToggleId) { TogglePanel(true); return TRUE; }
         return FALSE;
     }
 };
