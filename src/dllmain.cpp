@@ -238,10 +238,16 @@ static void CollectParams(IParamBlock2* pb, int& total) {
 static bool TryEPolyParams(Animatable* owner) {
     if (!owner) return false;
 
-    FPInterface* fp = (FPInterface*)owner->GetInterface(EPOLY_INTERFACE);
-    if (!fp) return false;
+    // Cast to EPoly — getParamBlock() is public on EPoly
+    EPoly* ep = (EPoly*)owner->GetInterface(EPOLY_INTERFACE);
+    if (!ep) return false;
 
-    // Call via FP dispatch — these virtuals are private
+    // Get the EPoly-specific param block (NOT Animatable::GetParamBlock)
+    IParamBlock2* pb = ep->getParamBlock();
+    if (!pb) return false;
+
+    // Call via FP dispatch — EpfnGetLastOperation is private
+    FPInterface* fp = (FPInterface*)ep;
     FPValue lastOpVal, selLevelVal;
     fp->Invoke(epfn_get_last_operation, lastOpVal);
     fp->Invoke(epfn_get_epoly_sel_level, selLevelVal);
@@ -252,17 +258,6 @@ static bool TryEPolyParams(Animatable* owner) {
     std::wstring opTitle;
     const OpParam* params = LookupOp(lastOp, selLevel, paramCount, opTitle);
     if (!params || paramCount == 0) return false;
-
-    // Find the param block containing these IDs
-    IParamBlock2* pb = nullptr;
-    for (int b = 0; b < owner->NumParamBlocks(); b++) {
-        IParamBlock2* candidate = owner->GetParamBlock(b);
-        if (candidate && candidate->IDtoIndex(params[0].pid) >= 0) {
-            pb = candidate;
-            break;
-        }
-    }
-    if (!pb) return false;
 
     GroupHeader gh;
     gh.title    = opTitle;
@@ -280,9 +275,8 @@ static bool TryEPolyParams(Animatable* owner) {
 
     gh.count = (int)g_edits.size() - gh.startIdx;
     if (gh.count > 0) {
-        // Only arm undo+reapply if we successfully gathered operation params
         g_epolyOp = lastOp;
-        g_epolyFP = fp;
+        g_epolyFP = (FPInterface*)ep;
         g_groups.push_back(gh);
         return true;
     }
@@ -656,6 +650,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         if (HIWORD(wp) == EN_KILLFOCUS) {
+            // Auto-apply when clicking away — no need to hit Enter
+            if (g_open) ApplyEdit((HWND)lp);
             EnableAccelerators();
             InvalidateRect(hwnd, nullptr, FALSE);
         }
