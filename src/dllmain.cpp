@@ -247,10 +247,6 @@ static bool TryEPolyParams(Animatable* owner) {
     int lastOp   = lastOpVal.i;
     int selLevel = selLevelVal.i;
 
-    // Store for undo+reapply
-    g_epolyOp = lastOp;
-    g_epolyFP = fp;
-
     int paramCount = 0;
     std::wstring opTitle;
     const OpParam* params = LookupOp(lastOp, selLevel, paramCount, opTitle);
@@ -282,7 +278,13 @@ static bool TryEPolyParams(Animatable* owner) {
     }
 
     gh.count = (int)g_edits.size() - gh.startIdx;
-    if (gh.count > 0) { g_groups.push_back(gh); return true; }
+    if (gh.count > 0) {
+        // Only arm undo+reapply if we successfully gathered operation params
+        g_epolyOp = lastOp;
+        g_epolyFP = fp;
+        g_groups.push_back(gh);
+        return true;
+    }
     return false;
 }
 
@@ -291,6 +293,8 @@ static void GatherParams() {
     g_groups.clear();
     g_edits.clear();
     g_nodeName.clear();
+    g_epolyOp = -1;
+    g_epolyFP = nullptr;
 
     Interface* ip = GetCOREInterface();
     if (!ip || ip->GetSelNodeCount() == 0) return;
