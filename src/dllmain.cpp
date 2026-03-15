@@ -6,6 +6,8 @@
 #include <modstack.h>
 #include <object.h>
 #include <actiontable.h>
+#include <custcont.h>
+#include <iepoly.h>
 #include <windowsx.h>
 #include <string>
 #include <vector>
@@ -46,6 +48,101 @@ static const COLORREF kEditBg    = RGB(38, 38, 44);
 static const COLORREF kEditFocus = RGB(50, 50, 58);
 static const COLORREF kCloseHov  = RGB(200, 60, 60);
 
+// ── EPoly operation → param mapping ─────────────────────────────
+struct OpParam {
+    const TCHAR* name;
+    ParamID pid;
+    bool isFloat;
+};
+
+// Connect
+static const OpParam kConnectParams[] = {
+    { _T("Segments"), (ParamID)ep_connect_edge_segments, false },
+    { _T("Pinch"),    (ParamID)ep_connect_edge_pinch,    true  },
+    { _T("Slide"),    (ParamID)ep_connect_edge_slide,    true  },
+};
+// Bridge
+static const OpParam kBridgeParams[] = {
+    { _T("Segments"), (ParamID)ep_bridge_segments,  false },
+    { _T("Taper"),    (ParamID)ep_bridge_taper,     true  },
+    { _T("Bias"),     (ParamID)ep_bridge_bias,      true  },
+    { _T("Twist 1"),  (ParamID)ep_bridge_twist_1,   true  },
+    { _T("Twist 2"),  (ParamID)ep_bridge_twist_2,   true  },
+};
+// Extrude face
+static const OpParam kExtrudeFaceParams[] = {
+    { _T("Height"), (ParamID)ep_face_extrude_height, true },
+};
+// Extrude edge
+static const OpParam kExtrudeEdgeParams[] = {
+    { _T("Height"), (ParamID)ep_edge_extrude_height, true },
+    { _T("Width"),  (ParamID)ep_edge_extrude_width,  true },
+};
+// Extrude vertex
+static const OpParam kExtrudeVertParams[] = {
+    { _T("Width"),  (ParamID)ep_vertex_extrude_width,  true },
+    { _T("Height"), (ParamID)ep_vertex_extrude_height, true },
+};
+// Bevel
+static const OpParam kBevelParams[] = {
+    { _T("Height"),  (ParamID)ep_bevel_height,  true  },
+    { _T("Outline"), (ParamID)ep_bevel_outline, true  },
+    { _T("Type"),    (ParamID)ep_bevel_type,    false },
+};
+// Chamfer (edge)
+static const OpParam kChamferEdgeParams[] = {
+    { _T("Amount"),   (ParamID)ep_edge_chamfer,          true  },
+    { _T("Segments"), (ParamID)ep_edge_chamfer_segments, false },
+};
+// Chamfer (vertex)
+static const OpParam kChamferVertParams[] = {
+    { _T("Amount"), (ParamID)ep_vertex_chamfer, true },
+};
+// Inset
+static const OpParam kInsetParams[] = {
+    { _T("Amount"), (ParamID)ep_inset,      true  },
+    { _T("Type"),   (ParamID)ep_inset_type, false },
+};
+// Outline
+static const OpParam kOutlineParams[] = {
+    { _T("Amount"), (ParamID)ep_outline, true },
+};
+
+static const OpParam* LookupOp(int op, int selLevel, int& count, std::wstring& title) {
+    switch (op) {
+    case epop_connect_edges:
+        title = L"Connect"; count = 3; return kConnectParams;
+    case epop_connect_vertices:
+        title = L"Connect Verts"; count = 0; return nullptr;
+    case epop_bridge_border:
+    case epop_bridge_polygon:
+    case epop_bridge_edge:
+        title = L"Bridge"; count = 5; return kBridgeParams;
+    case epop_extrude:
+        if (selLevel == EP_SL_EDGE) {
+            title = L"Extrude Edge"; count = 2; return kExtrudeEdgeParams;
+        } else if (selLevel == EP_SL_VERTEX) {
+            title = L"Extrude Vertex"; count = 2; return kExtrudeVertParams;
+        } else {
+            title = L"Extrude Face"; count = 1; return kExtrudeFaceParams;
+        }
+    case epop_bevel:
+        title = L"Bevel"; count = 3; return kBevelParams;
+    case epop_chamfer:
+        if (selLevel == EP_SL_VERTEX) {
+            title = L"Chamfer Vertex"; count = 1; return kChamferVertParams;
+        } else {
+            title = L"Chamfer Edge"; count = 2; return kChamferEdgeParams;
+        }
+    case epop_inset:
+        title = L"Inset"; count = 2; return kInsetParams;
+    case epop_outline:
+        title = L"Outline"; count = 1; return kOutlineParams;
+    default:
+        count = 0; return nullptr;
+    }
+}
+
 // ── Data ────────────────────────────────────────────────────────
 struct EditField {
     HWND         hwnd = nullptr;
@@ -85,25 +182,24 @@ static void ClosePanel();
 static void RefreshEdits();
 static void ApplyEdit(HWND h);
 
-// ── Mouse side-button hook (XButton1 or XButton2) ───────────────
+// ── Mouse side-button hook ──────────────────────────────────────
 static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     if (nCode >= 0 && wp == WM_XBUTTONDOWN) {
         MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lp;
         WORD xbutton = HIWORD(ms->mouseData);
         if (xbutton == XBUTTON1 || xbutton == XBUTTON2) {
-            // Only when Max (or our panel) is foreground
             HWND fg = GetForegroundWindow();
             Interface* ip = GetCOREInterface();
             if (ip && (fg == ip->GetMAXHWnd() || IsChild(ip->GetMAXHWnd(), fg) || fg == g_panel)) {
                 PostMessage(g_panel, WM_WALKER_TOGGLE, 0, 0);
-                return 1;   // eat the click
+                return 1;
             }
         }
     }
     return CallNextHookEx(g_mouseHook, nCode, wp, lp);
 }
 
-// ── Param collection ────────────────────────────────────────────
+// ── Param helpers ───────────────────────────────────────────────
 static bool IsFloat(ParamType2 t) {
     return t==TYPE_FLOAT||t==TYPE_ANGLE||t==TYPE_PCNT_FRAC||t==TYPE_WORLD||t==TYPE_COLOR_CHANNEL;
 }
@@ -111,6 +207,7 @@ static bool IsInt(ParamType2 t) {
     return t==TYPE_INT||t==TYPE_TIMEVALUE||t==TYPE_RADIOBTN_INDEX||t==TYPE_INDEX;
 }
 
+// ── Generic param collection (fallback) ─────────────────────────
 static void CollectParams(IParamBlock2* pb, int& total) {
     if (!pb) return;
     int n = pb->NumParams();
@@ -130,6 +227,56 @@ static void CollectParams(IParamBlock2* pb, int& total) {
     }
 }
 
+// ── Try EPoly last-operation params ─────────────────────────────
+static bool TryEPolyParams(Animatable* owner) {
+    if (!owner) return false;
+
+    FPInterface* ep = (FPInterface*)owner->GetInterface(EPOLY_INTERFACE);
+    if (!ep) return false;
+
+    // Call via FP dispatch — these virtuals are private
+    FPValue lastOpVal, selLevelVal;
+    ep->Invoke(epfn_get_last_operation, lastOpVal);
+    ep->Invoke(epfn_get_epoly_sel_level, selLevelVal);
+    int lastOp   = lastOpVal.i;
+    int selLevel = selLevelVal.i;
+
+    int paramCount = 0;
+    std::wstring opTitle;
+    const OpParam* params = LookupOp(lastOp, selLevel, paramCount, opTitle);
+    if (!params || paramCount == 0) return false;
+
+    // Find the param block containing these IDs
+    IParamBlock2* pb = nullptr;
+    for (int b = 0; b < owner->NumParamBlocks(); b++) {
+        IParamBlock2* candidate = owner->GetParamBlock(b);
+        if (candidate && candidate->IDtoIndex(params[0].pid) >= 0) {
+            pb = candidate;
+            break;
+        }
+    }
+    if (!pb) return false;
+
+    GroupHeader gh;
+    gh.title    = opTitle;
+    gh.startIdx = (int)g_edits.size();
+
+    for (int i = 0; i < paramCount; i++) {
+        if (pb->IDtoIndex(params[i].pid) < 0) continue;
+        EditField ef;
+        ef.label = params[i].name;
+        ef.pb    = pb;
+        ef.id    = params[i].pid;
+        ef.type  = (ParamType2)(params[i].isFloat ? TYPE_FLOAT : TYPE_INT);
+        g_edits.push_back(ef);
+    }
+
+    gh.count = (int)g_edits.size() - gh.startIdx;
+    if (gh.count > 0) { g_groups.push_back(gh); return true; }
+    return false;
+}
+
+// ── Gather params ───────────────────────────────────────────────
 static void GatherParams() {
     g_groups.clear();
     g_edits.clear();
@@ -145,7 +292,21 @@ static void GatherParams() {
     Object* obj = node->GetObjectRef();
     if (!obj) return;
 
-    // Modifiers
+    // ── Priority: EPoly last-operation params ───────────────────
+    // Check modifiers first (Edit Poly modifier)
+    Object* walk = obj;
+    while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        IDerivedObject* d = static_cast<IDerivedObject*>(walk);
+        for (int m = 0; m < d->NumModifiers(); m++) {
+            if (TryEPolyParams(d->GetModifier(m))) return;
+        }
+        walk = d->GetObjRef();
+    }
+    // Check base object (Editable Poly)
+    if (walk && TryEPolyParams(walk)) return;
+
+    // ── Fallback: generic all-params ────────────────────────────
+    obj = node->GetObjectRef();
     while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
         IDerivedObject* d = static_cast<IDerivedObject*>(obj);
         for (int m = 0; m < d->NumModifiers(); m++) {
@@ -164,7 +325,6 @@ static void GatherParams() {
         }
         obj = d->GetObjRef();
     }
-    // Base object
     if (obj) {
         GroupHeader gh;
         MSTR cn; obj->GetClassName(cn, false);
@@ -193,8 +353,6 @@ static void FormatValue(const EditField& ef, TimeValue t, TCHAR* buf, int len) {
 static void RefreshEdits() {
     Interface* ip = GetCOREInterface();
     if (!ip) return;
-
-    // Auto-close on selection change
     if (ip->GetSelNodeCount() == 0) { ClosePanel(); return; }
     INode* node = ip->GetSelNode(0);
     const MCHAR* nn = node ? node->GetName() : nullptr;
@@ -235,7 +393,7 @@ static void ApplyEdit(HWND h) {
     }
 }
 
-// ── Edit subclass (Enter/Esc/Tab/Wheel) ─────────────────────────
+// ── Edit subclass (Enter/Esc/Tab/Wheel + Ctrl/Shift) ────────────
 static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     EditField* ef = (EditField*)GetProp(h, _T("WF"));
 
@@ -248,27 +406,37 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CHAR:
         if (wp == VK_RETURN || wp == VK_ESCAPE) return 0;
         break;
+
     case WM_MOUSEWHEEL: {
         if (!ef || !ef->pb) break;
         Interface* ip = GetCOREInterface();
         TimeValue t = ip->GetTime();
         float step = (float)GET_WHEEL_DELTA_WPARAM(wp) / 120.0f;
+        bool shift = (GetKeyState(VK_SHIFT)   & 0x8000) != 0;
+        bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
 
         if (IsFloat(ef->type)) {
             float cur = ef->pb->GetFloat(ef->id, t);
             float a = cur < 0 ? -cur : cur;
             float sc = a > 100.f ? 10.f : a > 10.f ? 1.f : a > 1.f ? 0.1f : 0.01f;
+            if (shift) sc *= 10.0f;
+            if (ctrl)  sc *= 0.1f;
             ef->pb->SetValue(ef->id, t, cur + step * sc);
         } else if (ef->type == TYPE_BOOL) {
             ef->pb->SetValue(ef->id, t, ef->pb->GetInt(ef->id, t) ? 0 : 1);
         } else {
             int cur = ef->pb->GetInt(ef->id, t);
-            ef->pb->SetValue(ef->id, t, cur + (int)step);
+            int intStep = (int)step;
+            if (shift) intStep *= 10;
+            if (ctrl && intStep != 0) { intStep = intStep > 0 ? 1 : -1; }
+            if (intStep == 0) intStep = step > 0 ? 1 : -1;
+            ef->pb->SetValue(ef->id, t, cur + intStep);
         }
         RefreshEdits();
         ip->RedrawViews(t);
         return 0;
     }
+
     case WM_LBUTTONDOWN:
         if (ef && ef->type == TYPE_BOOL) {
             Interface* ip = GetCOREInterface();
@@ -283,7 +451,7 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return CallWindowProc(g_origEdit, h, msg, wp, lp);
 }
 
-// ── Overlay paint ───────────────────────────────────────────────
+// ── Panel paint ─────────────────────────────────────────────────
 static void PaintPanel(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
@@ -293,16 +461,13 @@ static void PaintPanel(HWND hwnd) {
     HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
     HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
 
-    // Bg
     HBRUSH bg = CreateSolidBrush(kBg);
     FillRect(mem, &rc, bg); DeleteObject(bg);
 
-    // Accent
     RECT bar = { 0, 0, rc.right, 3 };
     HBRUSH ab = CreateSolidBrush(kAccent);
     FillRect(mem, &bar, ab); DeleteObject(ab);
 
-    // Border
     HPEN bp = CreatePen(PS_SOLID, 1, kBorder);
     SelectObject(mem, bp);
     SelectObject(mem, (HBRUSH)GetStockObject(NULL_BRUSH));
@@ -313,12 +478,10 @@ static void PaintPanel(HWND hwnd) {
     int y = kPad + 3, x = kPad;
     int rEdge = rc.right - kPad;
 
-    // Header
     SelectObject(mem, g_fontBold);
     SetTextColor(mem, kAccent);
     TextOut(mem, x, y, g_nodeName.c_str(), (int)g_nodeName.length());
 
-    // Close button
     if (g_hoverClose) {
         HBRUSH hov = CreateSolidBrush(kCloseHov);
         FillRect(mem, &g_closeRect, hov); DeleteObject(hov);
@@ -334,7 +497,6 @@ static void PaintPanel(HWND hwnd) {
     DeleteObject(sep);
     y += 5;
 
-    // Groups & labels
     HWND focused = GetFocus();
     for (size_t gi = 0; gi < g_groups.size(); gi++) {
         const auto& gh = g_groups[gi];
@@ -349,7 +511,6 @@ static void PaintPanel(HWND hwnd) {
             SetTextColor(mem, kLabelClr);
             TextOut(mem, x + 8, y + 2, ef.label.c_str(), (int)ef.label.length());
 
-            // Edit border
             if (ef.hwnd) {
                 RECT er; GetWindowRect(ef.hwnd, &er);
                 MapWindowPoints(HWND_DESKTOP, hwnd, (LPPOINT)&er, 2);
@@ -418,8 +579,14 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_COMMAND:
-        if (HIWORD(wp) == EN_SETFOCUS || HIWORD(wp) == EN_KILLFOCUS)
+        if (HIWORD(wp) == EN_SETFOCUS) {
+            DisableAccelerators();
             InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        if (HIWORD(wp) == EN_KILLFOCUS) {
+            EnableAccelerators();
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
         break;
 
     case WM_TIMER:
@@ -440,7 +607,6 @@ static void OpenPanel() {
     GatherParams();
     if (g_groups.empty()) return;
 
-    // Measure label widths
     HDC hdc = GetDC(g_panel);
     SelectObject(hdc, g_font);
     int maxLbl = 0;
@@ -464,10 +630,8 @@ static void OpenPanel() {
     if (panelW < kMinW) panelW = kMinW;
     int editX = panelW - kPad - kEditW;
 
-    // Close button rect
     g_closeRect = { panelW - kPad - 18, kPad, panelW - kPad, kPad + 18 };
 
-    // Layout edits + calc height
     int y = 3 + kPad + kFontHdr + 6 + 1 + 5;
     for (size_t gi = 0; gi < g_groups.size(); gi++) {
         y += kLineH;
@@ -493,10 +657,8 @@ static void OpenPanel() {
     }
     int panelH = y + kPad;
 
-    // Fill values
     RefreshEdits();
 
-    // Position at cursor
     POINT pt; GetCursorPos(&pt);
     HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = { sizeof(mi) }; GetMonitorInfo(hMon, &mi);
@@ -524,7 +686,8 @@ static void ClosePanel() {
     g_open = false;
     g_hoverClose = false;
 
-    // Return focus to Max
+    EnableAccelerators();
+
     Interface* ip = GetCOREInterface();
     if (ip) SetFocus(ip->GetMAXHWnd());
 }
@@ -591,7 +754,6 @@ public:
         IActionManager* am = GetCOREInterface()->GetActionManager();
         if (am) am->ActivateActionTable(&g_actionCB, kTableId);
 
-        // Low-level mouse hook for side buttons (XButton1/XButton2)
         g_mouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseHookProc, hInstance, 0);
 
         return GUPRESULT_KEEP;
