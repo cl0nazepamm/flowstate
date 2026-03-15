@@ -3,10 +3,13 @@
 #include <iparamb2.h>
 #include <plugapi.h>
 #include <maxapi.h>
-#include <custcont.h>
+#include <modstack.h>
+#include <object.h>
+#include <actiontable.h>
+#include <windowsx.h>
 #include <string>
+#include <vector>
 
-// ── Plugin Identity ─────────────────────────────────────────────
 #define WALKER_CLASS_ID  Class_ID(0x7A1CE200, 0x3B4D5E6F)
 #define WALKER_NAME      _T("Walker")
 #define WALKER_CATEGORY  _T("MCP")
@@ -14,442 +17,629 @@
 extern HINSTANCE hInstance;
 HINSTANCE hInstance = nullptr;
 
-// ── Overlay Config ──────────────────────────────────────────────
-static const TCHAR* kOverlayClass  = _T("WalkerOverlay");
-static const int    kTimerMs       = 50;
-static const int    kPad           = 10;
-static const int    kFontPx        = 14;
-static const COLORREF kBg          = RGB(28, 28, 32);
-static const COLORREF kBorder      = RGB(70, 70, 80);
-static const COLORREF kTitleClr    = RGB(100, 170, 255);
-static const COLORREF kLabelClr    = RGB(180, 180, 190);
-static const COLORREF kValueClr    = RGB(255, 255, 255);
-static const COLORREF kDimClr      = RGB(100, 100, 110);
+// ── Action IDs ──────────────────────────────────────────────────
+static const ActionTableId   kTableId   = 0x7A1CE201;
+static const ActionContextId kContextId = 0x7A1CE202;
+static const int             kToggleId  = 1;
 
-// ── Globals ─────────────────────────────────────────────────────
-static HWND     g_overlay  = nullptr;
-static UINT_PTR g_timer    = 0;
-static HWND     g_lastCtrl = nullptr;
-static HFONT    g_font     = nullptr;
-static HFONT    g_fontBold = nullptr;
+// ── Config ──────────────────────────────────────────────────────
+static const TCHAR* kWndClass   = _T("WalkerPanel");
+static const int kPad       = 12;
+static const int kFontPx    = 12;
+static const int kFontHdr   = 14;
+static const int kLineH     = 22;
+static const int kHeaderH   = 42;
+static const int kGroupGap  = 8;
+static const int kEditW     = 90;
+static const int kEditH     = 18;
+static const int kMaxParams = 24;
+static const int kMinW      = 240;
+static const int kRefreshMs = 500;
 
-struct WalkerInfo {
-    std::wstring rollup;
+static const COLORREF kBg        = RGB(28, 28, 32);
+static const COLORREF kBorder    = RGB(55, 55, 65);
+static const COLORREF kAccent    = RGB(100, 170, 255);
+static const COLORREF kGroupClr  = RGB(130, 145, 170);
+static const COLORREF kLabelClr  = RGB(160, 160, 170);
+static const COLORREF kValueClr  = RGB(255, 255, 255);
+static const COLORREF kEditBg    = RGB(38, 38, 44);
+static const COLORREF kEditFocus = RGB(50, 50, 58);
+static const COLORREF kCloseHov  = RGB(200, 60, 60);
+
+// ── Data ────────────────────────────────────────────────────────
+struct EditField {
+    HWND         hwnd = nullptr;
     std::wstring label;
-    std::wstring value;
-    std::wstring type;   // "Spinner" or "Slider"
-    int          ctrlID = 0;
-    bool         valid  = false;
+    IParamBlock2* pb  = nullptr;
+    ParamID      id   = 0;
+    ParamType2   type = (ParamType2)0;
 };
 
-static WalkerInfo g_info;
+struct GroupHeader {
+    std::wstring title;
+    int startIdx = 0;
+    int count    = 0;
+};
 
-// ── Find nearest static text label to the left of a control ─────
-static std::wstring FindLabel(HWND hwnd) {
-    HWND parent = GetParent(hwnd);
-    if (!parent) return L"";
+// ── Globals ─────────────────────────────────────────────────────
+static HWND     g_panel      = nullptr;
+static HFONT    g_font       = nullptr;
+static HFONT    g_fontBold   = nullptr;
+static HBRUSH   g_brEdit     = nullptr;
+static HBRUSH   g_brEditFoc  = nullptr;
+static WNDPROC  g_origEdit   = nullptr;
+static HHOOK    g_mouseHook  = nullptr;
+static bool     g_open       = false;
+static bool     g_hoverClose = false;
+static RECT     g_closeRect  = {};
 
-    RECT sr;
-    GetWindowRect(hwnd, &sr);
-    int spinMidY = (sr.top + sr.bottom) / 2;
+static const UINT WM_WALKER_TOGGLE = WM_USER + 100;
 
-    std::wstring best;
-    int bestDist = 99999;
+static std::vector<EditField>   g_edits;
+static std::vector<GroupHeader> g_groups;
+static std::wstring             g_nodeName;
 
-    HWND ch = GetWindow(parent, GW_CHILD);
-    while (ch) {
-        if (ch != hwnd) {
-            TCHAR cls[64];
-            GetClassName(ch, cls, 64);
-            if (_tcsicmp(cls, _T("Static")) == 0) {
-                RECT cr;
-                GetWindowRect(ch, &cr);
-                int midY = (cr.top + cr.bottom) / 2;
-                int dy   = abs(midY - spinMidY);
-                int dx   = sr.left - cr.right;
+// Forward declarations
+static void TogglePanel();
+static void ClosePanel();
+static void RefreshEdits();
+static void ApplyEdit(HWND h);
 
-                if (dy < 18 && dx >= -30 && dx < bestDist) {
-                    TCHAR text[256];
-                    GetWindowText(ch, text, 256);
-                    if (text[0]) {
-                        best     = text;
-                        bestDist = dx;
-                    }
-                }
+// ── Mouse side-button hook (XButton1 or XButton2) ───────────────
+static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
+    if (nCode >= 0 && wp == WM_XBUTTONDOWN) {
+        MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lp;
+        WORD xbutton = HIWORD(ms->mouseData);
+        if (xbutton == XBUTTON1 || xbutton == XBUTTON2) {
+            // Only when Max (or our panel) is foreground
+            HWND fg = GetForegroundWindow();
+            Interface* ip = GetCOREInterface();
+            if (ip && (fg == ip->GetMAXHWnd() || IsChild(ip->GetMAXHWnd(), fg) || fg == g_panel)) {
+                PostMessage(g_panel, WM_WALKER_TOGGLE, 0, 0);
+                return 1;   // eat the click
             }
         }
-        ch = GetWindow(ch, GW_HWNDNEXT);
     }
-
-    while (!best.empty() && (best.back() == L':' || best.back() == L' '))
-        best.pop_back();
-    return best;
+    return CallNextHookEx(g_mouseHook, nCode, wp, lp);
 }
 
-// ── Walk parents to find rollup panel title ─────────────────────
-static std::wstring FindRollup(HWND hwnd) {
-    HWND cur = GetParent(hwnd);
-    while (cur) {
-        HWND parent = GetParent(cur);
-        if (!parent) break;
+// ── Param collection ────────────────────────────────────────────
+static bool IsFloat(ParamType2 t) {
+    return t==TYPE_FLOAT||t==TYPE_ANGLE||t==TYPE_PCNT_FRAC||t==TYPE_WORLD||t==TYPE_COLOR_CHANNEL;
+}
+static bool IsInt(ParamType2 t) {
+    return t==TYPE_INT||t==TYPE_TIMEVALUE||t==TYPE_RADIOBTN_INDEX||t==TYPE_INDEX;
+}
 
-        TCHAR cls[64];
-        GetClassName(parent, cls, 64);
-        if (_tcscmp(cls, ROLLUPWINDOWCLASS) == 0) {
-            IRollupWindow* irw = GetIRollup(parent);
-            if (irw) {
-                int idx = irw->GetPanelIndex(cur);
-                if (idx >= 0) {
-                    MSTR title = irw->GetPanelTitle(idx);
-                    std::wstring result(title.data());
-                    ReleaseIRollup(irw);
-                    return result;
-                }
-                ReleaseIRollup(irw);
-            }
+static void CollectParams(IParamBlock2* pb, int& total) {
+    if (!pb) return;
+    int n = pb->NumParams();
+    for (int i = 0; i < n && total < kMaxParams; i++) {
+        ParamID pid = pb->IndextoID(i);
+        const ParamDef& d = pb->GetParamDef(pid);
+        if (d.type & TYPE_TAB) continue;
+        if (!IsFloat(d.type) && !IsInt(d.type) && d.type != TYPE_BOOL) continue;
+
+        EditField ef;
+        ef.label = d.int_name ? d.int_name : L"?";
+        ef.pb    = pb;
+        ef.id    = pid;
+        ef.type  = d.type;
+        g_edits.push_back(ef);
+        total++;
+    }
+}
+
+static void GatherParams() {
+    g_groups.clear();
+    g_edits.clear();
+    g_nodeName.clear();
+
+    Interface* ip = GetCOREInterface();
+    if (!ip || ip->GetSelNodeCount() == 0) return;
+    INode* node = ip->GetSelNode(0);
+    if (!node) return;
+    const MCHAR* nn = node->GetName();
+    g_nodeName = nn ? nn : L"";
+
+    Object* obj = node->GetObjectRef();
+    if (!obj) return;
+
+    // Modifiers
+    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        IDerivedObject* d = static_cast<IDerivedObject*>(obj);
+        for (int m = 0; m < d->NumModifiers(); m++) {
+            Modifier* mod = d->GetModifier(m);
+            if (!mod) continue;
+            GroupHeader gh;
+            MSTR cn; mod->GetClassName(cn, false);
+            const MCHAR* p = cn.data();
+            gh.title    = p ? p : L"Modifier";
+            gh.startIdx = (int)g_edits.size();
+            int tot = 0;
+            for (int b = 0; b < mod->NumParamBlocks(); b++)
+                CollectParams(mod->GetParamBlock(b), tot);
+            gh.count = (int)g_edits.size() - gh.startIdx;
+            if (gh.count > 0) g_groups.push_back(gh);
         }
-        cur = parent;
+        obj = d->GetObjRef();
     }
-    return L"";
+    // Base object
+    if (obj) {
+        GroupHeader gh;
+        MSTR cn; obj->GetClassName(cn, false);
+        const MCHAR* p = cn.data();
+        gh.title    = p ? p : L"Object";
+        gh.startIdx = (int)g_edits.size();
+        int tot = 0;
+        for (int b = 0; b < obj->NumParamBlocks(); b++)
+            CollectParams(obj->GetParamBlock(b), tot);
+        gh.count = (int)g_edits.size() - gh.startIdx;
+        if (gh.count > 0) g_groups.push_back(gh);
+    }
 }
 
-// ── Gather info about a spinner or slider control ───────────────
-static WalkerInfo GatherInfo(HWND hwnd, bool isSlider) {
-    WalkerInfo info;
-
-    float fv = 0.0f;
-    int   iv = 0;
-
-    if (isSlider) {
-        ISliderControl* sl = GetISlider(hwnd);
-        if (!sl) return info;
-        fv = sl->GetFVal();
-        iv = sl->GetIVal();
-        ReleaseISlider(sl);
+// ── Value formatting ────────────────────────────────────────────
+static void FormatValue(const EditField& ef, TimeValue t, TCHAR* buf, int len) {
+    if (IsFloat(ef.type)) {
+        swprintf(buf, len, _T("%.4g"), ef.pb->GetFloat(ef.id, t));
+    } else if (ef.type == TYPE_BOOL) {
+        swprintf(buf, len, _T("%s"), ef.pb->GetInt(ef.id, t) ? _T("On") : _T("Off"));
     } else {
-        ISpinnerControl* sp = GetISpinner(hwnd);
-        if (!sp) return info;
-        fv = sp->GetFVal();
-        iv = sp->GetIVal();
-        ReleaseISpinner(sp);
+        swprintf(buf, len, _T("%d"), ef.pb->GetInt(ef.id, t));
     }
-
-    info.valid  = true;
-    info.ctrlID = GetDlgCtrlID(hwnd);
-    info.type   = isSlider ? L"Slider" : L"Spinner";
-
-    // Format value — show int if it looks integer, otherwise float
-    if (static_cast<float>(iv) == fv) {
-        info.value = std::to_wstring(iv);
-    } else {
-        wchar_t buf[64];
-        swprintf(buf, 64, L"%.4g", fv);
-        info.value = buf;
-    }
-
-    info.label  = FindLabel(hwnd);
-    info.rollup = FindRollup(hwnd);
-    return info;
 }
 
-// ── Find spinner sibling for a CustEdit ─────────────────────────
-static HWND FindAdjacentSpinner(HWND editHwnd) {
-    HWND parent = GetParent(editHwnd);
-    if (!parent) return nullptr;
+static void RefreshEdits() {
+    Interface* ip = GetCOREInterface();
+    if (!ip) return;
 
-    RECT er;
-    GetWindowRect(editHwnd, &er);
+    // Auto-close on selection change
+    if (ip->GetSelNodeCount() == 0) { ClosePanel(); return; }
+    INode* node = ip->GetSelNode(0);
+    const MCHAR* nn = node ? node->GetName() : nullptr;
+    std::wstring cur = nn ? nn : L"";
+    if (cur != g_nodeName) { ClosePanel(); return; }
 
-    HWND sib = GetWindow(parent, GW_CHILD);
-    while (sib) {
-        if (sib != editHwnd) {
-            TCHAR cls[64];
-            GetClassName(sib, cls, 64);
-            if (_tcscmp(cls, SPINNERWINDOWCLASS) == 0) {
-                RECT sr;
-                GetWindowRect(sib, &sr);
-                if (abs(sr.top - er.top) < 5 &&
-                    sr.left >= er.right - 5 &&
-                    sr.left <= er.right + 15) {
-                    return sib;
-                }
-            }
+    TimeValue t = ip->GetTime();
+    HWND focused = GetFocus();
+    for (auto& ef : g_edits) {
+        if (ef.hwnd == focused) continue;
+        TCHAR buf[64];
+        FormatValue(ef, t, buf, 64);
+        SetWindowText(ef.hwnd, buf);
+    }
+}
+
+// ── Apply edited value ──────────────────────────────────────────
+static void ApplyEdit(HWND h) {
+    Interface* ip = GetCOREInterface();
+    if (!ip) return;
+    TimeValue t = ip->GetTime();
+
+    for (auto& ef : g_edits) {
+        if (ef.hwnd != h) continue;
+        TCHAR txt[256];
+        GetWindowText(h, txt, 256);
+
+        if (IsFloat(ef.type)) {
+            ef.pb->SetValue(ef.id, t, (float)_wtof(txt));
+        } else if (ef.type == TYPE_BOOL) {
+            int v = (_wcsicmp(txt, _T("On")) == 0 || _wtoi(txt) != 0) ? 1 : 0;
+            ef.pb->SetValue(ef.id, t, v);
+        } else {
+            ef.pb->SetValue(ef.id, t, _wtoi(txt));
         }
-        sib = GetWindow(sib, GW_HWNDNEXT);
+        ip->RedrawViews(t);
+        break;
     }
-    return nullptr;
 }
 
-// ── Overlay painting ────────────────────────────────────────────
-static void PaintOverlay(HWND hwnd) {
-    if (!g_info.valid) return;
+// ── Edit subclass (Enter/Esc/Tab/Wheel) ─────────────────────────
+static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    EditField* ef = (EditField*)GetProp(h, _T("WF"));
 
+    switch (msg) {
+    case WM_KEYDOWN:
+        if (wp == VK_RETURN)  { ApplyEdit(h); RefreshEdits(); return 0; }
+        if (wp == VK_ESCAPE)  { ClosePanel(); return 0; }
+        if (wp == VK_TAB)     { SetFocus(GetNextDlgTabItem(g_panel, h, GetKeyState(VK_SHIFT) < 0)); return 0; }
+        break;
+    case WM_CHAR:
+        if (wp == VK_RETURN || wp == VK_ESCAPE) return 0;
+        break;
+    case WM_MOUSEWHEEL: {
+        if (!ef || !ef->pb) break;
+        Interface* ip = GetCOREInterface();
+        TimeValue t = ip->GetTime();
+        float step = (float)GET_WHEEL_DELTA_WPARAM(wp) / 120.0f;
+
+        if (IsFloat(ef->type)) {
+            float cur = ef->pb->GetFloat(ef->id, t);
+            float a = cur < 0 ? -cur : cur;
+            float sc = a > 100.f ? 10.f : a > 10.f ? 1.f : a > 1.f ? 0.1f : 0.01f;
+            ef->pb->SetValue(ef->id, t, cur + step * sc);
+        } else if (ef->type == TYPE_BOOL) {
+            ef->pb->SetValue(ef->id, t, ef->pb->GetInt(ef->id, t) ? 0 : 1);
+        } else {
+            int cur = ef->pb->GetInt(ef->id, t);
+            ef->pb->SetValue(ef->id, t, cur + (int)step);
+        }
+        RefreshEdits();
+        ip->RedrawViews(t);
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+        if (ef && ef->type == TYPE_BOOL) {
+            Interface* ip = GetCOREInterface();
+            TimeValue t = ip->GetTime();
+            ef->pb->SetValue(ef->id, t, ef->pb->GetInt(ef->id, t) ? 0 : 1);
+            RefreshEdits();
+            ip->RedrawViews(t);
+            return 0;
+        }
+        break;
+    }
+    return CallWindowProc(g_origEdit, h, msg, wp, lp);
+}
+
+// ── Overlay paint ───────────────────────────────────────────────
+static void PaintPanel(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
-    RECT rc;
-    GetClientRect(hwnd, &rc);
+    RECT rc; GetClientRect(hwnd, &rc);
 
-    // Double-buffer
-    HDC mem    = CreateCompatibleDC(hdc);
+    HDC mem = CreateCompatibleDC(hdc);
     HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
     HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
 
-    // Background
+    // Bg
     HBRUSH bg = CreateSolidBrush(kBg);
-    FillRect(mem, &rc, bg);
-    DeleteObject(bg);
+    FillRect(mem, &rc, bg); DeleteObject(bg);
 
-    // Accent bar at top
-    RECT accent = { 0, 0, rc.right, 3 };
-    HBRUSH accentBr = CreateSolidBrush(kTitleClr);
-    FillRect(mem, &accent, accentBr);
-    DeleteObject(accentBr);
+    // Accent
+    RECT bar = { 0, 0, rc.right, 3 };
+    HBRUSH ab = CreateSolidBrush(kAccent);
+    FillRect(mem, &bar, ab); DeleteObject(ab);
 
     // Border
-    HPEN pen = CreatePen(PS_SOLID, 1, kBorder);
-    HPEN oldPen   = (HPEN)SelectObject(mem, pen);
-    HBRUSH hollow = (HBRUSH)GetStockObject(NULL_BRUSH);
-    SelectObject(mem, hollow);
+    HPEN bp = CreatePen(PS_SOLID, 1, kBorder);
+    SelectObject(mem, bp);
+    SelectObject(mem, (HBRUSH)GetStockObject(NULL_BRUSH));
     Rectangle(mem, 0, 0, rc.right, rc.bottom);
-    SelectObject(mem, oldPen);
-    DeleteObject(pen);
+    DeleteObject(bp);
 
     SetBkMode(mem, TRANSPARENT);
+    int y = kPad + 3, x = kPad;
+    int rEdge = rc.right - kPad;
 
-    int y = kPad + 3;  // below accent bar
-    int x = kPad;
+    // Header
+    SelectObject(mem, g_fontBold);
+    SetTextColor(mem, kAccent);
+    TextOut(mem, x, y, g_nodeName.c_str(), (int)g_nodeName.length());
 
-    // Title: Rollup > Label
-    std::wstring title;
-    if (!g_info.rollup.empty() && !g_info.label.empty())
-        title = g_info.rollup + L"  \x25B8  " + g_info.label;
-    else if (!g_info.label.empty())
-        title = g_info.label;
-    else if (!g_info.rollup.empty())
-        title = g_info.rollup;
-
-    if (!title.empty()) {
-        HFONT of = (HFONT)SelectObject(mem, g_fontBold);
-        SetTextColor(mem, kTitleClr);
-        RECT tr = { x, y, rc.right - kPad, rc.bottom };
-        DrawText(mem, title.c_str(), -1, &tr, DT_LEFT | DT_SINGLELINE);
-        y += kFontPx + 6;
-        SelectObject(mem, of);
+    // Close button
+    if (g_hoverClose) {
+        HBRUSH hov = CreateSolidBrush(kCloseHov);
+        FillRect(mem, &g_closeRect, hov); DeleteObject(hov);
     }
+    SetTextColor(mem, kValueClr);
+    RECT cr = g_closeRect;
+    DrawText(mem, _T("\u00D7"), 1, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-    HFONT of = (HFONT)SelectObject(mem, g_font);
+    y += kFontHdr + 6;
+    HPEN sep = CreatePen(PS_SOLID, 1, kBorder);
+    SelectObject(mem, sep);
+    MoveToEx(mem, x, y, nullptr); LineTo(mem, rEdge, y);
+    DeleteObject(sep);
+    y += 5;
 
-    // Value line
-    {
-        SetTextColor(mem, kLabelClr);
-        std::wstring lbl = L"Value: ";
-        RECT vr = { x, y, rc.right - kPad, rc.bottom };
-        DrawText(mem, lbl.c_str(), -1, &vr, DT_LEFT | DT_SINGLELINE);
+    // Groups & labels
+    HWND focused = GetFocus();
+    for (size_t gi = 0; gi < g_groups.size(); gi++) {
+        const auto& gh = g_groups[gi];
+        SelectObject(mem, g_fontBold);
+        SetTextColor(mem, kGroupClr);
+        TextOut(mem, x, y, gh.title.c_str(), (int)gh.title.length());
+        y += kLineH;
 
-        SIZE sz;
-        GetTextExtentPoint32(mem, lbl.c_str(), (int)lbl.length(), &sz);
+        SelectObject(mem, g_font);
+        for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++) {
+            auto& ef = g_edits[fi];
+            SetTextColor(mem, kLabelClr);
+            TextOut(mem, x + 8, y + 2, ef.label.c_str(), (int)ef.label.length());
 
-        SetTextColor(mem, kValueClr);
-        RECT vr2 = { x + sz.cx, y, rc.right - kPad, rc.bottom };
-        DrawText(mem, g_info.value.c_str(), -1, &vr2, DT_LEFT | DT_SINGLELINE);
-        y += kFontPx + 4;
+            // Edit border
+            if (ef.hwnd) {
+                RECT er; GetWindowRect(ef.hwnd, &er);
+                MapWindowPoints(HWND_DESKTOP, hwnd, (LPPOINT)&er, 2);
+                InflateRect(&er, 1, 1);
+                COLORREF bc = (focused == ef.hwnd) ? kAccent : kBorder;
+                HPEN ep = CreatePen(PS_SOLID, 1, bc);
+                SelectObject(mem, ep);
+                Rectangle(mem, er.left, er.top, er.right, er.bottom);
+                DeleteObject(ep);
+            }
+            y += kLineH;
+        }
+        if (gi + 1 < g_groups.size()) y += kGroupGap;
     }
-
-    // Type & ID line
-    {
-        SetTextColor(mem, kDimClr);
-        std::wstring meta = g_info.type + L"  |  ID: " + std::to_wstring(g_info.ctrlID);
-        RECT mr = { x, y, rc.right - kPad, rc.bottom };
-        DrawText(mem, meta.c_str(), -1, &mr, DT_LEFT | DT_SINGLELINE);
-    }
-
-    SelectObject(mem, of);
 
     BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
-    SelectObject(mem, old);
-    DeleteObject(bmp);
-    DeleteDC(mem);
+    SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
     EndPaint(hwnd, &ps);
 }
 
-static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+// ── Window proc ─────────────────────────────────────────────────
+static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_PAINT:      PaintOverlay(hwnd); return 0;
-    case WM_NCHITTEST:  return HTTRANSPARENT;
-    case WM_ERASEBKGND: return 1;
-    default:            return DefWindowProc(hwnd, msg, wp, lp);
+    case WM_PAINT:
+        PaintPanel(hwnd); return 0;
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_NCHITTEST: {
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        ScreenToClient(hwnd, &pt);
+        if (PtInRect(&g_closeRect, pt)) return HTCLIENT;
+        if (pt.y < kHeaderH) return HTCAPTION;
+        return HTCLIENT;
     }
+
+    case WM_LBUTTONDOWN: {
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        if (PtInRect(&g_closeRect, pt)) { ClosePanel(); return 0; }
+        break;
+    }
+
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tme);
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        bool over = PtInRect(&g_closeRect, pt) != 0;
+        if (over != g_hoverClose) { g_hoverClose = over; InvalidateRect(hwnd, &g_closeRect, FALSE); }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (g_hoverClose) { g_hoverClose = false; InvalidateRect(hwnd, &g_closeRect, FALSE); }
+        return 0;
+
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wp;
+        HWND eh = (HWND)lp;
+        SetTextColor(hdc, kValueClr);
+        if (GetFocus() == eh) {
+            SetBkColor(hdc, kEditFocus);
+            return (LRESULT)g_brEditFoc;
+        }
+        SetBkColor(hdc, kEditBg);
+        return (LRESULT)g_brEdit;
+    }
+
+    case WM_COMMAND:
+        if (HIWORD(wp) == EN_SETFOCUS || HIWORD(wp) == EN_KILLFOCUS)
+            InvalidateRect(hwnd, nullptr, FALSE);
+        break;
+
+    case WM_TIMER:
+        RefreshEdits(); return 0;
+
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) { ClosePanel(); return 0; }
+        break;
+
+    case WM_WALKER_TOGGLE:
+        TogglePanel(); return 0;
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
 }
 
-// ── Timer callback — poll mouse and detect controls ─────────────
-static void CALLBACK WalkerTick(HWND, UINT, UINT_PTR, DWORD) {
-    POINT pt;
-    GetCursorPos(&pt);
-    HWND hwnd = WindowFromPoint(pt);
+// ── Open / Close ────────────────────────────────────────────────
+static void OpenPanel() {
+    GatherParams();
+    if (g_groups.empty()) return;
 
-    if (!hwnd) {
-        if (g_lastCtrl) { ShowWindow(g_overlay, SW_HIDE); g_lastCtrl = nullptr; }
-        return;
-    }
-
-    TCHAR cls[64];
-    GetClassName(hwnd, cls, 64);
-
-    // Identify the target control
-    HWND   target   = nullptr;
-    bool   isSlider = false;
-
-    if (_tcscmp(cls, SPINNERWINDOWCLASS) == 0) {
-        target = hwnd;
-    } else if (_tcscmp(cls, SLIDERWINDOWCLASS) == 0) {
-        target   = hwnd;
-        isSlider = true;
-    } else if (_tcscmp(cls, CUSTEDITWINDOWCLASS) == 0) {
-        target = FindAdjacentSpinner(hwnd);
-    }
-
-    if (!target) {
-        if (g_lastCtrl) { ShowWindow(g_overlay, SW_HIDE); g_lastCtrl = nullptr; }
-        return;
-    }
-
-    // Gather info (always refresh for live value updates)
-    g_info     = GatherInfo(target, isSlider);
-    g_lastCtrl = target;
-
-    if (!g_info.valid) {
-        ShowWindow(g_overlay, SW_HIDE);
-        return;
-    }
-
-    // ── Measure text to size overlay ────────────────────────────
-    HDC hdc = GetDC(g_overlay);
-    HFONT of = (HFONT)SelectObject(hdc, g_fontBold);
-
-    std::wstring title;
-    if (!g_info.rollup.empty() && !g_info.label.empty())
-        title = g_info.rollup + L"  \x25B8  " + g_info.label;
-    else if (!g_info.label.empty())
-        title = g_info.label;
-    else if (!g_info.rollup.empty())
-        title = g_info.rollup;
-
-    SIZE titleSz = {};
-    if (!title.empty())
-        GetTextExtentPoint32(hdc, title.c_str(), (int)title.length(), &titleSz);
-
+    // Measure label widths
+    HDC hdc = GetDC(g_panel);
     SelectObject(hdc, g_font);
+    int maxLbl = 0;
+    for (auto& ef : g_edits) {
+        SIZE sz; GetTextExtentPoint32(hdc, ef.label.c_str(), (int)ef.label.length(), &sz);
+        if (sz.cx > maxLbl) maxLbl = sz.cx;
+    }
+    SelectObject(hdc, g_fontBold);
+    int maxTitle = 0;
+    for (auto& gh : g_groups) {
+        SIZE sz; GetTextExtentPoint32(hdc, gh.title.c_str(), (int)gh.title.length(), &sz);
+        if (sz.cx > maxTitle) maxTitle = sz.cx;
+    }
+    SIZE hdrSz; GetTextExtentPoint32(hdc, g_nodeName.c_str(), (int)g_nodeName.length(), &hdrSz);
+    if (hdrSz.cx + 30 > maxTitle) maxTitle = hdrSz.cx + 30;
+    ReleaseDC(g_panel, hdc);
 
-    std::wstring valLine  = L"Value: " + g_info.value;
-    std::wstring metaLine = g_info.type + L"  |  ID: " + std::to_wstring(g_info.ctrlID);
+    int contentW = maxLbl + 28 + kEditW;
+    if (contentW < maxTitle) contentW = maxTitle;
+    int panelW = contentW + kPad * 2 + 4;
+    if (panelW < kMinW) panelW = kMinW;
+    int editX = panelW - kPad - kEditW;
 
-    SIZE valSz, metaSz;
-    GetTextExtentPoint32(hdc, valLine.c_str(),  (int)valLine.length(),  &valSz);
-    GetTextExtentPoint32(hdc, metaLine.c_str(), (int)metaLine.length(), &metaSz);
+    // Close button rect
+    g_closeRect = { panelW - kPad - 18, kPad, panelW - kPad, kPad + 18 };
 
-    SelectObject(hdc, of);
-    ReleaseDC(g_overlay, hdc);
+    // Layout edits + calc height
+    int y = 3 + kPad + kFontHdr + 6 + 1 + 5;
+    for (size_t gi = 0; gi < g_groups.size(); gi++) {
+        y += kLineH;
+        auto& gh = g_groups[gi];
+        for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++) {
+            auto& ef = g_edits[fi];
+            DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL;
+            if (ef.type == TYPE_BOOL) style |= ES_CENTER | ES_READONLY;
+            else style |= ES_RIGHT;
 
-    int maxW = titleSz.cx;
-    if (valSz.cx  > maxW) maxW = valSz.cx;
-    if (metaSz.cx > maxW) maxW = metaSz.cx;
+            ef.hwnd = CreateWindowEx(0, _T("EDIT"), _T(""),
+                style, editX, y + 1, kEditW, kEditH,
+                g_panel, nullptr, hInstance, nullptr);
 
-    int w = maxW + kPad * 2 + 4;
-    int lines = (title.empty() ? 0 : 1) + 2;
-    int h = kPad * 2 + 3 + lines * (kFontPx + 5);  // +3 for accent bar
+            SendMessage(ef.hwnd, WM_SETFONT, (WPARAM)g_font, TRUE);
+            if (!g_origEdit) g_origEdit = (WNDPROC)GetWindowLongPtr(ef.hwnd, GWLP_WNDPROC);
+            SetWindowLongPtr(ef.hwnd, GWLP_WNDPROC, (LONG_PTR)EditProc);
+            SetProp(ef.hwnd, _T("WF"), (HANDLE)&ef);
 
-    // ── Position overlay near cursor ────────────────────────────
-    int ox = pt.x + 20;
-    int oy = pt.y + 15;
+            y += kLineH;
+        }
+        if (gi + 1 < g_groups.size()) y += kGroupGap;
+    }
+    int panelH = y + kPad;
 
+    // Fill values
+    RefreshEdits();
+
+    // Position at cursor
+    POINT pt; GetCursorPos(&pt);
     HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi = { sizeof(mi) };
-    GetMonitorInfo(hMon, &mi);
+    MONITORINFO mi = { sizeof(mi) }; GetMonitorInfo(hMon, &mi);
+    int ox = pt.x - panelW / 2, oy = pt.y - 20;
+    if (ox + panelW > mi.rcWork.right)  ox = mi.rcWork.right - panelW;
+    if (oy + panelH > mi.rcWork.bottom) oy = mi.rcWork.bottom - panelH;
+    if (ox < mi.rcWork.left) ox = mi.rcWork.left;
+    if (oy < mi.rcWork.top)  oy = mi.rcWork.top;
 
-    if (ox + w > mi.rcWork.right)   ox = pt.x - w - 10;
-    if (oy + h > mi.rcWork.bottom)  oy = pt.y - h - 10;
-    if (ox < mi.rcWork.left)        ox = mi.rcWork.left;
-    if (oy < mi.rcWork.top)         oy = mi.rcWork.top;
-
-    SetWindowPos(g_overlay, HWND_TOPMOST, ox, oy, w, h,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    InvalidateRect(g_overlay, nullptr, FALSE);
+    SetWindowPos(g_panel, HWND_TOPMOST, ox, oy, panelW, panelH, SWP_SHOWWINDOW);
+    SetTimer(g_panel, 1, kRefreshMs, nullptr);
+    if (!g_edits.empty()) SetFocus(g_edits[0].hwnd);
+    g_open = true;
 }
 
-// ── GUP Plugin ──────────────────────────────────────────────────
+static void ClosePanel() {
+    if (!g_open) return;
+    KillTimer(g_panel, 1);
+    for (auto& ef : g_edits) {
+        if (ef.hwnd) { RemoveProp(ef.hwnd, _T("WF")); DestroyWindow(ef.hwnd); ef.hwnd = nullptr; }
+    }
+    g_edits.clear();
+    g_groups.clear();
+    ShowWindow(g_panel, SW_HIDE);
+    g_open = false;
+    g_hoverClose = false;
+
+    // Return focus to Max
+    Interface* ip = GetCOREInterface();
+    if (ip) SetFocus(ip->GetMAXHWnd());
+}
+
+static void TogglePanel() {
+    if (g_open) ClosePanel(); else OpenPanel();
+}
+
+// ── Action system ───────────────────────────────────────────────
+class WalkerAction : public ActionItem {
+public:
+    int   GetId() override { return kToggleId; }
+    BOOL  ExecuteAction() override { TogglePanel(); return TRUE; }
+    void  GetButtonText(MSTR& t) override { t = WALKER_NAME; }
+    void  GetMenuText(MSTR& t) override { t = _T("Toggle Walker Panel"); }
+    void  GetDescriptionText(MSTR& t) override { t = _T("Show/hide Walker floating parameter panel"); }
+    void  GetCategoryText(MSTR& t) override { t = WALKER_NAME; }
+    BOOL  IsChecked() override { return g_open; }
+    BOOL  IsItemVisible() override { return TRUE; }
+    BOOL  IsEnabled() override { return TRUE; }
+    void  DeleteThis() override {}
+};
+
+class WalkerActionCB : public ActionCallback {
+public:
+    BOOL ExecuteAction(int id) override {
+        if (id == kToggleId) { TogglePanel(); return TRUE; }
+        return FALSE;
+    }
+};
+
+static WalkerAction   g_action;
+static WalkerActionCB g_actionCB;
+
+static ActionTable* MakeActionTable() {
+    static ActionTable table(kTableId, kContextId, TSTR(WALKER_NAME));
+    static bool init = false;
+    if (!init) { table.AppendOperation(&g_action); init = true; }
+    return &table;
+}
+
+// ── GUP ─────────────────────────────────────────────────────────
 class WalkerGUP : public GUP {
 public:
     DWORD Start() override {
-        // Register overlay window class
-        WNDCLASSEX wc  = {};
-        wc.cbSize      = sizeof(wc);
-        wc.lpfnWndProc = OverlayProc;
-        wc.hInstance    = hInstance;
-        wc.lpszClassName = kOverlayClass;
-        wc.hCursor      = LoadCursor(nullptr, IDC_ARROW);
+        WNDCLASSEX wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc  = PanelProc;
+        wc.hInstance     = hInstance;
+        wc.lpszClassName = kWndClass;
+        wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
         RegisterClassEx(&wc);
 
-        // Fonts
-        g_font = CreateFont(kFontPx, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH, _T("Segoe UI"));
-        g_fontBold = CreateFont(kFontPx, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH, _T("Segoe UI"));
+        g_font     = CreateFont(kFontPx, 0,0,0, FW_NORMAL, 0,0,0, DEFAULT_CHARSET,0,0, CLEARTYPE_QUALITY, 0, _T("Segoe UI"));
+        g_fontBold = CreateFont(kFontHdr, 0,0,0, FW_SEMIBOLD, 0,0,0, DEFAULT_CHARSET,0,0, CLEARTYPE_QUALITY, 0, _T("Segoe UI"));
+        g_brEdit    = CreateSolidBrush(kEditBg);
+        g_brEditFoc = CreateSolidBrush(kEditFocus);
 
-        // Hidden overlay window
-        g_overlay = CreateWindowEx(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            kOverlayClass, nullptr, WS_POPUP,
-            0, 0, 1, 1,
-            nullptr, nullptr, hInstance, nullptr);
+        g_panel = CreateWindowEx(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            kWndClass, nullptr, WS_POPUP,
+            0, 0, 1, 1, nullptr, nullptr, hInstance, nullptr);
 
-        // Start polling
-        g_timer = SetTimer(nullptr, 0, kTimerMs, WalkerTick);
+        IActionManager* am = GetCOREInterface()->GetActionManager();
+        if (am) am->ActivateActionTable(&g_actionCB, kTableId);
+
+        // Low-level mouse hook for side buttons (XButton1/XButton2)
+        g_mouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseHookProc, hInstance, 0);
 
         return GUPRESULT_KEEP;
     }
 
     void Stop() override {
-        if (g_timer)   { KillTimer(nullptr, g_timer); g_timer = 0; }
-        if (g_overlay) { DestroyWindow(g_overlay);    g_overlay = nullptr; }
-        if (g_font)    { DeleteObject(g_font);         g_font = nullptr; }
-        if (g_fontBold){ DeleteObject(g_fontBold);     g_fontBold = nullptr; }
-        UnregisterClass(kOverlayClass, hInstance);
+        if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+        ClosePanel();
+        if (g_panel)    { DestroyWindow(g_panel);  g_panel = nullptr; }
+        if (g_font)     { DeleteObject(g_font);     g_font = nullptr; }
+        if (g_fontBold) { DeleteObject(g_fontBold); g_fontBold = nullptr; }
+        if (g_brEdit)   { DeleteObject(g_brEdit);   g_brEdit = nullptr; }
+        if (g_brEditFoc){ DeleteObject(g_brEditFoc); g_brEditFoc = nullptr; }
+        UnregisterClass(kWndClass, hInstance);
     }
 
     void      DeleteThis() override { delete this; }
     DWORD_PTR Control(DWORD) override { return 0; }
 };
 
-// ── Class Descriptor ────────────────────────────────────────────
+// ── ClassDesc ───────────────────────────────────────────────────
 class WalkerClassDesc : public ClassDesc2 {
 public:
-    int          IsPublic() override             { return TRUE; }
-    void*        Create(BOOL) override           { return new WalkerGUP(); }
-    const TCHAR* ClassName() override            { return WALKER_NAME; }
+    int          IsPublic() override              { return TRUE; }
+    void*        Create(BOOL) override            { return new WalkerGUP(); }
+    const TCHAR* ClassName() override             { return WALKER_NAME; }
     const TCHAR* NonLocalizedClassName() override { return WALKER_NAME; }
-    SClass_ID    SuperClassID() override         { return GUP_CLASS_ID; }
-    Class_ID     ClassID() override              { return WALKER_CLASS_ID; }
-    const TCHAR* Category() override             { return WALKER_CATEGORY; }
-    const TCHAR* InternalName() override         { return WALKER_NAME; }
-    HINSTANCE    HInstance() override             { return hInstance; }
+    SClass_ID    SuperClassID() override          { return GUP_CLASS_ID; }
+    Class_ID     ClassID() override               { return WALKER_CLASS_ID; }
+    const TCHAR* Category() override              { return WALKER_CATEGORY; }
+    const TCHAR* InternalName() override          { return WALKER_NAME; }
+    HINSTANCE    HInstance() override              { return hInstance; }
+
+    int           NumActionTables() override      { return 1; }
+    ActionTable*  GetActionTable(int) override    { return MakeActionTable(); }
 };
 
 static WalkerClassDesc walkerDesc;
 
-// ── DLL Boilerplate ─────────────────────────────────────────────
+// ── DLL boilerplate ─────────────────────────────────────────────
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
-    if (fdwReason == DLL_PROCESS_ATTACH) {
-        hInstance = hinstDLL;
-        DisableThreadLibraryCalls(hinstDLL);
-    }
+    if (fdwReason == DLL_PROCESS_ATTACH) { hInstance = hinstDLL; DisableThreadLibraryCalls(hinstDLL); }
     return TRUE;
 }
 
-__declspec(dllexport) const TCHAR* LibDescription()      { return WALKER_NAME; }
-__declspec(dllexport) int          LibNumberClasses()     { return 1; }
-__declspec(dllexport) ClassDesc*   LibClassDesc(int i)    { return i == 0 ? &walkerDesc : nullptr; }
-__declspec(dllexport) ULONG        LibVersion()           { return VERSION_3DSMAX; }
-__declspec(dllexport) int          LibInitialize()        { return TRUE; }
-__declspec(dllexport) int          LibShutdown()          { return TRUE; }
+__declspec(dllexport) const TCHAR* LibDescription()   { return WALKER_NAME; }
+__declspec(dllexport) int          LibNumberClasses()  { return 1; }
+__declspec(dllexport) ClassDesc*   LibClassDesc(int i) { return i == 0 ? &walkerDesc : nullptr; }
+__declspec(dllexport) ULONG        LibVersion()        { return VERSION_3DSMAX; }
+__declspec(dllexport) int          LibInitialize()     { return TRUE; }
+__declspec(dllexport) int          LibShutdown()       { return TRUE; }
