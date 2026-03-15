@@ -8,6 +8,8 @@
 #include <actiontable.h>
 #include <custcont.h>
 #include <iepoly.h>
+#include <maxscript/maxscript.h>
+#include <hold.h>
 #include <windowsx.h>
 #include <string>
 #include <vector>
@@ -172,6 +174,10 @@ static RECT     g_closeRect  = {};
 
 static const UINT WM_WALKER_TOGGLE = WM_USER + 100;
 
+// EPoly undo+reapply state
+static int          g_epolyOp  = -1;       // last detected operation ID
+static FPInterface* g_epolyFP  = nullptr;  // EPoly FP interface for re-executing
+
 static std::vector<EditField>   g_edits;
 static std::vector<GroupHeader> g_groups;
 static std::wstring             g_nodeName;
@@ -231,15 +237,19 @@ static void CollectParams(IParamBlock2* pb, int& total) {
 static bool TryEPolyParams(Animatable* owner) {
     if (!owner) return false;
 
-    FPInterface* ep = (FPInterface*)owner->GetInterface(EPOLY_INTERFACE);
-    if (!ep) return false;
+    FPInterface* fp = (FPInterface*)owner->GetInterface(EPOLY_INTERFACE);
+    if (!fp) return false;
 
     // Call via FP dispatch — these virtuals are private
     FPValue lastOpVal, selLevelVal;
-    ep->Invoke(epfn_get_last_operation, lastOpVal);
-    ep->Invoke(epfn_get_epoly_sel_level, selLevelVal);
+    fp->Invoke(epfn_get_last_operation, lastOpVal);
+    fp->Invoke(epfn_get_epoly_sel_level, selLevelVal);
     int lastOp   = lastOpVal.i;
     int selLevel = selLevelVal.i;
+
+    // Store for undo+reapply
+    g_epolyOp = lastOp;
+    g_epolyFP = fp;
 
     int paramCount = 0;
     std::wstring opTitle;
@@ -371,6 +381,23 @@ static void RefreshEdits(bool forceAll) {
     }
 }
 
+// ── EPoly: undo last op, re-execute with current params ─────────
+static void EPolyReapply() {
+    if (g_epolyOp < 0 || !g_epolyFP) return;
+    Interface* ip = GetCOREInterface();
+    if (!ip) return;
+
+    // Undo the last operation (original or our previous re-apply)
+    ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
+
+    // Re-execute with current param block values
+    FPParams prms(1, TYPE_ENUM, g_epolyOp);
+    FPValue result;
+    g_epolyFP->Invoke(epfn_button_op, result, &prms);
+
+    ip->RedrawViews(ip->GetTime());
+}
+
 // ── Notify scene after param change ─────────────────────────────
 static void NotifyParamChanged() {
     Interface* ip = GetCOREInterface();
@@ -399,6 +426,7 @@ static void ApplyEdit(HWND h) {
         TCHAR txt[256];
         GetWindowText(h, txt, 256);
 
+        theHold.Suspend();
         if (IsFloat(ef.type)) {
             ef.pb->SetValue(ef.id, t, (float)_wtof(txt));
         } else if (ef.type == TYPE_BOOL) {
@@ -407,7 +435,9 @@ static void ApplyEdit(HWND h) {
         } else {
             ef.pb->SetValue(ef.id, t, _wtoi(txt));
         }
-        NotifyParamChanged();
+        theHold.Resume();
+        if (g_epolyOp >= 0) EPolyReapply();
+        else                 NotifyParamChanged();
         break;
     }
 }
@@ -434,6 +464,8 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         bool shift = (GetKeyState(VK_SHIFT)   & 0x8000) != 0;
         bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
 
+        // Suspend undo for param-only changes (EPolyReapply handles its own undo)
+        theHold.Suspend();
         if (IsFloat(ef->type)) {
             float cur = ef->pb->GetFloat(ef->id, t);
             float a = cur < 0 ? -cur : cur;
@@ -451,8 +483,11 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (intStep == 0) intStep = step > 0 ? 1 : -1;
             ef->pb->SetValue(ef->id, t, cur + intStep);
         }
-        RefreshEdits(true);   // forceAll — update the field we're scrolling on
-        NotifyParamChanged();
+        theHold.Resume();
+
+        if (g_epolyOp >= 0) EPolyReapply();
+        else                 NotifyParamChanged();
+        RefreshEdits(true);
         return 0;
     }
 
@@ -460,9 +495,12 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (ef && ef->type == TYPE_BOOL) {
             Interface* ip = GetCOREInterface();
             TimeValue t = ip->GetTime();
+            theHold.Suspend();
             ef->pb->SetValue(ef->id, t, ef->pb->GetInt(ef->id, t) ? 0 : 1);
+            theHold.Resume();
+            if (g_epolyOp >= 0) EPolyReapply();
+            else                 NotifyParamChanged();
             RefreshEdits(true);
-            NotifyParamChanged();
             return 0;
         }
         break;
@@ -704,6 +742,8 @@ static void ClosePanel() {
     ShowWindow(g_panel, SW_HIDE);
     g_open = false;
     g_hoverClose = false;
+    g_epolyOp = -1;
+    g_epolyFP = nullptr;
 
     EnableAccelerators();
 
