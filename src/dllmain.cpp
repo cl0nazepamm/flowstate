@@ -174,10 +174,11 @@ static RECT     g_closeRect  = {};
 
 static const UINT WM_WALKER_TOGGLE = WM_USER + 100;
 
-// EPoly undo+reapply state — one-shot, killed on close
-static int          g_epolyOp    = -1;
-static FPInterface* g_epolyFP    = nullptr;
-static bool         g_tryEPoly   = true;    // gate: only try EPoly detection once
+// EPoly preview state — one-shot, killed on close
+static int          g_epolyOp      = -1;
+static FPInterface* g_epolyFP      = nullptr;
+static bool         g_epolyPreview = false;  // true = in preview mode
+static bool         g_tryEPoly     = true;   // gate: only try EPoly detection once
 
 static std::vector<EditField>   g_edits;
 static std::vector<GroupHeader> g_groups;
@@ -185,7 +186,7 @@ static std::wstring             g_nodeName;
 
 // Forward declarations
 static void TogglePanel(bool fresh = false);
-static void ClosePanel();
+static void ClosePanel(bool accept = true);
 static void RefreshEdits(bool forceAll = false);
 static void ApplyEdit(HWND h);
 
@@ -380,21 +381,50 @@ static void RefreshEdits(bool forceAll) {
     }
 }
 
-// ── EPoly: undo last op, re-execute with current params ─────────
-static void EPolyReapply() {
-    if (g_epolyOp < 0 || !g_epolyFP) return;
+// ── EPoly preview: enter preview mode (undo committed op first) ──
+static void EPolyPreviewBegin() {
+    if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview) return;
     Interface* ip = GetCOREInterface();
     if (!ip) return;
 
-    // Undo the last operation (original or our previous re-apply)
+    // Undo the committed operation ONCE to restore pre-op state + selection
     ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
 
-    // Re-execute with current param block values
+    // Enter preview mode for this operation
     FPParams prms(1, TYPE_ENUM, g_epolyOp);
     FPValue result;
-    g_epolyFP->Invoke(epfn_button_op, result, &prms);
+    g_epolyFP->Invoke(epfn_preview_begin, result, &prms);
+    g_epolyPreview = true;
 
+    // Initial preview with current param values
+    FPValue dummy;
+    g_epolyFP->Invoke(epfn_preview_invalidate, dummy);
     ip->RedrawViews(ip->GetTime());
+}
+
+// Refresh the preview after a param change (no undo, just invalidate)
+static void EPolyPreviewUpdate() {
+    if (!g_epolyPreview || !g_epolyFP) return;
+    FPValue dummy;
+    g_epolyFP->Invoke(epfn_preview_invalidate, dummy);
+    Interface* ip = GetCOREInterface();
+    if (ip) ip->RedrawViews(ip->GetTime());
+}
+
+// Commit the preview result
+static void EPolyPreviewAccept() {
+    if (!g_epolyPreview || !g_epolyFP) return;
+    FPValue dummy;
+    g_epolyFP->Invoke(epfn_preview_accept, dummy);
+    g_epolyPreview = false;
+}
+
+// Cancel the preview (reverts to pre-op state)
+static void EPolyPreviewCancel() {
+    if (!g_epolyPreview || !g_epolyFP) return;
+    FPValue dummy;
+    g_epolyFP->Invoke(epfn_preview_cancel, dummy);
+    g_epolyPreview = false;
 }
 
 // ── Notify scene after param change ─────────────────────────────
@@ -435,8 +465,9 @@ static void ApplyEdit(HWND h) {
             ef.pb->SetValue(ef.id, t, _wtoi(txt));
         }
         theHold.Resume();
-        if (g_epolyOp >= 0) EPolyReapply();
-        else                 NotifyParamChanged();
+        if (g_epolyOp >= 0 && !g_epolyPreview) EPolyPreviewBegin();
+        if (g_epolyPreview) EPolyPreviewUpdate();
+        else                NotifyParamChanged();
         break;
     }
 }
@@ -448,7 +479,7 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_KEYDOWN:
         if (wp == VK_RETURN)  { ApplyEdit(h); RefreshEdits(true); return 0; }
-        if (wp == VK_ESCAPE)  { ClosePanel(); return 0; }
+        if (wp == VK_ESCAPE)  { ClosePanel(false); return 0; }
         if (wp == VK_TAB)     { SetFocus(GetNextDlgTabItem(g_panel, h, GetKeyState(VK_SHIFT) < 0)); return 0; }
         break;
     case WM_CHAR:
@@ -463,7 +494,9 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         bool shift = (GetKeyState(VK_SHIFT)   & 0x8000) != 0;
         bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
 
-        // Suspend undo for param-only changes (EPolyReapply handles its own undo)
+        // Enter preview mode on first change (one-time undo + preview_begin)
+        if (g_epolyOp >= 0 && !g_epolyPreview) EPolyPreviewBegin();
+
         theHold.Suspend();
         if (IsFloat(ef->type)) {
             float cur = ef->pb->GetFloat(ef->id, t);
@@ -484,7 +517,7 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         theHold.Resume();
 
-        if (g_epolyOp >= 0) EPolyReapply();
+        if (g_epolyPreview)  EPolyPreviewUpdate();
         else                 NotifyParamChanged();
         RefreshEdits(true);
         return 0;
@@ -494,10 +527,11 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (ef && ef->type == TYPE_BOOL) {
             Interface* ip = GetCOREInterface();
             TimeValue t = ip->GetTime();
+            if (g_epolyOp >= 0 && !g_epolyPreview) EPolyPreviewBegin();
             theHold.Suspend();
             ef->pb->SetValue(ef->id, t, ef->pb->GetInt(ef->id, t) ? 0 : 1);
             theHold.Resume();
-            if (g_epolyOp >= 0) EPolyReapply();
+            if (g_epolyPreview)  EPolyPreviewUpdate();
             else                 NotifyParamChanged();
             RefreshEdits(true);
             return 0;
@@ -742,9 +776,15 @@ static void OpenPanel() {
     g_open = true;
 }
 
-static void ClosePanel() {
+// accept=true commits preview result, accept=false cancels (reverts)
+static void ClosePanel(bool accept) {
     if (!g_open) return;
     KillTimer(g_panel, 1);
+
+    // Commit or cancel the EPoly preview before destroying UI
+    if (accept) EPolyPreviewAccept();
+    else        EPolyPreviewCancel();
+
     for (auto& ef : g_edits) {
         if (ef.hwnd) { RemoveProp(ef.hwnd, _T("WF")); DestroyWindow(ef.hwnd); ef.hwnd = nullptr; }
     }
@@ -755,7 +795,8 @@ static void ClosePanel() {
     g_hoverClose = false;
     g_epolyOp = -1;
     g_epolyFP = nullptr;
-    g_tryEPoly = false;   // killed — next open always goes generic
+    g_epolyPreview = false;
+    g_tryEPoly = false;
 
     EnableAccelerators();
 
