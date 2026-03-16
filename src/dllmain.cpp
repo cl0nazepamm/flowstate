@@ -7,6 +7,7 @@
 #include <object.h>
 #include <actiontable.h>
 #include <custcont.h>
+#include <iparamm2.h>
 #include <iepoly.h>
 #include <maxscript/maxscript.h>
 #include <hold.h>
@@ -112,8 +113,9 @@ static bool     g_open       = false;
 static bool     g_hoverClose = false;
 static RECT     g_closeRect  = {};
 
-static const UINT WM_WALKER_TOGGLE = WM_USER + 100;
-static const UINT WM_WALKER_PIN   = WM_USER + 102;
+static const UINT WM_WALKER_TOGGLE   = WM_USER + 100;
+static const UINT WM_WALKER_PIN      = WM_USER + 102;
+static const UINT WM_WALKER_ADDPARAM = WM_USER + 103;
 
 static int          g_epolyOp          = -1;
 static FPInterface* g_epolyFP          = nullptr;
@@ -194,7 +196,13 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             return 1;
         }
         if (xbutton == XBUTTON1 && g_open) {
-            PostMessage(g_panel, WM_WALKER_PIN, 0, 0);
+            // Check if cursor is over Walker panel
+            POINT cpt; GetCursorPos(&cpt);
+            RECT pr; GetWindowRect(g_panel, &pr);
+            if (PtInRect(&pr, cpt))
+                PostMessage(g_panel, WM_WALKER_PIN, 0, 0);      // pin/unpin
+            else
+                PostMessage(g_panel, WM_WALKER_ADDPARAM, 0, 0);  // grab spinner
             return 1;
         }
     }
@@ -205,6 +213,119 @@ pass:
 // ── Param helpers ───────────────────────────────────────────────
 static bool IsFloat(ParamType2 t) { return t==TYPE_FLOAT||t==TYPE_ANGLE||t==TYPE_PCNT_FRAC||t==TYPE_WORLD||t==TYPE_COLOR_CHANNEL; }
 static bool IsInt(ParamType2 t)   { return t==TYPE_INT||t==TYPE_TIMEVALUE||t==TYPE_RADIOBTN_INDEX||t==TYPE_INDEX; }
+
+// ── Detect spinner under cursor → return its persistent key ─────
+static std::wstring DetectSpinnerKey() {
+    POINT pt; GetCursorPos(&pt);
+    HWND hwnd = WindowFromPoint(pt);
+    if (!hwnd) return L"";
+
+    TCHAR cls[64]; GetClassName(hwnd, cls, 64);
+    if (_tcscmp(cls, SPINNERWINDOWCLASS) != 0 && _tcscmp(cls, CUSTEDITWINDOWCLASS) != 0)
+        return L"";
+
+    int ctrlID = GetDlgCtrlID(hwnd);
+    HWND dlg = GetParent(hwnd);
+    if (!dlg || ctrlID == 0) return L"";
+
+    Interface* ip = GetCOREInterface();
+    if (!ip || ip->GetSelNodeCount() == 0) return L"";
+    INode* node = ip->GetSelNode(0);
+    if (!node) return L"";
+
+    // Search all param blocks on the selected node's modifier stack + base object
+    auto tryPB = [&](IParamBlock2* pb, const MCHAR* className) -> std::wstring {
+        if (!pb) return L"";
+        IParamMap2* map = pb->GetMap();
+        if (!map || map->GetHWnd() != dlg) return L"";
+        for (int i = 0; i < pb->NumParams(); i++) {
+            ParamID pid = pb->IndextoID(i);
+            const ParamDef& def = pb->GetParamDef(pid);
+            for (int c = 0; c < def.ctrl_count; c++) {
+                if (def.ctrl_IDs[c] == ctrlID) {
+                    std::wstring key = std::wstring(className) + L":" + (def.int_name ? def.int_name : L"?");
+                    return key;
+                }
+            }
+        }
+        return L"";
+    };
+
+    Object* obj = node->GetObjectRef();
+    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        IDerivedObject* d = static_cast<IDerivedObject*>(obj);
+        for (int m = 0; m < d->NumModifiers(); m++) {
+            Modifier* mod = d->GetModifier(m);
+            if (!mod) continue;
+            MSTR cn; mod->GetClassName(cn, false);
+            for (int b = 0; b < mod->NumParamBlocks(); b++) {
+                std::wstring key = tryPB(mod->GetParamBlock(b), cn.data());
+                if (!key.empty()) return key;
+            }
+        }
+        obj = d->GetObjRef();
+    }
+    if (obj) {
+        MSTR cn; obj->GetClassName(cn, false);
+        for (int b = 0; b < obj->NumParamBlocks(); b++) {
+            std::wstring key = tryPB(obj->GetParamBlock(b), cn.data());
+            if (!key.empty()) return key;
+        }
+        // EPoly param block
+        EPoly* ep = (EPoly*)obj->GetInterface(EPOLY_INTERFACE);
+        if (ep) {
+            std::wstring key = tryPB(ep->getParamBlock(), cn.data());
+            if (!key.empty()) return key;
+        }
+    }
+    return L"";
+}
+
+// ── Find a param by persistent key on current selection ─────────
+static bool FindParamByKey(INode* node, const std::wstring& key,
+                           IParamBlock2*& outPB, ParamID& outID, ParamType2& outType) {
+    size_t sep = key.find(L':');
+    if (sep == std::wstring::npos) return false;
+    std::wstring wantClass = key.substr(0, sep);
+    std::wstring wantParam = key.substr(sep + 1);
+
+    auto searchPB = [&](IParamBlock2* pb) -> bool {
+        if (!pb) return false;
+        for (int i = 0; i < pb->NumParams(); i++) {
+            ParamID pid = pb->IndextoID(i);
+            const ParamDef& def = pb->GetParamDef(pid);
+            if (def.int_name && std::wstring(def.int_name) == wantParam) {
+                outPB = pb; outID = pid; outType = def.type;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    Object* obj = node->GetObjectRef();
+    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        IDerivedObject* d = static_cast<IDerivedObject*>(obj);
+        for (int m = 0; m < d->NumModifiers(); m++) {
+            Modifier* mod = d->GetModifier(m);
+            if (!mod) continue;
+            MSTR cn; mod->GetClassName(cn, false);
+            if (std::wstring(cn.data()) != wantClass) continue;
+            for (int b = 0; b < mod->NumParamBlocks(); b++)
+                if (searchPB(mod->GetParamBlock(b))) return true;
+        }
+        obj = d->GetObjRef();
+    }
+    if (obj) {
+        MSTR cn; obj->GetClassName(cn, false);
+        if (std::wstring(cn.data()) == wantClass) {
+            for (int b = 0; b < obj->NumParamBlocks(); b++)
+                if (searchPB(obj->GetParamBlock(b))) return true;
+            EPoly* ep = (EPoly*)obj->GetInterface(EPOLY_INTERFACE);
+            if (ep && searchPB(ep->getParamBlock())) return true;
+        }
+    }
+    return false;
+}
 
 static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int& total) {
     if (!pb) return;
@@ -344,6 +465,42 @@ static void GatherParams() {
             CollectParams(obj->GetParamBlock(b), gh.title, tot);
         gh.count = (int)g_edits.size() - gh.startIdx;
         if (gh.count > 0) g_groups.push_back(gh);
+    }
+
+    // ── Collect pinned params not already in panel ──────────────
+    if (!g_pinned.empty() && node) {
+        // Build set of keys already collected
+        std::set<std::wstring> existing;
+        for (auto& ef : g_edits) existing.insert(ef.key);
+
+        GroupHeader pgh;
+        pgh.title    = L"\u2605 Pinned";
+        pgh.startIdx = (int)g_edits.size();
+
+        for (auto& key : g_pinned) {
+            if (existing.count(key)) continue;  // already shown
+            if (g_hidden.count(key)) continue;
+
+            IParamBlock2* pb = nullptr;
+            ParamID pid = 0;
+            ParamType2 ptype = (ParamType2)0;
+            if (FindParamByKey(node, key, pb, pid, ptype)) {
+                if (ptype & TYPE_TAB) continue;
+                if (!IsFloat(ptype) && !IsInt(ptype) && ptype != TYPE_BOOL) continue;
+
+                size_t sep = key.find(L':');
+                EditField ef;
+                ef.label = (sep != std::wstring::npos) ? key.substr(sep + 1) : key;
+                ef.key   = key;
+                ef.pb    = pb;
+                ef.id    = pid;
+                ef.type  = ptype;
+                g_edits.push_back(ef);
+            }
+        }
+
+        pgh.count = (int)g_edits.size() - pgh.startIdx;
+        if (pgh.count > 0) g_groups.push_back(pgh);
     }
 }
 
@@ -808,7 +965,6 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         TogglePanel(wp != 0); return 0;
 
     case WM_WALKER_PIN: {
-        // XButton1: toggle pin on param under cursor
         int idx = FindParamAtCursor();
         if (idx >= 0) {
             const auto& key = g_edits[idx].key;
@@ -816,6 +972,19 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else g_pinned.insert(key);
             SaveSettings();
             InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    }
+
+    case WM_WALKER_ADDPARAM: {
+        // XButton1 outside panel: detect spinner in Max UI, pin it
+        std::wstring key = DetectSpinnerKey();
+        if (!key.empty()) {
+            g_pinned.insert(key);
+            SaveSettings();
+            // Re-gather to pick up the new pinned param
+            GatherParams();
+            BuildLayout();
         }
         return 0;
     }
