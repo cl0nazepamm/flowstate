@@ -723,6 +723,25 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
 
+        // Shift+click on group header = unhide all params for that group
+        if (GetKeyState(VK_SHIFT) & 0x8000) {
+            int gIdx = FindGroupAtY(pt.y);
+            if (gIdx >= 0) {
+                const auto& title = g_groups[gIdx].title;
+                std::wstring prefix = title + L":";
+                // Remove all hidden entries starting with this group
+                for (auto it = g_hidden.begin(); it != g_hidden.end(); ) {
+                    if (it->compare(0, prefix.size(), prefix) == 0) it = g_hidden.erase(it);
+                    else ++it;
+                }
+                SaveSettings();
+                // Re-gather and rebuild to get the params back
+                GatherParams();
+                BuildLayout();
+                return 0;
+            }
+        }
+
         // Click on group header = toggle collapse
         int gIdx = FindGroupAtY(pt.y);
         if (gIdx >= 0) {
@@ -734,6 +753,17 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         break;
+    }
+
+    case WM_RBUTTONDOWN: {
+        // Right-click = clear ALL hidden params, re-gather everything
+        if (!g_hidden.empty()) {
+            g_hidden.clear();
+            SaveSettings();
+            GatherParams();
+            BuildLayout();
+        }
+        return 0;
     }
 
     case WM_MOUSEMOVE: {
