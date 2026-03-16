@@ -52,21 +52,31 @@ static const COLORREF kEditFocus = RGB(50, 50, 58);
 static const COLORREF kCloseHov  = RGB(200, 60, 60);
 static const COLORREF kPinClr    = RGB(255, 200, 60);
 
-// ── EPoly operation mappings (unchanged) ────────────────────────
-struct OpParam { const TCHAR* name; ParamID pid; bool isFloat; };
+static std::wstring MakeParamLabel(const MCHAR* rawName) {
+    if (!rawName || !rawName[0]) return L"?";
+    std::wstring label(rawName);
+    for (auto& ch : label) {
+        if (ch == L'_') ch = L' ';
+    }
+    return label;
+}
 
-static const OpParam kConnectParams[]     = { {_T("Segments"),(ParamID)ep_connect_edge_segments,false}, {_T("Pinch"),(ParamID)ep_connect_edge_pinch,true}, {_T("Slide"),(ParamID)ep_connect_edge_slide,true} };
-static const OpParam kBridgeParams[]      = { {_T("Segments"),(ParamID)ep_bridge_segments,false}, {_T("Taper"),(ParamID)ep_bridge_taper,true}, {_T("Bias"),(ParamID)ep_bridge_bias,true}, {_T("Twist 1"),(ParamID)ep_bridge_twist_1,true}, {_T("Twist 2"),(ParamID)ep_bridge_twist_2,true} };
-static const OpParam kExtrudeFaceParams[] = { {_T("Height"),(ParamID)ep_face_extrude_height,true} };
-static const OpParam kExtrudeEdgeParams[] = { {_T("Height"),(ParamID)ep_edge_extrude_height,true}, {_T("Width"),(ParamID)ep_edge_extrude_width,true} };
-static const OpParam kExtrudeVertParams[] = { {_T("Width"),(ParamID)ep_vertex_extrude_width,true}, {_T("Height"),(ParamID)ep_vertex_extrude_height,true} };
-static const OpParam kBevelParams[]       = { {_T("Height"),(ParamID)ep_bevel_height,true}, {_T("Outline"),(ParamID)ep_bevel_outline,true}, {_T("Type"),(ParamID)ep_bevel_type,false} };
-static const OpParam kChamferEdgeParams[] = { {_T("Amount"),(ParamID)ep_edge_chamfer,true}, {_T("Segments"),(ParamID)ep_edge_chamfer_segments,false} };
-static const OpParam kChamferVertParams[] = { {_T("Amount"),(ParamID)ep_vertex_chamfer,true} };
-static const OpParam kInsetParams[]       = { {_T("Amount"),(ParamID)ep_inset,true}, {_T("Type"),(ParamID)ep_inset_type,false} };
-static const OpParam kOutlineParams[]     = { {_T("Amount"),(ParamID)ep_outline,true} };
+// Compatibility fallback for operation settings when live rollout controls are unavailable.
+struct FallbackOpParam { const TCHAR* label; ParamID pid; bool isFloat; };
 
-static const OpParam* LookupOp(int op, int selLevel, int& count, std::wstring& title) {
+static const FallbackOpParam kConnectParams[]     = { {_T("Segments"),(ParamID)ep_connect_edge_segments,false}, {_T("Pinch"),(ParamID)ep_connect_edge_pinch,true}, {_T("Slide"),(ParamID)ep_connect_edge_slide,true} };
+static const FallbackOpParam kBridgeParams[]      = { {_T("Segments"),(ParamID)ep_bridge_segments,false}, {_T("Taper"),(ParamID)ep_bridge_taper,true}, {_T("Bias"),(ParamID)ep_bridge_bias,true}, {_T("Twist 1"),(ParamID)ep_bridge_twist_1,true}, {_T("Twist 2"),(ParamID)ep_bridge_twist_2,true} };
+static const FallbackOpParam kExtrudeFaceParams[] = { {_T("Height"),(ParamID)ep_face_extrude_height,true} };
+static const FallbackOpParam kExtrudeEdgeParams[] = { {_T("Height"),(ParamID)ep_edge_extrude_height,true}, {_T("Width"),(ParamID)ep_edge_extrude_width,true} };
+static const FallbackOpParam kExtrudeVertParams[] = { {_T("Width"),(ParamID)ep_vertex_extrude_width,true}, {_T("Height"),(ParamID)ep_vertex_extrude_height,true} };
+static const FallbackOpParam kBevelParams[]       = { {_T("Height"),(ParamID)ep_bevel_height,true}, {_T("Outline"),(ParamID)ep_bevel_outline,true}, {_T("Type"),(ParamID)ep_bevel_type,false} };
+static const FallbackOpParam kChamferEdgeParams[] = { {_T("Amount"),(ParamID)ep_edge_chamfer,true}, {_T("Segments"),(ParamID)ep_edge_chamfer_segments,false} };
+static const FallbackOpParam kChamferVertParams[] = { {_T("Amount"),(ParamID)ep_vertex_chamfer,true} };
+static const FallbackOpParam kInsetParams[]       = { {_T("Amount"),(ParamID)ep_inset,true}, {_T("Type"),(ParamID)ep_inset_type,false} };
+static const FallbackOpParam kOutlineParams[]     = { {_T("Amount"),(ParamID)ep_outline,true} };
+
+static const FallbackOpParam* LookupFallbackParams(int op, int selLevel, int& count, std::wstring& title) {
+    title.clear();
     switch (op) {
     case epop_connect_edges:    title=L"Connect";  count=3; return kConnectParams;
     case epop_bridge_border: case epop_bridge_polygon: case epop_bridge_edge:
@@ -90,6 +100,7 @@ struct EditField {
     HWND         hwnd = nullptr;
     std::wstring label;
     std::wstring key;        // persistent ID "Group:Label"
+    int          keyOrdinal = 0; // nth occurrence for duplicated keys
     IParamBlock2* pb  = nullptr;
     ParamID      id   = 0;
     ParamType2   type = (ParamType2)0;
@@ -121,7 +132,8 @@ static int          g_epolyOp          = -1;
 static FPInterface* g_epolyFP          = nullptr;
 static bool         g_epolyPreview     = false;
 static bool         g_tryEPoly         = true;
-static int          g_lastDetectedOp   = -2;  // last EPoly op we already handled (-2 = never)
+static int          g_lastDetectedOp   = -2;  // remembered while op UI is live; reset when op UI disappears
+static ULONG        g_nodeHandle       = 0;
 
 static std::vector<EditField>   g_edits;
 static std::vector<GroupHeader> g_groups;
@@ -217,32 +229,40 @@ static bool IsInt(ParamType2 t)   { return t==TYPE_INT||t==TYPE_TIMEVALUE||t==TY
 // ── Detect spinner under cursor → return its persistent key ─────
 static std::wstring DetectSpinnerKey() {
     POINT pt; GetCursorPos(&pt);
-    HWND hwnd = WindowFromPoint(pt);
-    if (!hwnd) return L"";
+    HWND hit = WindowFromPoint(pt);
+    if (!hit) return L"";
 
-    TCHAR cls[64]; GetClassName(hwnd, cls, 64);
-    if (_tcscmp(cls, SPINNERWINDOWCLASS) != 0 && _tcscmp(cls, CUSTEDITWINDOWCLASS) != 0)
-        return L"";
-
-    int ctrlID = GetDlgCtrlID(hwnd);
-    HWND dlg = GetParent(hwnd);
-    if (!dlg || ctrlID == 0) return L"";
+    std::vector<HWND> chain;
+    for (HWND w = hit; w && chain.size() < 24; w = GetParent(w))
+        chain.push_back(w);
 
     Interface* ip = GetCOREInterface();
     if (!ip || ip->GetSelNodeCount() == 0) return L"";
     INode* node = ip->GetSelNode(0);
     if (!node) return L"";
 
-    // Search all param blocks on the selected node's modifier stack + base object
+    auto controlMatchesHit = [&](HWND mapHwnd, int ctrlID) -> bool {
+        if (!mapHwnd || ctrlID <= 0) return false;
+        HWND ctrl = GetDlgItem(mapHwnd, ctrlID);
+        if (!ctrl) return false;
+        for (HWND w : chain)
+            if (w == ctrl || IsChild(ctrl, w) || IsChild(w, ctrl)) return true;
+        return false;
+    };
+
+    // Search all param blocks on the selected node's modifier stack + base object.
     auto tryPB = [&](IParamBlock2* pb, const MCHAR* className) -> std::wstring {
         if (!pb) return L"";
         IParamMap2* map = pb->GetMap();
-        if (!map || map->GetHWnd() != dlg) return L"";
+        if (!map) return L"";
+        HWND mapHwnd = map->GetHWnd();
+        if (!mapHwnd) return L"";
+
         for (int i = 0; i < pb->NumParams(); i++) {
             ParamID pid = pb->IndextoID(i);
             const ParamDef& def = pb->GetParamDef(pid);
             for (int c = 0; c < def.ctrl_count; c++) {
-                if (def.ctrl_IDs[c] == ctrlID) {
+                if (controlMatchesHit(mapHwnd, def.ctrl_IDs[c])) {
                     std::wstring key = std::wstring(className) + L":" + (def.int_name ? def.int_name : L"?");
                     return key;
                 }
@@ -283,11 +303,13 @@ static std::wstring DetectSpinnerKey() {
 
 // ── Find a param by persistent key on current selection ─────────
 static bool FindParamByKey(INode* node, const std::wstring& key,
-                           IParamBlock2*& outPB, ParamID& outID, ParamType2& outType) {
+                           IParamBlock2*& outPB, ParamID& outID, ParamType2& outType,
+                           int keyOrdinal = 0) {
     size_t sep = key.find(L':');
     if (sep == std::wstring::npos) return false;
     std::wstring wantClass = key.substr(0, sep);
     std::wstring wantParam = key.substr(sep + 1);
+    int seen = 0;
 
     auto searchPB = [&](IParamBlock2* pb) -> bool {
         if (!pb) return false;
@@ -295,8 +317,11 @@ static bool FindParamByKey(INode* node, const std::wstring& key,
             ParamID pid = pb->IndextoID(i);
             const ParamDef& def = pb->GetParamDef(pid);
             if (def.int_name && std::wstring(def.int_name) == wantParam) {
-                outPB = pb; outID = pid; outType = def.type;
-                return true;
+                if (seen == keyOrdinal) {
+                    outPB = pb; outID = pid; outType = def.type;
+                    return true;
+                }
+                ++seen;
             }
         }
         return false;
@@ -327,6 +352,24 @@ static bool FindParamByKey(INode* node, const std::wstring& key,
     return false;
 }
 
+static bool ResolveEditBinding(INode* node, EditField& ef) {
+    IParamBlock2* pb = nullptr;
+    ParamID pid = 0;
+    ParamType2 ptype = (ParamType2)0;
+    if (!FindParamByKey(node, ef.key, pb, pid, ptype, ef.keyOrdinal)) return false;
+    ef.pb = pb;
+    ef.id = pid;
+    ef.type = ptype;
+    return true;
+}
+
+static int GetNextKeyOrdinal(const std::wstring& key) {
+    int ord = 0;
+    for (const auto& ef : g_edits)
+        if (ef.key == key) ++ord;
+    return ord;
+}
+
 static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int& total) {
     if (!pb) return;
     int n = pb->NumParams();
@@ -344,6 +387,7 @@ static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int&
         EditField ef;
         ef.label = label;
         ef.key   = key;
+        ef.keyOrdinal = GetNextKeyOrdinal(key);
         ef.pb    = pb;
         ef.id    = pid;
         ef.type  = d.type;
@@ -368,41 +412,117 @@ static bool TryEPolyParams(Animatable* owner) {
     int lastOp   = lastOpVal.i;
     int selLevel = selLevelVal.i;
 
-    // Skip if this is the SAME operation we already handled
+    // Forget/reject repeating the same destructive operation until a new one appears.
     if (lastOp == g_lastDetectedOp) return false;
 
-    int paramCount = 0;
+    MSTR classNameM;
+    owner->GetClassName(classNameM, false);
+    std::wstring className = classNameM.data() ? classNameM.data() : L"EPoly";
+
+    int fallbackCount = 0;
     std::wstring opTitle;
-    const OpParam* params = LookupOp(lastOp, selLevel, paramCount, opTitle);
-    if (!params || paramCount == 0) return false;
+    const FallbackOpParam* fallback = LookupFallbackParams(lastOp, selLevel, fallbackCount, opTitle);
+    if (opTitle.empty()) opTitle = className;
 
     GroupHeader gh;
     gh.title    = opTitle;
     gh.startIdx = (int)g_edits.size();
 
-    for (int i = 0; i < paramCount; i++) {
-        if (pb->IDtoIndex(params[i].pid) < 0) continue;
-        std::wstring key = opTitle + L":" + params[i].name;
-        if (g_hidden.count(key)) continue;
+    // Try visible-control scan first (only works if command panel shows this rollup)
+    IParamMap2* map = pb->GetMap();
+    HWND mapHwnd = map ? map->GetHWnd() : nullptr;
+    if (mapHwnd) {
+        for (int i = 0; i < pb->NumParams() && (int)g_edits.size() < kMaxParams; i++) {
+            ParamID pid = pb->IndextoID(i);
+            const ParamDef& d = pb->GetParamDef(pid);
+            if (d.type & TYPE_TAB) continue;
+            if (!IsFloat(d.type) && !IsInt(d.type) && d.type != TYPE_BOOL) continue;
+            if (!d.int_name || !d.int_name[0]) continue;
 
-        EditField ef;
-        ef.label = params[i].name;
-        ef.key   = key;
-        ef.pb    = pb;
-        ef.id    = params[i].pid;
-        ef.type  = (ParamType2)(params[i].isFloat ? TYPE_FLOAT : TYPE_INT);
-        g_edits.push_back(ef);
+            bool visibleInMap = false;
+            for (int c = 0; c < d.ctrl_count; c++) {
+                if (d.ctrl_IDs[c] <= 0) continue;
+                HWND ctrl = GetDlgItem(mapHwnd, d.ctrl_IDs[c]);
+                if (ctrl && IsWindowVisible(ctrl)) { visibleInMap = true; break; }
+            }
+            if (!visibleInMap) continue;
+
+            std::wstring key = opTitle + L":" + d.int_name;
+            if (g_hidden.count(key)) continue;
+
+            EditField ef;
+            ef.label = MakeParamLabel(d.int_name);
+            ef.key   = key;
+            ef.keyOrdinal = GetNextKeyOrdinal(key);
+            ef.pb    = pb;
+            ef.id    = pid;
+            ef.type  = d.type;
+            g_edits.push_back(ef);
+        }
+    }
+
+    // Fallback: hardcoded param IDs (works even if command panel is closed)
+    if ((int)g_edits.size() == gh.startIdx && fallback && fallbackCount > 0) {
+        gh.title = opTitle;
+        for (int i = 0; i < fallbackCount && (int)g_edits.size() < kMaxParams; i++) {
+            if (pb->IDtoIndex(fallback[i].pid) < 0) continue;
+            std::wstring key = gh.title + L":" + fallback[i].label;
+            if (g_hidden.count(key)) continue;
+
+            EditField ef;
+            ef.label = fallback[i].label;
+            ef.key   = key;
+            ef.keyOrdinal = GetNextKeyOrdinal(key);
+            ef.pb    = pb;
+            ef.id    = fallback[i].pid;
+            ef.type  = (ParamType2)(fallback[i].isFloat ? TYPE_FLOAT : TYPE_INT);
+            g_edits.push_back(ef);
+        }
     }
 
     gh.count = (int)g_edits.size() - gh.startIdx;
     if (gh.count > 0) {
         g_epolyOp = lastOp;
         g_epolyFP = fp;
-        g_lastDetectedOp = lastOp;  // stamp — won't detect this same op again
+        g_lastDetectedOp = lastOp;
         g_groups.push_back(gh);
         return true;
     }
     return false;
+}
+
+static bool TryCollectLiveEPoly(Object* obj) {
+    Object* walk = obj;
+    while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        IDerivedObject* d = static_cast<IDerivedObject*>(walk);
+        for (int m = 0; m < d->NumModifiers(); m++) {
+            if (TryEPolyParams(d->GetModifier(m))) return true;
+        }
+        walk = d->GetObjRef();
+    }
+    return walk ? TryEPolyParams(walk) : false;
+}
+
+static bool HasLiveEPolyMap(Object* obj) {
+    Object* walk = obj;
+    while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        IDerivedObject* d = static_cast<IDerivedObject*>(walk);
+        for (int m = 0; m < d->NumModifiers(); m++) {
+            Animatable* owner = d->GetModifier(m);
+            EPoly* ep = owner ? (EPoly*)owner->GetInterface(EPOLY_INTERFACE) : nullptr;
+            if (!ep) continue;
+            IParamBlock2* pb = ep->getParamBlock();
+            IParamMap2* map = pb ? pb->GetMap() : nullptr;
+            if (map && map->GetHWnd()) return true;
+        }
+        walk = d->GetObjRef();
+    }
+    if (!walk) return false;
+    EPoly* ep = (EPoly*)walk->GetInterface(EPOLY_INTERFACE);
+    if (!ep) return false;
+    IParamBlock2* pb = ep->getParamBlock();
+    IParamMap2* map = pb ? pb->GetMap() : nullptr;
+    return map && map->GetHWnd();
 }
 
 // ── Gather params ───────────────────────────────────────────────
@@ -410,6 +530,7 @@ static void GatherParams() {
     g_groups.clear();
     g_edits.clear();
     g_nodeName.clear();
+    g_nodeHandle = 0;
     g_epolyOp = -1;
     g_epolyFP = nullptr;
 
@@ -419,52 +540,45 @@ static void GatherParams() {
     if (!node) return;
     const MCHAR* nn = node->GetName();
     g_nodeName = nn ? nn : L"";
+    g_nodeHandle = node->GetHandle();
 
     Object* obj = node->GetObjectRef();
     if (!obj) return;
 
-    if (g_tryEPoly) {
-        Object* walk = obj;
-        while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-            IDerivedObject* d = static_cast<IDerivedObject*>(walk);
-            for (int m = 0; m < d->NumModifiers(); m++)
-                if (TryEPolyParams(d->GetModifier(m))) return;
-            walk = d->GetObjRef();
+    bool epolyCollected = g_tryEPoly && TryCollectLiveEPoly(obj);
+    if (!epolyCollected) {
+        // Generic
+        obj = node->GetObjectRef();
+        while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+            IDerivedObject* d = static_cast<IDerivedObject*>(obj);
+            for (int m = 0; m < d->NumModifiers(); m++) {
+                Modifier* mod = d->GetModifier(m);
+                if (!mod) continue;
+                GroupHeader gh;
+                MSTR cn; mod->GetClassName(cn, false);
+                const MCHAR* p = cn.data();
+                gh.title    = p ? p : L"Modifier";
+                gh.startIdx = (int)g_edits.size();
+                int tot = 0;
+                for (int b = 0; b < mod->NumParamBlocks(); b++)
+                    CollectParams(mod->GetParamBlock(b), gh.title, tot);
+                gh.count = (int)g_edits.size() - gh.startIdx;
+                if (gh.count > 0) g_groups.push_back(gh);
+            }
+            obj = d->GetObjRef();
         }
-        if (walk && TryEPolyParams(walk)) return;
-    }
-
-    // Generic
-    obj = node->GetObjectRef();
-    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-        IDerivedObject* d = static_cast<IDerivedObject*>(obj);
-        for (int m = 0; m < d->NumModifiers(); m++) {
-            Modifier* mod = d->GetModifier(m);
-            if (!mod) continue;
+        if (obj) {
             GroupHeader gh;
-            MSTR cn; mod->GetClassName(cn, false);
+            MSTR cn; obj->GetClassName(cn, false);
             const MCHAR* p = cn.data();
-            gh.title    = p ? p : L"Modifier";
+            gh.title    = p ? p : L"Object";
             gh.startIdx = (int)g_edits.size();
             int tot = 0;
-            for (int b = 0; b < mod->NumParamBlocks(); b++)
-                CollectParams(mod->GetParamBlock(b), gh.title, tot);
+            for (int b = 0; b < obj->NumParamBlocks(); b++)
+                CollectParams(obj->GetParamBlock(b), gh.title, tot);
             gh.count = (int)g_edits.size() - gh.startIdx;
             if (gh.count > 0) g_groups.push_back(gh);
         }
-        obj = d->GetObjRef();
-    }
-    if (obj) {
-        GroupHeader gh;
-        MSTR cn; obj->GetClassName(cn, false);
-        const MCHAR* p = cn.data();
-        gh.title    = p ? p : L"Object";
-        gh.startIdx = (int)g_edits.size();
-        int tot = 0;
-        for (int b = 0; b < obj->NumParamBlocks(); b++)
-            CollectParams(obj->GetParamBlock(b), gh.title, tot);
-        gh.count = (int)g_edits.size() - gh.startIdx;
-        if (gh.count > 0) g_groups.push_back(gh);
     }
 
     // ── Collect pinned params not already in panel ──────────────
@@ -492,6 +606,7 @@ static void GatherParams() {
                 EditField ef;
                 ef.label = (sep != std::wstring::npos) ? key.substr(sep + 1) : key;
                 ef.key   = key;
+                ef.keyOrdinal = GetNextKeyOrdinal(key);
                 ef.pb    = pb;
                 ef.id    = pid;
                 ef.type  = ptype;
@@ -549,14 +664,18 @@ static void RefreshEdits(bool forceAll) {
     if (!ip) return;
     if (ip->GetSelNodeCount() == 0) { ClosePanel(); return; }
     INode* node = ip->GetSelNode(0);
+    if (!node) { ClosePanel(); return; }
     const MCHAR* nn = node ? node->GetName() : nullptr;
     std::wstring cur = nn ? nn : L"";
-    if (cur != g_nodeName) { ClosePanel(); return; }
+    ULONG handle = node->GetHandle();
+
+    // Hard-close when context changes.
+    if (handle != g_nodeHandle || cur != g_nodeName) { ClosePanel(); return; }
 
     TimeValue t = ip->GetTime();
     HWND focused = GetFocus();
     for (auto& ef : g_edits) {
-        if (!ef.hwnd) continue;
+        if (!ef.hwnd || !ef.pb) continue;
         if (!forceAll && ef.hwnd == focused) continue;
         TCHAR buf[64];
         FormatValue(ef, t, buf, 64);
@@ -577,9 +696,13 @@ static void NotifyParamChanged() {
 static void ApplyEdit(HWND h) {
     Interface* ip = GetCOREInterface();
     if (!ip) return;
+    if (ip->GetSelNodeCount() == 0) return;
+    INode* node = ip->GetSelNode(0);
+    if (!node) return;
     TimeValue t = ip->GetTime();
     for (auto& ef : g_edits) {
         if (ef.hwnd != h) continue;
+        if (!ef.pb) return;
         TCHAR txt[256];
         GetWindowText(h, txt, 256);
         if (g_epolyOp >= 0 && !g_epolyPreview) EPolyPreviewBegin();
@@ -609,6 +732,7 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEWHEEL: {
         if (!ef || !ef->pb) break;
         Interface* ip = GetCOREInterface();
+        if (!ip) break;
         TimeValue t = ip->GetTime();
         float step = (float)GET_WHEEL_DELTA_WPARAM(wp) / 120.0f;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -639,8 +763,9 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_LBUTTONDOWN:
-        if (ef && ef->type == TYPE_BOOL) {
+        if (ef && ef->type == TYPE_BOOL && ef->pb) {
             Interface* ip = GetCOREInterface();
+            if (!ip) break;
             TimeValue t = ip->GetTime();
             if (g_epolyOp >= 0 && !g_epolyPreview) EPolyPreviewBegin();
             theHold.Suspend();
@@ -1033,6 +1158,8 @@ static void ClosePanel(bool accept) {
     g_epolyFP = nullptr;
     g_epolyPreview = false;
     g_tryEPoly = false;
+    g_nodeHandle = 0;
+    g_nodeName.clear();
     EnableAccelerators();
     Interface* ip = GetCOREInterface();
     if (ip) SetFocus(ip->GetMAXHWnd());
