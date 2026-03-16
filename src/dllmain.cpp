@@ -545,40 +545,44 @@ static void GatherParams() {
     Object* obj = node->GetObjectRef();
     if (!obj) return;
 
-    bool epolyCollected = g_tryEPoly && TryCollectLiveEPoly(obj);
-    if (!epolyCollected) {
-        // Generic
-        obj = node->GetObjectRef();
-        while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-            IDerivedObject* d = static_cast<IDerivedObject*>(obj);
-            for (int m = 0; m < d->NumModifiers(); m++) {
-                Modifier* mod = d->GetModifier(m);
-                if (!mod) continue;
-                GroupHeader gh;
-                MSTR cn; mod->GetClassName(cn, false);
-                const MCHAR* p = cn.data();
-                gh.title    = p ? p : L"Modifier";
-                gh.startIdx = (int)g_edits.size();
-                int tot = 0;
-                for (int b = 0; b < mod->NumParamBlocks(); b++)
-                    CollectParams(mod->GetParamBlock(b), gh.title, tot);
-                gh.count = (int)g_edits.size() - gh.startIdx;
-                if (gh.count > 0) g_groups.push_back(gh);
-            }
-            obj = d->GetObjRef();
-        }
-        if (obj) {
+    // ── One-shot EPoly operation detection ──────────────────────
+    if (g_tryEPoly) TryCollectLiveEPoly(obj);
+
+    // ── Generic: modifiers + base object (always runs) ──────────
+    // Collect modifiers
+    Object* walkObj = node->GetObjectRef();
+    while (walkObj && walkObj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        IDerivedObject* d = static_cast<IDerivedObject*>(walkObj);
+        for (int m = 0; m < d->NumModifiers(); m++) {
+            Modifier* mod = d->GetModifier(m);
+            if (!mod) continue;
+            // Skip Edit Poly modifier in generic — handled by EPoly path or XButton1
+            if (mod->GetInterface(EPOLY_INTERFACE)) continue;
             GroupHeader gh;
-            MSTR cn; obj->GetClassName(cn, false);
+            MSTR cn; mod->GetClassName(cn, false);
             const MCHAR* p = cn.data();
-            gh.title    = p ? p : L"Object";
+            gh.title    = p ? p : L"Modifier";
             gh.startIdx = (int)g_edits.size();
             int tot = 0;
-            for (int b = 0; b < obj->NumParamBlocks(); b++)
-                CollectParams(obj->GetParamBlock(b), gh.title, tot);
+            for (int b = 0; b < mod->NumParamBlocks(); b++)
+                CollectParams(mod->GetParamBlock(b), gh.title, tot);
             gh.count = (int)g_edits.size() - gh.startIdx;
             if (gh.count > 0) g_groups.push_back(gh);
         }
+        walkObj = d->GetObjRef();
+    }
+    // Collect base object (skip Editable Poly — too many params, use XButton1)
+    if (walkObj && !walkObj->GetInterface(EPOLY_INTERFACE)) {
+        GroupHeader gh;
+        MSTR cn; walkObj->GetClassName(cn, false);
+        const MCHAR* p = cn.data();
+        gh.title    = p ? p : L"Object";
+        gh.startIdx = (int)g_edits.size();
+        int tot = 0;
+        for (int b = 0; b < walkObj->NumParamBlocks(); b++)
+            CollectParams(walkObj->GetParamBlock(b), gh.title, tot);
+        gh.count = (int)g_edits.size() - gh.startIdx;
+        if (gh.count > 0) g_groups.push_back(gh);
     }
 
     // ── Collect pinned params not already in panel ──────────────
