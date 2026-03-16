@@ -115,10 +115,11 @@ static RECT     g_closeRect  = {};
 static const UINT WM_WALKER_TOGGLE = WM_USER + 100;
 static const UINT WM_WALKER_PIN   = WM_USER + 102;
 
-static int          g_epolyOp      = -1;
-static FPInterface* g_epolyFP      = nullptr;
-static bool         g_epolyPreview = false;
-static bool         g_tryEPoly     = true;
+static int          g_epolyOp          = -1;
+static FPInterface* g_epolyFP          = nullptr;
+static bool         g_epolyPreview     = false;
+static bool         g_tryEPoly         = true;
+static int          g_lastDetectedOp   = -2;  // last EPoly op we already handled (-2 = never)
 
 static std::vector<EditField>   g_edits;
 static std::vector<GroupHeader> g_groups;
@@ -246,6 +247,9 @@ static bool TryEPolyParams(Animatable* owner) {
     int lastOp   = lastOpVal.i;
     int selLevel = selLevelVal.i;
 
+    // Skip if this is the SAME operation we already handled
+    if (lastOp == g_lastDetectedOp) return false;
+
     int paramCount = 0;
     std::wstring opTitle;
     const OpParam* params = LookupOp(lastOp, selLevel, paramCount, opTitle);
@@ -273,6 +277,7 @@ static bool TryEPolyParams(Animatable* owner) {
     if (gh.count > 0) {
         g_epolyOp = lastOp;
         g_epolyFP = fp;
+        g_lastDetectedOp = lastOp;  // stamp — won't detect this same op again
         g_groups.push_back(gh);
         return true;
     }
