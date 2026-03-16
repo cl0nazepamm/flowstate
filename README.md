@@ -1,4 +1,4 @@
-# Walker
+# PowerParams
 
 A floating parameter panel for 3ds Max 2026. Spawns at your cursor, lets you edit object and modifier parameters without the command panel.
 
@@ -6,15 +6,15 @@ A floating parameter panel for 3ds Max 2026. Spawns at your cursor, lets you edi
 
 Press a mouse side button and a dark panel appears with editable parameters for the selected object. Scroll wheel to adjust values, type to override, close when done. Settings persist across sessions.
 
-For Editable Poly, Walker detects your last operation (Connect, Bridge, Extrude, etc.) and shows only those params with live preview through the EPoly preview system.
+For Editable Poly, PowerParams detects your last operation (Connect, Bridge, Extrude, etc.) and shows only those params with live preview through the EPoly preview system.
 
 ## Controls
 
 | Input | Action |
 |-------|--------|
-| **XButton2** (back mouse) | Toggle Walker panel |
-| **XButton1** (front mouse) over Max spinner | Add that parameter to Walker |
-| **XButton1** over Walker param | Pin/unpin (★ marker) |
+| **XButton2** (back mouse) | Toggle PowerParams panel |
+| **XButton1** (front mouse) over Max spinner | Add that parameter to PowerParams |
+| **XButton1** over PowerParams param | Pin/unpin (★ marker) |
 | **Scroll wheel** | Adjust value |
 | **Shift+scroll** | 10x coarser |
 | **Ctrl+scroll** | 10x finer |
@@ -27,11 +27,11 @@ For Editable Poly, Walker detects your last operation (Connect, Bridge, Extrude,
 | **Click outside** | Accept and close |
 | **Drag header** | Move panel |
 
-Also bindable via **Customize > Keyboard** — search for "Walker" category.
+Also bindable via **Customize > Keyboard** — search for "PowerParams" category.
 
 ## How parameters are collected
 
-1. **EPoly operation detection** (one-shot) — if you just did a Connect, Bridge, Extrude, Bevel, Chamfer, Inset, or Outline, Walker shows only those operation params. Uses the EPoly preview system for live feedback. Detected once, forgotten after close.
+1. **EPoly operation detection** (one-shot) — if you just did a Connect, Bridge, Extrude, Bevel, Chamfer, Inset, or Outline, PowerParams shows only those operation params. Uses the EPoly preview system for live feedback. Detected once, forgotten after close.
 
 2. **Modifiers** — Bend, Taper, Twist, Shell, TurboSmooth, etc. All scalar params (float, int, bool) from their param blocks.
 
@@ -43,7 +43,7 @@ Editable Poly base objects are skipped in generic collection (their param block 
 
 ## Persistence
 
-Settings saved to `Walker.cfg` in Max's plugcfg directory:
+Settings saved to `PowerParams.cfg` in Max's plugcfg directory:
 - Collapsed group states
 - Pinned parameters
 - Hidden parameters
@@ -61,7 +61,7 @@ Requires:
 build.bat
 ```
 
-Builds the plugin and deploys `Walker.gup` to the 3ds Max plugins folder. Auto-elevates to admin for the copy.
+Builds the plugin and deploys `PowerParams.gup` to the 3ds Max plugins folder. Auto-elevates to admin for the copy.
 
 ## Architecture
 

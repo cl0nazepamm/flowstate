@@ -1,4 +1,4 @@
-LIBRARY "Walker.gup"
+LIBRARY "PowerParams.gup"
 EXPORTS
     LibDescription      @1
     LibNumberClasses    @2

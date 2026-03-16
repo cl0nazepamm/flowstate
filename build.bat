@@ -35,7 +35,7 @@ for /f "tokens=2 delims==" %%a in ('findstr "PLUGIN_NAME:INTERNAL" "%NATIVE_DIR%
 for /f "tokens=2 delims==" %%a in ('findstr "PLUGIN_TYPE:INTERNAL" "%NATIVE_DIR%build\CMakeCache.txt"') do set PTYPE=%%a
 
 :: Fallback
-if "%PNAME%"=="" set PNAME=Walker
+if "%PNAME%"=="" set PNAME=PowerParams
 if "%PTYPE%"=="" set PTYPE=gup
 
 set PLUGIN_FILE=%PNAME%.%PTYPE%

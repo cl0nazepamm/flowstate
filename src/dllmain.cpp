@@ -16,9 +16,9 @@
 #include <vector>
 #include <set>
 
-#define WALKER_CLASS_ID  Class_ID(0x7A1CE200, 0x3B4D5E6F)
-#define WALKER_NAME      _T("Walker")
-#define WALKER_CATEGORY  _T("MCP")
+#define PPARAM_CLASS_ID  Class_ID(0x7A1CE200, 0x3B4D5E6F)
+#define PPARAM_NAME      _T("PowerParams")
+#define PPARAM_CATEGORY  _T("MCP")
 
 extern HINSTANCE hInstance;
 HINSTANCE hInstance = nullptr;
@@ -28,7 +28,7 @@ static const ActionContextId kContextId = 0x7A1CE202;
 static const int             kToggleId  = 1;
 
 // ── Config ──────────────────────────────────────────────────────
-static const TCHAR* kWndClass = _T("WalkerPanel");
+static const TCHAR* kWndClass = _T("PowerParamsPanel");
 static const int kPad       = 12;
 static const int kFontPx    = 12;
 static const int kFontHdr   = 14;
@@ -124,9 +124,9 @@ static bool     g_open       = false;
 static bool     g_hoverClose = false;
 static RECT     g_closeRect  = {};
 
-static const UINT WM_WALKER_TOGGLE   = WM_USER + 100;
-static const UINT WM_WALKER_PIN      = WM_USER + 102;
-static const UINT WM_WALKER_ADDPARAM = WM_USER + 103;
+static const UINT WM_PP_TOGGLE   = WM_USER + 100;
+static const UINT WM_PP_PIN      = WM_USER + 102;
+static const UINT WM_PP_ADDPARAM = WM_USER + 103;
 
 static int          g_epolyOp          = -1;
 static FPInterface* g_epolyFP          = nullptr;
@@ -151,7 +151,7 @@ static std::wstring GetCfgPath() {
     MSTR dirStr = ip->GetDir(APP_PLUGCFG_DIR);
     const MCHAR* dir = dirStr.data();
     if (!dir || !dir[0]) return L"";
-    return std::wstring(dir) + L"\\Walker.cfg";
+    return std::wstring(dir) + L"\\PowerParams.cfg";
 }
 
 static void SaveSettings() {
@@ -204,17 +204,17 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
         if (!isMax) goto pass;
 
         if (xbutton == XBUTTON2) {
-            PostMessage(g_panel, WM_WALKER_TOGGLE, 1, 0);
+            PostMessage(g_panel, WM_PP_TOGGLE, 1, 0);
             return 1;
         }
         if (xbutton == XBUTTON1 && g_open) {
-            // Check if cursor is over Walker panel
+            // Check if cursor is over PowerParams panel
             POINT cpt; GetCursorPos(&cpt);
             RECT pr; GetWindowRect(g_panel, &pr);
             if (PtInRect(&pr, cpt))
-                PostMessage(g_panel, WM_WALKER_PIN, 0, 0);      // pin/unpin
+                PostMessage(g_panel, WM_PP_PIN, 0, 0);      // pin/unpin
             else
-                PostMessage(g_panel, WM_WALKER_ADDPARAM, 0, 0);  // grab spinner
+                PostMessage(g_panel, WM_PP_ADDPARAM, 0, 0);  // grab spinner
             return 1;
         }
     }
@@ -1090,10 +1090,10 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == VK_ESCAPE) { ClosePanel(false); return 0; }
         break;
 
-    case WM_WALKER_TOGGLE:
+    case WM_PP_TOGGLE:
         TogglePanel(wp != 0); return 0;
 
-    case WM_WALKER_PIN: {
+    case WM_PP_PIN: {
         int idx = FindParamAtCursor();
         if (idx >= 0) {
             const auto& key = g_edits[idx].key;
@@ -1105,7 +1105,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
-    case WM_WALKER_ADDPARAM: {
+    case WM_PP_ADDPARAM: {
         // XButton1 outside panel: detect spinner in Max UI, pin it
         std::wstring key = DetectSpinnerKey();
         if (!key.empty()) {
@@ -1176,20 +1176,20 @@ static void TogglePanel(bool fresh) {
 }
 
 // ── Action system ───────────────────────────────────────────────
-class WalkerAction : public ActionItem {
+class PPAction : public ActionItem {
 public:
     int   GetId() override { return kToggleId; }
     BOOL  ExecuteAction() override { TogglePanel(true); return TRUE; }
-    void  GetButtonText(MSTR& t) override { t = WALKER_NAME; }
-    void  GetMenuText(MSTR& t) override { t = _T("Toggle Walker Panel"); }
-    void  GetDescriptionText(MSTR& t) override { t = _T("Show/hide Walker floating parameter panel"); }
-    void  GetCategoryText(MSTR& t) override { t = WALKER_NAME; }
+    void  GetButtonText(MSTR& t) override { t = PPARAM_NAME; }
+    void  GetMenuText(MSTR& t) override { t = _T("Toggle PowerParams Panel"); }
+    void  GetDescriptionText(MSTR& t) override { t = _T("Show/hide PowerParams floating parameter panel"); }
+    void  GetCategoryText(MSTR& t) override { t = PPARAM_NAME; }
     BOOL  IsChecked() override { return g_open; }
     BOOL  IsItemVisible() override { return TRUE; }
     BOOL  IsEnabled() override { return TRUE; }
     void  DeleteThis() override {}
 };
-class WalkerActionCB : public ActionCallback {
+class PPActionCB : public ActionCallback {
 public:
     BOOL ExecuteAction(int id) override {
         if (id == kToggleId) { TogglePanel(true); return TRUE; }
@@ -1197,18 +1197,18 @@ public:
     }
 };
 
-static WalkerAction   g_action;
-static WalkerActionCB g_actionCB;
+static PPAction   g_action;
+static PPActionCB g_actionCB;
 
 static ActionTable* MakeActionTable() {
-    static ActionTable table(kTableId, kContextId, TSTR(WALKER_NAME));
+    static ActionTable table(kTableId, kContextId, TSTR(PPARAM_NAME));
     static bool init = false;
     if (!init) { table.AppendOperation(&g_action); init = true; }
     return &table;
 }
 
 // ── GUP ─────────────────────────────────────────────────────────
-class WalkerGUP : public GUP {
+class PowerParamsGUP : public GUP {
 public:
     DWORD Start() override {
         LoadSettings();
@@ -1252,31 +1252,31 @@ public:
 };
 
 // ── ClassDesc ───────────────────────────────────────────────────
-class WalkerClassDesc : public ClassDesc2 {
+class PPClassDesc : public ClassDesc2 {
 public:
     int          IsPublic() override              { return TRUE; }
-    void*        Create(BOOL) override            { return new WalkerGUP(); }
-    const TCHAR* ClassName() override             { return WALKER_NAME; }
-    const TCHAR* NonLocalizedClassName() override { return WALKER_NAME; }
+    void*        Create(BOOL) override            { return new PowerParamsGUP(); }
+    const TCHAR* ClassName() override             { return PPARAM_NAME; }
+    const TCHAR* NonLocalizedClassName() override { return PPARAM_NAME; }
     SClass_ID    SuperClassID() override          { return GUP_CLASS_ID; }
-    Class_ID     ClassID() override               { return WALKER_CLASS_ID; }
-    const TCHAR* Category() override              { return WALKER_CATEGORY; }
-    const TCHAR* InternalName() override          { return WALKER_NAME; }
+    Class_ID     ClassID() override               { return PPARAM_CLASS_ID; }
+    const TCHAR* Category() override              { return PPARAM_CATEGORY; }
+    const TCHAR* InternalName() override          { return PPARAM_NAME; }
     HINSTANCE    HInstance() override              { return hInstance; }
     int           NumActionTables() override      { return 1; }
     ActionTable*  GetActionTable(int) override    { return MakeActionTable(); }
 };
 
-static WalkerClassDesc walkerDesc;
+static PPClassDesc ppDesc;
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
     if (fdwReason == DLL_PROCESS_ATTACH) { hInstance = hinstDLL; DisableThreadLibraryCalls(hinstDLL); }
     return TRUE;
 }
 
-__declspec(dllexport) const TCHAR* LibDescription()   { return WALKER_NAME; }
+__declspec(dllexport) const TCHAR* LibDescription()   { return PPARAM_NAME; }
 __declspec(dllexport) int          LibNumberClasses()  { return 1; }
-__declspec(dllexport) ClassDesc*   LibClassDesc(int i) { return i == 0 ? &walkerDesc : nullptr; }
+__declspec(dllexport) ClassDesc*   LibClassDesc(int i) { return i == 0 ? &ppDesc : nullptr; }
 __declspec(dllexport) ULONG        LibVersion()        { return VERSION_3DSMAX; }
 __declspec(dllexport) int          LibInitialize()     { return TRUE; }
 __declspec(dllexport) int          LibShutdown()       { return TRUE; }

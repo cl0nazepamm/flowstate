@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # ╔══════════════════════════════════════════════════════════════╗
 # ║  CHANGE THESE for your plugin                               ║
 # ╚══════════════════════════════════════════════════════════════╝
-set(PLUGIN_NAME "Walker")           # Output filename (Walker.gup)
+set(PLUGIN_NAME "PowerParams")           # Output filename (PowerParams.gup)
 set(PLUGIN_TYPE "gup")              # gup, dlo, dlm, dlt, dlr, dlu, dle, bmi
 
 project(${PLUGIN_NAME} VERSION 1.0.0 LANGUAGES CXX)
