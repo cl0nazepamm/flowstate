@@ -132,7 +132,7 @@ static int          g_epolyOp          = -1;
 static FPInterface* g_epolyFP          = nullptr;
 static bool         g_epolyPreview     = false;
 static bool         g_tryEPoly         = true;
-static int          g_lastDetectedOp   = -2;  // remembered while op UI is live; reset when op UI disappears
+// g_tryEPoly is the only gate for EPoly detection (no dedup needed)
 static ULONG        g_nodeHandle       = 0;
 
 static std::vector<EditField>   g_edits;
@@ -208,13 +208,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             return 1;
         }
         if (xbutton == XBUTTON1 && g_open) {
-            // Check if cursor is over PowerParams panel
-            POINT cpt; GetCursorPos(&cpt);
-            RECT pr; GetWindowRect(g_panel, &pr);
-            if (PtInRect(&pr, cpt))
-                PostMessage(g_panel, WM_PP_PIN, 0, 0);      // pin/unpin
-            else
-                PostMessage(g_panel, WM_PP_ADDPARAM, 0, 0);  // grab spinner
+            PostMessage(g_panel, WM_PP_ADDPARAM, 0, 0);
             return 1;
         }
     }
@@ -412,9 +406,6 @@ static bool TryEPolyParams(Animatable* owner) {
     int lastOp   = lastOpVal.i;
     int selLevel = selLevelVal.i;
 
-    // Forget/reject repeating the same destructive operation until a new one appears.
-    if (lastOp == g_lastDetectedOp) return false;
-
     MSTR classNameM;
     owner->GetClassName(classNameM, false);
     std::wstring className = classNameM.data() ? classNameM.data() : L"EPoly";
@@ -484,7 +475,6 @@ static bool TryEPolyParams(Animatable* owner) {
     if (gh.count > 0) {
         g_epolyOp = lastOp;
         g_epolyFP = fp;
-        g_lastDetectedOp = lastOp;
         g_groups.push_back(gh);
         return true;
     }
@@ -1087,27 +1077,28 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PP_TOGGLE:
         TogglePanel(wp != 0); return 0;
 
-    case WM_PP_PIN: {
-        int idx = FindParamAtCursor();
-        if (idx >= 0) {
-            const auto& key = g_edits[idx].key;
-            if (g_pinned.count(key)) g_pinned.erase(key);
-            else g_pinned.insert(key);
-            SaveSettings();
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
-        return 0;
-    }
-
     case WM_PP_ADDPARAM: {
-        // XButton1 outside panel: detect spinner in Max UI, pin it
+        // Hide panel so WindowFromPoint sees through to Max UI spinners
+        ShowWindow(g_panel, SW_HIDE);
         std::wstring key = DetectSpinnerKey();
+        ShowWindow(g_panel, SW_SHOWNA);
+
         if (!key.empty()) {
+            // Found a spinner — add it as pinned
             g_pinned.insert(key);
             SaveSettings();
-            // Re-gather to pick up the new pinned param
             GatherParams();
             BuildLayout();
+        } else {
+            // No spinner found — try pin/unpin on our panel
+            int idx = FindParamAtCursor();
+            if (idx >= 0) {
+                const auto& k = g_edits[idx].key;
+                if (g_pinned.count(k)) g_pinned.erase(k);
+                else g_pinned.insert(k);
+                SaveSettings();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
         }
         return 0;
     }
