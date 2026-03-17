@@ -75,7 +75,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
     Paramblk2.lib
     comctl32.lib
     # Geom.lib
-    Maxscrpt.lib
+    # Maxscrpt.lib
     # mesh.lib
     # bmm.lib
 )

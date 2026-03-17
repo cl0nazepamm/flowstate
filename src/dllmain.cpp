@@ -9,7 +9,6 @@
 #include <custcont.h>
 #include <iparamm2.h>
 #include <iepoly.h>
-#include <maxscript/maxscript.h>
 #include <hold.h>
 #include <windowsx.h>
 #include <string>
@@ -393,7 +392,7 @@ static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int&
 // ── EPoly preview helpers (no state tracking beyond these) ──────
 static void EPolyBegin() {
     if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview || g_epolySpent) return;
-    ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
+    // No undo — preview applies on current state. Accept = new operation. Cancel = no change.
     FPParams prms(1, TYPE_ENUM, g_epolyOp);
     FPValue r;
     g_epolyFP->Invoke(epfn_preview_begin, r, &prms);
@@ -401,7 +400,7 @@ static void EPolyBegin() {
     FPValue d;
     g_epolyFP->Invoke(epfn_preview_invalidate, d);
     if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
-    InvalidateRect(g_panel, nullptr, FALSE);  // show "✓ Apply" immediately
+    InvalidateRect(g_panel, nullptr, FALSE);
 }
 
 static void EPolyRefresh() {
