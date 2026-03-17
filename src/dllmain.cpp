@@ -130,7 +130,12 @@ static const UINT WM_PP_ADDPARAM = WM_USER + 103;
 
 static ULONG        g_nodeHandle       = 0;
 
-static bool     g_suppressClose = false;  // suppress WM_ACTIVATE close during XButton1
+// EPoly preview state
+static int          g_epolyOp       = -1;
+static FPInterface* g_epolyFP       = nullptr;
+static bool         g_epolyPreview  = false;
+
+static bool     g_suppressClose = false;
 
 static std::vector<EditField>   g_edits;
 static std::vector<GroupHeader> g_groups;
@@ -193,7 +198,7 @@ static void BuildLayout();
 // ── Mouse hook — XButton2=panel, XButton1=pin ───────────────────
 static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     // Click outside panel = instant close
-    if (nCode >= 0 && g_open && !g_suppressClose && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN)) {
+    if (nCode >= 0 && g_open && !g_suppressClose && !g_epolyPreview && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN)) {
         MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lp;
         RECT pr; GetWindowRect(g_panel, &pr);
         if (!PtInRect(&pr, ms->pt)) {
@@ -384,6 +389,59 @@ static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int&
     }
 }
 
+// ── EPoly preview helpers (no state tracking beyond these) ──────
+static void EPolyBegin() {
+    if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview) return;
+    ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
+    FPParams prms(1, TYPE_ENUM, g_epolyOp);
+    FPValue r;
+    g_epolyFP->Invoke(epfn_preview_begin, r, &prms);
+    g_epolyPreview = true;
+    FPValue d;
+    g_epolyFP->Invoke(epfn_preview_invalidate, d);
+    if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
+}
+
+static void EPolyRefresh() {
+    if (!g_epolyPreview || !g_epolyFP) return;
+    FPValue d;
+    g_epolyFP->Invoke(epfn_preview_invalidate, d);
+    if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
+}
+
+static void EPolyAccept() {
+    if (!g_epolyPreview || !g_epolyFP) return;
+    FPValue d;
+    g_epolyFP->Invoke(epfn_preview_accept, d);
+    g_epolyPreview = false;
+}
+
+static void EPolyCancel() {
+    if (!g_epolyPreview || !g_epolyFP) return;
+    FPValue d;
+    g_epolyFP->Invoke(epfn_preview_cancel, d);
+    g_epolyPreview = false;
+}
+
+// Accept preview + remove the op group from panel, panel stays open
+static void EPolyDrop() {
+    EPolyAccept();
+    g_epolyOp = -1;
+    g_epolyFP = nullptr;
+    // Remove first group (the op group)
+    if (!g_groups.empty()) {
+        int cnt = g_groups[0].count;
+        int start = g_groups[0].startIdx;
+        for (int i = start; i < start + cnt; i++) {
+            if (g_edits[i].hwnd) { RemoveProp(g_edits[i].hwnd, _T("WF")); DestroyWindow(g_edits[i].hwnd); }
+        }
+        g_edits.erase(g_edits.begin() + start, g_edits.begin() + start + cnt);
+        g_groups.erase(g_groups.begin());
+        for (auto& gh : g_groups) gh.startIdx -= cnt;
+        BuildLayout();
+    }
+}
+
 // ── Gather params ───────────────────────────────────────────────
 static void GatherParams() {
     g_groups.clear();
@@ -454,7 +512,11 @@ static void GatherParams() {
                             g_edits.push_back(ef);
                         }
                         gh.count = (int)g_edits.size() - gh.startIdx;
-                        if (gh.count > 0) g_groups.push_back(gh);
+                        if (gh.count > 0) {
+                            g_epolyOp = lastOp;
+                            g_epolyFP = fp;
+                            g_groups.push_back(gh);
+                        }
                     }
                 }
             }
@@ -598,12 +660,14 @@ static void ApplyEdit(HWND h) {
         if (!ef.pb) return;
         TCHAR txt[256];
         GetWindowText(h, txt, 256);
+        if (g_epolyOp >= 0 && !g_epolyPreview) EPolyBegin();
         theHold.Suspend();
         if (IsFloat(ef.type))       ef.pb->SetValue(ef.id, t, (float)_wtof(txt));
         else if (ef.type==TYPE_BOOL) ef.pb->SetValue(ef.id, t, (_wcsicmp(txt,_T("On"))==0||_wtoi(txt)!=0)?1:0);
         else                        ef.pb->SetValue(ef.id, t, _wtoi(txt));
         theHold.Resume();
-        NotifyParamChanged();
+        if (g_epolyPreview) EPolyRefresh();
+        else                NotifyParamChanged();
         break;
     }
 }
@@ -614,7 +678,7 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_KEYDOWN:
         if (wp == VK_RETURN)  { ApplyEdit(h); RefreshEdits(true); return 0; }
-        if (wp == VK_ESCAPE)  { ClosePanel(); return 0; }
+        if (wp == VK_ESCAPE)  { EPolyCancel(); ClosePanel(); return 0; }
         if (wp == VK_TAB)     { SetFocus(GetNextDlgTabItem(g_panel, h, GetKeyState(VK_SHIFT)<0)); return 0; }
         break;
     case WM_CHAR:
@@ -628,6 +692,7 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         float step = (float)GET_WHEEL_DELTA_WPARAM(wp) / 120.0f;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (g_epolyOp >= 0 && !g_epolyPreview) EPolyBegin();
         theHold.Suspend();
         if (IsFloat(ef->type)) {
             float cur = ef->pb->GetFloat(ef->id, t);
@@ -647,7 +712,8 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             ef->pb->SetValue(ef->id, t, cur + s);
         }
         theHold.Resume();
-        NotifyParamChanged();
+        if (g_epolyPreview) EPolyRefresh();
+        else                NotifyParamChanged();
         RefreshEdits(true);
         return 0;
     }
@@ -656,10 +722,12 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             Interface* ip = GetCOREInterface();
             if (!ip) break;
             TimeValue t = ip->GetTime();
+            if (g_epolyOp >= 0 && !g_epolyPreview) EPolyBegin();
             theHold.Suspend();
             ef->pb->SetValue(ef->id, t, ef->pb->GetInt(ef->id, t) ? 0 : 1);
             theHold.Resume();
-            NotifyParamChanged();
+            if (g_epolyPreview) EPolyRefresh();
+            else                NotifyParamChanged();
             RefreshEdits(true);
             return 0;
         }
@@ -709,10 +777,12 @@ static void PaintPanel(HWND hwnd) {
         const auto& gh = g_groups[gi];
         bool collapsed = g_collapsed.count(gh.title) > 0;
 
-        // Group header with collapse indicator
+        // Group header
         SelectObject(mem, g_fontBold);
-        SetTextColor(mem, kGroupClr);
+        bool isLiveOp = (g_epolyPreview && gi == 0 && g_epolyOp >= 0);
+        SetTextColor(mem, isLiveOp ? kAccent : kGroupClr);
         std::wstring hdr = (collapsed ? L"\x25B8 " : L"\x25BE ") + gh.title;
+        if (isLiveOp) hdr += L"  \x2713 Apply";
         TextOut(mem, x, y, hdr.c_str(), (int)hdr.length());
         y += kLineH;
 
@@ -914,9 +984,15 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
 
-        // Click on group header = toggle collapse
+        // Click on group header
         int gIdx = FindGroupAtY(pt.y);
         if (gIdx >= 0) {
+            // EPoly op group while preview active = apply and drop
+            if (g_epolyPreview && gIdx == 0 && g_epolyOp >= 0) {
+                EPolyDrop();
+                return 0;
+            }
+            // Normal collapse toggle
             const auto& title = g_groups[gIdx].title;
             if (g_collapsed.count(title)) g_collapsed.erase(title);
             else g_collapsed.insert(title);
@@ -1023,6 +1099,7 @@ static void OpenPanel() {
 
 static void ClosePanel() {
     if (!g_open) return;
+    EPolyAccept();  // commit preview if active (no-op if not)
     KillTimer(g_panel, 1);
     DestroyEdits();
     g_edits.clear();
@@ -1030,6 +1107,9 @@ static void ClosePanel() {
     ShowWindow(g_panel, SW_HIDE);
     g_open = false;
     g_hoverClose = false;
+    g_epolyOp = -1;
+    g_epolyFP = nullptr;
+    g_epolyPreview = false;
     g_nodeHandle = 0;
     g_nodeName.clear();
     EnableAccelerators();
