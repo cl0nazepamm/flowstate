@@ -499,10 +499,8 @@ static void GatherParams() {
                         gh.title = title;
                         gh.startIdx = (int)g_edits.size();
                         for (int i = 0; i < cnt; i++) {
-                            if (pb->IDtoIndex(fb[i].pid) < 0) continue;
-                            const ParamDef& fd = pb->GetParamDef(fb[i].pid);
-                            std::wstring iname = (fd.int_name && fd.int_name[0]) ? fd.int_name : std::wstring(fb[i].label);
-                            std::wstring key = cls + L":" + iname;
+                            // Use label as key — some params (pinch/slide) might not be in IDtoIndex
+                            std::wstring key = cls + L":" + fb[i].label;
                             if (g_hidden.count(key)) continue;
 
                             EditField ef;
