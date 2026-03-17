@@ -1095,7 +1095,7 @@ static void OpenPanel() {
 
     int estH = 3 + kPad*2 + kFontHdr + 10 + (int)g_edits.size() * kLineH + (int)g_groups.size() * (kLineH + kGroupGap);
     if (estH < 60) estH = 60;
-    int ox = pt.x - kMinW / 2, oy = pt.y - 20;
+    int ox = pt.x - kMinW / 2, oy = pt.y - estH / 2;
     if (ox + kMinW > mi.rcWork.right) ox = mi.rcWork.right - kMinW;
     if (oy + estH > mi.rcWork.bottom) oy = mi.rcWork.bottom - estH;
     if (ox < mi.rcWork.left) ox = mi.rcWork.left;
