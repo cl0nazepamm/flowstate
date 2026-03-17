@@ -408,45 +408,10 @@ static bool TryEPolyParams(Animatable* owner) {
     gh.title    = opTitle;
     gh.startIdx = (int)g_edits.size();
 
-    // Try visible-control scan first (only works if command panel shows this rollup)
-    IParamMap2* map = pb->GetMap();
-    HWND mapHwnd = map ? map->GetHWnd() : nullptr;
-    if (mapHwnd) {
-        for (int i = 0; i < pb->NumParams() && (int)g_edits.size() < kMaxParams; i++) {
-            ParamID pid = pb->IndextoID(i);
-            const ParamDef& d = pb->GetParamDef(pid);
-            if (d.type & TYPE_TAB) continue;
-            if (!IsFloat(d.type) && !IsInt(d.type) && d.type != TYPE_BOOL) continue;
-            if (!d.int_name || !d.int_name[0]) continue;
-
-            bool visibleInMap = false;
-            for (int c = 0; c < d.ctrl_count; c++) {
-                if (d.ctrl_IDs[c] <= 0) continue;
-                HWND ctrl = GetDlgItem(mapHwnd, d.ctrl_IDs[c]);
-                if (ctrl && IsWindowVisible(ctrl)) { visibleInMap = true; break; }
-            }
-            if (!visibleInMap) continue;
-
-            std::wstring key = className + L":" + d.int_name;
-            if (g_hidden.count(key)) continue;
-
-            EditField ef;
-            ef.label = MakeParamLabel(d.int_name);
-            ef.key   = key;
-            ef.keyOrdinal = GetNextKeyOrdinal(key);
-            ef.pb    = pb;
-            ef.id    = pid;
-            ef.type  = d.type;
-            g_edits.push_back(ef);
-        }
-    }
-
-    // Fallback: hardcoded param IDs (works even if command panel is closed)
-    if ((int)g_edits.size() == gh.startIdx && fallback && fallbackCount > 0) {
-        gh.title = opTitle;
+    // Use hardcoded operation params — clean and specific
+    if (fallback && fallbackCount > 0) {
         for (int i = 0; i < fallbackCount && (int)g_edits.size() < kMaxParams; i++) {
             if (pb->IDtoIndex(fallback[i].pid) < 0) continue;
-            // Use className:int_name for consistent keys with DetectSpinnerKey
             const ParamDef& fd = pb->GetParamDef(fallback[i].pid);
             std::wstring intName = (fd.int_name && fd.int_name[0]) ? fd.int_name : std::wstring(fallback[i].label);
             std::wstring key = className + L":" + intName;
