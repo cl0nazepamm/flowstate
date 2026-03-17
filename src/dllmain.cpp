@@ -223,42 +223,32 @@ static bool IsInt(ParamType2 t)   { return t==TYPE_INT||t==TYPE_TIMEVALUE||t==TY
 // ── Detect spinner under cursor → return its persistent key ─────
 static std::wstring DetectSpinnerKey() {
     POINT pt; GetCursorPos(&pt);
-    HWND hit = WindowFromPoint(pt);
-    if (!hit) return L"";
+    HWND hwnd = WindowFromPoint(pt);
+    if (!hwnd) return L"";
 
-    std::vector<HWND> chain;
-    for (HWND w = hit; w && chain.size() < 24; w = GetParent(w))
-        chain.push_back(w);
+    // Must be a Max spinner or edit control
+    TCHAR cls[64]; GetClassName(hwnd, cls, 64);
+    if (_tcscmp(cls, SPINNERWINDOWCLASS) != 0 && _tcscmp(cls, CUSTEDITWINDOWCLASS) != 0)
+        return L"";
+
+    int ctrlID = GetDlgCtrlID(hwnd);
+    if (ctrlID <= 0) return L"";
 
     Interface* ip = GetCOREInterface();
     if (!ip || ip->GetSelNodeCount() == 0) return L"";
     INode* node = ip->GetSelNode(0);
     if (!node) return L"";
 
-    auto controlMatchesHit = [&](HWND mapHwnd, int ctrlID) -> bool {
-        if (!mapHwnd || ctrlID <= 0) return false;
-        HWND ctrl = GetDlgItem(mapHwnd, ctrlID);
-        if (!ctrl) return false;
-        for (HWND w : chain)
-            if (w == ctrl || IsChild(ctrl, w) || IsChild(w, ctrl)) return true;
-        return false;
-    };
-
-    // Search all param blocks on the selected node's modifier stack + base object.
+    // Match ctrl ID against all param blocks — no param map dependency
     auto tryPB = [&](IParamBlock2* pb, const MCHAR* className) -> std::wstring {
         if (!pb) return L"";
-        IParamMap2* map = pb->GetMap();
-        if (!map) return L"";
-        HWND mapHwnd = map->GetHWnd();
-        if (!mapHwnd) return L"";
-
         for (int i = 0; i < pb->NumParams(); i++) {
             ParamID pid = pb->IndextoID(i);
             const ParamDef& def = pb->GetParamDef(pid);
+            if (!def.int_name) continue;
             for (int c = 0; c < def.ctrl_count; c++) {
-                if (controlMatchesHit(mapHwnd, def.ctrl_IDs[c])) {
-                    std::wstring key = std::wstring(className) + L":" + (def.int_name ? def.int_name : L"?");
-                    return key;
+                if (def.ctrl_IDs[c] == ctrlID) {
+                    return std::wstring(className) + L":" + def.int_name;
                 }
             }
         }
@@ -285,7 +275,6 @@ static std::wstring DetectSpinnerKey() {
             std::wstring key = tryPB(obj->GetParamBlock(b), cn.data());
             if (!key.empty()) return key;
         }
-        // EPoly param block
         EPoly* ep = (EPoly*)obj->GetInterface(EPOLY_INTERFACE);
         if (ep) {
             std::wstring key = tryPB(ep->getParamBlock(), cn.data());
@@ -438,7 +427,7 @@ static bool TryEPolyParams(Animatable* owner) {
             }
             if (!visibleInMap) continue;
 
-            std::wstring key = opTitle + L":" + d.int_name;
+            std::wstring key = className + L":" + d.int_name;
             if (g_hidden.count(key)) continue;
 
             EditField ef;
@@ -457,7 +446,10 @@ static bool TryEPolyParams(Animatable* owner) {
         gh.title = opTitle;
         for (int i = 0; i < fallbackCount && (int)g_edits.size() < kMaxParams; i++) {
             if (pb->IDtoIndex(fallback[i].pid) < 0) continue;
-            std::wstring key = gh.title + L":" + fallback[i].label;
+            // Use className:int_name for consistent keys with DetectSpinnerKey
+            const ParamDef& fd = pb->GetParamDef(fallback[i].pid);
+            std::wstring intName = (fd.int_name && fd.int_name[0]) ? fd.int_name : std::wstring(fallback[i].label);
+            std::wstring key = className + L":" + intName;
             if (g_hidden.count(key)) continue;
 
             EditField ef;
@@ -1078,27 +1070,17 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         TogglePanel(wp != 0); return 0;
 
     case WM_PP_ADDPARAM: {
-        // Hide panel so WindowFromPoint sees through to Max UI spinners
-        ShowWindow(g_panel, SW_HIDE);
+        // XButton1: detect spinner under cursor and add it to the list
+        // Temporarily hide panel so WindowFromPoint sees the spinner
+        SetWindowPos(g_panel, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         std::wstring key = DetectSpinnerKey();
-        ShowWindow(g_panel, SW_SHOWNA);
+        SetWindowPos(g_panel, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
 
-        if (!key.empty()) {
-            // Found a spinner — add it as pinned
+        if (!key.empty() && !g_pinned.count(key)) {
             g_pinned.insert(key);
             SaveSettings();
             GatherParams();
             BuildLayout();
-        } else {
-            // No spinner found — try pin/unpin on our panel
-            int idx = FindParamAtCursor();
-            if (idx >= 0) {
-                const auto& k = g_edits[idx].key;
-                if (g_pinned.count(k)) g_pinned.erase(k);
-                else g_pinned.insert(k);
-                SaveSettings();
-                InvalidateRect(hwnd, nullptr, FALSE);
-            }
         }
         return 0;
     }
