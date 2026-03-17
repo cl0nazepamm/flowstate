@@ -806,7 +806,8 @@ static void PaintPanel(HWND hwnd) {
 
     SelectObject(mem, g_fontBold);
     SetTextColor(mem, kAccent);
-    TextOut(mem, x, y, g_nodeName.c_str(), (int)g_nodeName.length());
+    const std::wstring& hdrText = g_nodeName.empty() ? std::wstring(L"PowerParams") : g_nodeName;
+    TextOut(mem, x, y, hdrText.c_str(), (int)hdrText.length());
 
     if (g_hoverClose) {
         HBRUSH hov = CreateSolidBrush(kCloseHov); FillRect(mem, &g_closeRect, hov); DeleteObject(hov);
@@ -877,7 +878,6 @@ static void DestroyEdits() {
 
 static void BuildLayout() {
     DestroyEdits();
-    if (g_groups.empty()) return;
 
     HDC hdc = GetDC(g_panel);
     SelectObject(hdc, g_font);
@@ -931,6 +931,7 @@ static void BuildLayout() {
         if (gi + 1 < g_groups.size()) y += kGroupGap;
     }
     int panelH = y + kPad;
+    if (panelH < 60) panelH = 60;
 
     RefreshEdits(true);
     SetWindowPos(g_panel, HWND_TOPMOST, g_panelPos.x, g_panelPos.y, panelW, panelH, SWP_NOACTIVATE);
@@ -1124,14 +1125,14 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // ── Open / Close ────────────────────────────────────────────────
 static void OpenPanel() {
     GatherParams();
-    if (g_groups.empty()) return;
+    // Always open — even if empty, user can add params via XButton1
 
     POINT pt; GetCursorPos(&pt);
     HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = { sizeof(mi) }; GetMonitorInfo(hMon, &mi);
 
-    // Estimate size for initial position
     int estH = 3 + kPad*2 + kFontHdr + 10 + (int)g_edits.size() * kLineH + (int)g_groups.size() * (kLineH + kGroupGap);
+    if (estH < 60) estH = 60;
     int ox = pt.x - kMinW / 2, oy = pt.y - 20;
     if (ox + kMinW > mi.rcWork.right) ox = mi.rcWork.right - kMinW;
     if (oy + estH > mi.rcWork.bottom) oy = mi.rcWork.bottom - estH;
