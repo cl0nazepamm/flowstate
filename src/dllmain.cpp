@@ -402,6 +402,65 @@ static void GatherParams() {
     Object* obj = node->GetObjectRef();
     if (!obj) return;
 
+    // ── EPoly last-op params at top (no preview, just values) ─────
+    {
+        Object* walk = obj;
+        while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+            IDerivedObject* d = static_cast<IDerivedObject*>(walk);
+            for (int m = 0; m < d->NumModifiers(); m++) {
+                Animatable* owner = d->GetModifier(m);
+                if (owner) {
+                    EPoly* ep = (EPoly*)owner->GetInterface(EPOLY_INTERFACE);
+                    if (ep) goto found_epoly;
+                }
+            }
+            walk = d->GetObjRef();
+        }
+        if (walk) {
+            EPoly* ep = (EPoly*)walk->GetInterface(EPOLY_INTERFACE);
+            if (ep) {
+    found_epoly:
+                IParamBlock2* pb = ep->getParamBlock();
+                if (pb) {
+                    FPInterface* fp = (FPInterface*)ep;
+                    FPValue opVal, slVal;
+                    fp->Invoke(epfn_get_last_operation, opVal);
+                    fp->Invoke(epfn_get_epoly_sel_level, slVal);
+                    int lastOp = opVal.i, selLv = slVal.i;
+
+                    int cnt = 0; std::wstring title;
+                    const FallbackOpParam* fb = LookupFallbackParams(lastOp, selLv, cnt, title);
+                    if (fb && cnt > 0) {
+                        MSTR cn; ((Animatable*)ep)->GetClassName(cn, false);
+                        std::wstring cls = cn.data() ? cn.data() : L"EPoly";
+
+                        GroupHeader gh;
+                        gh.title = title;
+                        gh.startIdx = (int)g_edits.size();
+                        for (int i = 0; i < cnt; i++) {
+                            if (pb->IDtoIndex(fb[i].pid) < 0) continue;
+                            const ParamDef& fd = pb->GetParamDef(fb[i].pid);
+                            std::wstring iname = (fd.int_name && fd.int_name[0]) ? fd.int_name : std::wstring(fb[i].label);
+                            std::wstring key = cls + L":" + iname;
+                            if (g_hidden.count(key)) continue;
+
+                            EditField ef;
+                            ef.label = fb[i].label;
+                            ef.key   = key;
+                            ef.keyOrdinal = GetNextKeyOrdinal(key);
+                            ef.pb    = pb;
+                            ef.id    = fb[i].pid;
+                            ef.type  = (ParamType2)(fb[i].isFloat ? TYPE_FLOAT : TYPE_INT);
+                            g_edits.push_back(ef);
+                        }
+                        gh.count = (int)g_edits.size() - gh.startIdx;
+                        if (gh.count > 0) g_groups.push_back(gh);
+                    }
+                }
+            }
+        }
+    }
+
     // ── Full modifier stack — everything, no skipping ───────────
     Object* walkObj = node->GetObjectRef();
     while (walkObj && walkObj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
