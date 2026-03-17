@@ -187,7 +187,7 @@ static void LoadSettings() {
 }
 
 // ── Forward declarations ────────────────────────────────────────
-static void TogglePanel(bool fresh = false);
+static void TogglePanel();
 static void ClosePanel(bool accept = true);
 static void RefreshEdits(bool forceAll = false);
 static void ApplyEdit(HWND h);
@@ -204,7 +204,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
         if (!isMax) goto pass;
 
         if (xbutton == XBUTTON2) {
-            PostMessage(g_panel, WM_PP_TOGGLE, 1, 0);
+            PostMessage(g_panel, WM_PP_TOGGLE, 0, 0);
             return 1;
         }
         if (xbutton == XBUTTON1 && g_open) {
@@ -1032,7 +1032,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
 
     case WM_PP_TOGGLE:
-        TogglePanel(wp != 0); return 0;
+        TogglePanel(); return 0;
 
     case WM_PP_ADDPARAM: {
         // XButton1: detect spinner under cursor and add it to the list
@@ -1101,17 +1101,15 @@ static void ClosePanel(bool accept) {
     if (ip) SetFocus(ip->GetMAXHWnd());
 }
 
-static void TogglePanel(bool fresh) {
-    if (g_open) { ClosePanel(); return; }
-    if (fresh) g_tryEPoly = true;
-    OpenPanel();
+static void TogglePanel() {
+    if (g_open) ClosePanel(); else OpenPanel();
 }
 
 // ── Action system ───────────────────────────────────────────────
 class PPAction : public ActionItem {
 public:
     int   GetId() override { return kToggleId; }
-    BOOL  ExecuteAction() override { TogglePanel(true); return TRUE; }
+    BOOL  ExecuteAction() override { TogglePanel(); return TRUE; }
     void  GetButtonText(MSTR& t) override { t = PPARAM_NAME; }
     void  GetMenuText(MSTR& t) override { t = _T("Toggle PowerParams Panel"); }
     void  GetDescriptionText(MSTR& t) override { t = _T("Show/hide PowerParams floating parameter panel"); }
@@ -1124,7 +1122,7 @@ public:
 class PPActionCB : public ActionCallback {
 public:
     BOOL ExecuteAction(int id) override {
-        if (id == kToggleId) { TogglePanel(true); return TRUE; }
+        if (id == kToggleId) { TogglePanel(); return TRUE; }
         return FALSE;
     }
 };
