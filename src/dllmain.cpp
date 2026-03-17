@@ -134,6 +134,7 @@ static ULONG        g_nodeHandle       = 0;
 static int          g_epolyOp       = -1;
 static FPInterface* g_epolyFP       = nullptr;
 static bool         g_epolyPreview  = false;
+static bool         g_epolySpent    = false;  // true after preview used — never re-arm
 
 static bool     g_suppressClose = false;
 
@@ -391,7 +392,7 @@ static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int&
 
 // ── EPoly preview helpers (no state tracking beyond these) ──────
 static void EPolyBegin() {
-    if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview) return;
+    if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview || g_epolySpent) return;
     ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
     FPParams prms(1, TYPE_ENUM, g_epolyOp);
     FPValue r;
@@ -414,6 +415,7 @@ static void EPolyAccept() {
     FPValue d;
     g_epolyFP->Invoke(epfn_preview_accept, d);
     g_epolyPreview = false;
+    g_epolySpent = true;
 }
 
 static void EPolyCancel() {
@@ -421,6 +423,7 @@ static void EPolyCancel() {
     FPValue d;
     g_epolyFP->Invoke(epfn_preview_cancel, d);
     g_epolyPreview = false;
+    g_epolySpent = true;
 }
 
 // Accept preview + remove the op group from panel, panel stays open
