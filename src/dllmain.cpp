@@ -401,6 +401,7 @@ static void EPolyBegin() {
     FPValue d;
     g_epolyFP->Invoke(epfn_preview_invalidate, d);
     if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
+    InvalidateRect(g_panel, nullptr, FALSE);  // show "✓ Apply" immediately
 }
 
 static void EPolyRefresh() {
