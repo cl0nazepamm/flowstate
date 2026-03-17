@@ -494,19 +494,16 @@ static void GatherParams() {
     Object* obj = node->GetObjectRef();
     if (!obj) return;
 
-    // ── One-shot EPoly operation detection ──────────────────────
+    // ── EPoly last-op detection at the top (one-shot) ─────────
     if (g_tryEPoly) TryCollectLiveEPoly(obj);
 
-    // ── Generic: modifiers + base object (always runs) ──────────
-    // Collect modifiers
+    // ── Full modifier stack — everything, no skipping ───────────
     Object* walkObj = node->GetObjectRef();
     while (walkObj && walkObj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
         IDerivedObject* d = static_cast<IDerivedObject*>(walkObj);
         for (int m = 0; m < d->NumModifiers(); m++) {
             Modifier* mod = d->GetModifier(m);
             if (!mod) continue;
-            // Skip Edit Poly modifier in generic — handled by EPoly path or XButton1
-            if (mod->GetInterface(EPOLY_INTERFACE)) continue;
             GroupHeader gh;
             MSTR cn; mod->GetClassName(cn, false);
             const MCHAR* p = cn.data();
@@ -520,8 +517,9 @@ static void GatherParams() {
         }
         walkObj = d->GetObjRef();
     }
-    // Collect base object (skip Editable Poly — too many params, use XButton1)
-    if (walkObj && !walkObj->GetInterface(EPOLY_INTERFACE)) {
+
+    // ── Base object — everything, including EPoly ───────────────
+    if (walkObj) {
         GroupHeader gh;
         MSTR cn; walkObj->GetClassName(cn, false);
         const MCHAR* p = cn.data();
@@ -530,6 +528,16 @@ static void GatherParams() {
         int tot = 0;
         for (int b = 0; b < walkObj->NumParamBlocks(); b++)
             CollectParams(walkObj->GetParamBlock(b), gh.title, tot);
+        // Also collect EPoly-specific param block if present
+        EPoly* ep = (EPoly*)walkObj->GetInterface(EPOLY_INTERFACE);
+        if (ep) {
+            IParamBlock2* epPB = ep->getParamBlock();
+            bool alreadyCollected = false;
+            for (int b = 0; b < walkObj->NumParamBlocks(); b++) {
+                if (walkObj->GetParamBlock(b) == epPB) { alreadyCollected = true; break; }
+            }
+            if (!alreadyCollected) CollectParams(epPB, gh.title, tot);
+        }
         gh.count = (int)g_edits.size() - gh.startIdx;
         if (gh.count > 0) g_groups.push_back(gh);
     }
@@ -920,14 +928,6 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT:      PaintPanel(hwnd); return 0;
     case WM_ERASEBKGND: return 1;
 
-    case WM_ACTIVATE:
-        if (LOWORD(wp) == WA_INACTIVE && g_open && !g_suppressClose)
-            PostMessage(hwnd, WM_USER + 101, 0, 0);
-        return 0;
-    case WM_USER + 101:
-        if (g_open && !g_suppressClose) ClosePanel();
-        return 0;
-
     case WM_NCHITTEST: {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         ScreenToClient(hwnd, &pt);
@@ -1035,7 +1035,18 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (HIWORD(wp) == EN_KILLFOCUS) { if (g_open) ApplyEdit((HWND)lp); EnableAccelerators(); InvalidateRect(hwnd, nullptr, FALSE); }
         break;
 
-    case WM_TIMER: RefreshEdits(); return 0;
+    case WM_TIMER: {
+        // Click-outside-to-close: check if focus left the panel
+        if (g_open && !g_suppressClose && !g_edits.empty()) {
+            HWND focus = GetFocus();
+            bool ours = false;
+            for (auto& ef : g_edits)
+                if (ef.hwnd && ef.hwnd == focus) { ours = true; break; }
+            if (!ours) { ClosePanel(); return 0; }
+        }
+        RefreshEdits();
+        return 0;
+    }
 
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) { ClosePanel(false); return 0; }
