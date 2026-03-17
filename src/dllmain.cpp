@@ -128,11 +128,6 @@ static const UINT WM_PP_TOGGLE   = WM_USER + 100;
 static const UINT WM_PP_PIN      = WM_USER + 102;
 static const UINT WM_PP_ADDPARAM = WM_USER + 103;
 
-static int          g_epolyOp          = -1;
-static FPInterface* g_epolyFP          = nullptr;
-static bool         g_epolyPreview     = false;
-static bool         g_tryEPoly         = true;
-// g_tryEPoly is the only gate for EPoly detection (no dedup needed)
 static ULONG        g_nodeHandle       = 0;
 
 static bool     g_suppressClose = false;  // suppress WM_ACTIVATE close during XButton1
@@ -190,7 +185,7 @@ static void LoadSettings() {
 
 // ── Forward declarations ────────────────────────────────────────
 static void TogglePanel();
-static void ClosePanel(bool accept = true);
+static void ClosePanel();
 static void RefreshEdits(bool forceAll = false);
 static void ApplyEdit(HWND h);
 static void BuildLayout();
@@ -389,107 +384,12 @@ static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int&
     }
 }
 
-// ── EPoly detection ─────────────────────────────────────────────
-static bool TryEPolyParams(Animatable* owner) {
-    if (!owner) return false;
-    EPoly* ep = (EPoly*)owner->GetInterface(EPOLY_INTERFACE);
-    if (!ep) return false;
-
-    IParamBlock2* pb = ep->getParamBlock();
-    if (!pb) return false;
-
-    FPInterface* fp = (FPInterface*)ep;
-    FPValue lastOpVal, selLevelVal;
-    fp->Invoke(epfn_get_last_operation, lastOpVal);
-    fp->Invoke(epfn_get_epoly_sel_level, selLevelVal);
-    int lastOp   = lastOpVal.i;
-    int selLevel = selLevelVal.i;
-
-    MSTR classNameM;
-    owner->GetClassName(classNameM, false);
-    std::wstring className = classNameM.data() ? classNameM.data() : L"EPoly";
-
-    int fallbackCount = 0;
-    std::wstring opTitle;
-    const FallbackOpParam* fallback = LookupFallbackParams(lastOp, selLevel, fallbackCount, opTitle);
-    if (opTitle.empty()) opTitle = className;
-
-    GroupHeader gh;
-    gh.title    = opTitle;
-    gh.startIdx = (int)g_edits.size();
-
-    // Use hardcoded operation params — clean and specific
-    if (fallback && fallbackCount > 0) {
-        for (int i = 0; i < fallbackCount && (int)g_edits.size() < kMaxParams; i++) {
-            if (pb->IDtoIndex(fallback[i].pid) < 0) continue;
-            const ParamDef& fd = pb->GetParamDef(fallback[i].pid);
-            std::wstring intName = (fd.int_name && fd.int_name[0]) ? fd.int_name : std::wstring(fallback[i].label);
-            std::wstring key = className + L":" + intName;
-            if (g_hidden.count(key)) continue;
-
-            EditField ef;
-            ef.label = fallback[i].label;
-            ef.key   = key;
-            ef.keyOrdinal = GetNextKeyOrdinal(key);
-            ef.pb    = pb;
-            ef.id    = fallback[i].pid;
-            ef.type  = (ParamType2)(fallback[i].isFloat ? TYPE_FLOAT : TYPE_INT);
-            g_edits.push_back(ef);
-        }
-    }
-
-    gh.count = (int)g_edits.size() - gh.startIdx;
-    if (gh.count > 0) {
-        g_epolyOp = lastOp;
-        g_epolyFP = fp;
-        g_groups.push_back(gh);
-        return true;
-    }
-    return false;
-}
-
-static bool TryCollectLiveEPoly(Object* obj) {
-    Object* walk = obj;
-    while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-        IDerivedObject* d = static_cast<IDerivedObject*>(walk);
-        for (int m = 0; m < d->NumModifiers(); m++) {
-            if (TryEPolyParams(d->GetModifier(m))) return true;
-        }
-        walk = d->GetObjRef();
-    }
-    return walk ? TryEPolyParams(walk) : false;
-}
-
-static bool HasLiveEPolyMap(Object* obj) {
-    Object* walk = obj;
-    while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-        IDerivedObject* d = static_cast<IDerivedObject*>(walk);
-        for (int m = 0; m < d->NumModifiers(); m++) {
-            Animatable* owner = d->GetModifier(m);
-            EPoly* ep = owner ? (EPoly*)owner->GetInterface(EPOLY_INTERFACE) : nullptr;
-            if (!ep) continue;
-            IParamBlock2* pb = ep->getParamBlock();
-            IParamMap2* map = pb ? pb->GetMap() : nullptr;
-            if (map && map->GetHWnd()) return true;
-        }
-        walk = d->GetObjRef();
-    }
-    if (!walk) return false;
-    EPoly* ep = (EPoly*)walk->GetInterface(EPOLY_INTERFACE);
-    if (!ep) return false;
-    IParamBlock2* pb = ep->getParamBlock();
-    IParamMap2* map = pb ? pb->GetMap() : nullptr;
-    return map && map->GetHWnd();
-}
-
 // ── Gather params ───────────────────────────────────────────────
 static void GatherParams() {
     g_groups.clear();
     g_edits.clear();
     g_nodeName.clear();
     g_nodeHandle = 0;
-    g_epolyOp = -1;
-    g_epolyFP = nullptr;
 
     Interface* ip = GetCOREInterface();
     if (!ip || ip->GetSelNodeCount() == 0) return;
@@ -501,12 +401,6 @@ static void GatherParams() {
 
     Object* obj = node->GetObjectRef();
     if (!obj) return;
-
-    // ── EPoly last-op detection (one-shot: first open only, forgotten after close)
-    if (g_tryEPoly) {
-        TryCollectLiveEPoly(obj);
-        g_tryEPoly = false;  // never again until Max restart
-    }
 
     // ── Full modifier stack — everything, no skipping ───────────
     Object* walkObj = node->GetObjectRef();
@@ -591,38 +485,6 @@ static void GatherParams() {
     }
 }
 
-// ── EPoly preview ───────────────────────────────────────────────
-static void EPolyPreviewBegin() {
-    if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview) return;
-    ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
-    FPParams prms(1, TYPE_ENUM, g_epolyOp);
-    FPValue result;
-    g_epolyFP->Invoke(epfn_preview_begin, result, &prms);
-    g_epolyPreview = true;
-    FPValue dummy;
-    g_epolyFP->Invoke(epfn_preview_invalidate, dummy);
-    Interface* ip = GetCOREInterface();
-    if (ip) ip->RedrawViews(ip->GetTime());
-}
-static void EPolyPreviewUpdate() {
-    if (!g_epolyPreview || !g_epolyFP) return;
-    FPValue dummy;
-    g_epolyFP->Invoke(epfn_preview_invalidate, dummy);
-    Interface* ip = GetCOREInterface();
-    if (ip) ip->RedrawViews(ip->GetTime());
-}
-static void EPolyPreviewAccept() {
-    if (!g_epolyPreview || !g_epolyFP) return;
-    FPValue dummy;
-    g_epolyFP->Invoke(epfn_preview_accept, dummy);
-    g_epolyPreview = false;
-}
-static void EPolyPreviewCancel() {
-    if (!g_epolyPreview || !g_epolyFP) return;
-    FPValue dummy;
-    g_epolyFP->Invoke(epfn_preview_cancel, dummy);
-    g_epolyPreview = false;
-}
 
 // ── Value formatting ────────────────────────────────────────────
 static void FormatValue(const EditField& ef, TimeValue t, TCHAR* buf, int len) {
@@ -677,14 +539,12 @@ static void ApplyEdit(HWND h) {
         if (!ef.pb) return;
         TCHAR txt[256];
         GetWindowText(h, txt, 256);
-        if (g_epolyOp >= 0 && !g_epolyPreview) EPolyPreviewBegin();
         theHold.Suspend();
         if (IsFloat(ef.type))       ef.pb->SetValue(ef.id, t, (float)_wtof(txt));
         else if (ef.type==TYPE_BOOL) ef.pb->SetValue(ef.id, t, (_wcsicmp(txt,_T("On"))==0||_wtoi(txt)!=0)?1:0);
         else                        ef.pb->SetValue(ef.id, t, _wtoi(txt));
         theHold.Resume();
-        if (g_epolyPreview) EPolyPreviewUpdate();
-        else                NotifyParamChanged();
+        NotifyParamChanged();
         break;
     }
 }
@@ -695,7 +555,7 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_KEYDOWN:
         if (wp == VK_RETURN)  { ApplyEdit(h); RefreshEdits(true); return 0; }
-        if (wp == VK_ESCAPE)  { ClosePanel(false); return 0; }
+        if (wp == VK_ESCAPE)  { ClosePanel(); return 0; }
         if (wp == VK_TAB)     { SetFocus(GetNextDlgTabItem(g_panel, h, GetKeyState(VK_SHIFT)<0)); return 0; }
         break;
     case WM_CHAR:
@@ -709,7 +569,6 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         float step = (float)GET_WHEEL_DELTA_WPARAM(wp) / 120.0f;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        if (g_epolyOp >= 0 && !g_epolyPreview) EPolyPreviewBegin();
         theHold.Suspend();
         if (IsFloat(ef->type)) {
             float cur = ef->pb->GetFloat(ef->id, t);
@@ -729,8 +588,7 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             ef->pb->SetValue(ef->id, t, cur + s);
         }
         theHold.Resume();
-        if (g_epolyPreview)  EPolyPreviewUpdate();
-        else                 NotifyParamChanged();
+        NotifyParamChanged();
         RefreshEdits(true);
         return 0;
     }
@@ -739,12 +597,10 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             Interface* ip = GetCOREInterface();
             if (!ip) break;
             TimeValue t = ip->GetTime();
-            if (g_epolyOp >= 0 && !g_epolyPreview) EPolyPreviewBegin();
             theHold.Suspend();
             ef->pb->SetValue(ef->id, t, ef->pb->GetInt(ef->id, t) ? 0 : 1);
             theHold.Resume();
-            if (g_epolyPreview)  EPolyPreviewUpdate();
-            else                 NotifyParamChanged();
+            NotifyParamChanged();
             RefreshEdits(true);
             return 0;
         }
@@ -1053,7 +909,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER: RefreshEdits(); return 0;
 
     case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) { ClosePanel(false); return 0; }
+        if (wp == VK_ESCAPE) { ClosePanel(); return 0; }
         break;
 
     case WM_PP_TOGGLE:
@@ -1106,20 +962,15 @@ static void OpenPanel() {
     g_open = true;
 }
 
-static void ClosePanel(bool accept) {
+static void ClosePanel() {
     if (!g_open) return;
     KillTimer(g_panel, 1);
-    if (accept) EPolyPreviewAccept(); else EPolyPreviewCancel();
     DestroyEdits();
     g_edits.clear();
     g_groups.clear();
     ShowWindow(g_panel, SW_HIDE);
     g_open = false;
     g_hoverClose = false;
-    g_epolyOp = -1;
-    g_epolyFP = nullptr;
-    g_epolyPreview = false;
-    g_tryEPoly = false;
     g_nodeHandle = 0;
     g_nodeName.clear();
     EnableAccelerators();
