@@ -886,6 +886,10 @@ static void BuildLayout() {
     int panelH = y + kPad;
     if (panelH < 60) panelH = 60;
 
+    // Keep current position if panel was dragged
+    RECT cur; GetWindowRect(g_panel, &cur);
+    if (cur.right - cur.left > 1) { g_panelPos.x = cur.left; g_panelPos.y = cur.top; }
+
     RefreshEdits(true);
     SetWindowPos(g_panel, HWND_TOPMOST, g_panelPos.x, g_panelPos.y, panelW, panelH, SWP_NOACTIVATE);
     InvalidateRect(g_panel, nullptr, FALSE);
@@ -1073,7 +1077,15 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // ── Open / Close ────────────────────────────────────────────────
 static void OpenPanel() {
     GatherParams();
-    // Always open — even if empty, user can add params via XButton1
+
+    // Auto-collapse groups with 10+ params on first encounter
+    static std::set<std::wstring> g_autoCollapseSeen;
+    for (auto& gh : g_groups) {
+        if (gh.count >= 10 && !g_autoCollapseSeen.count(gh.title)) {
+            g_autoCollapseSeen.insert(gh.title);
+            g_collapsed.insert(gh.title);
+        }
+    }
 
     POINT pt; GetCursorPos(&pt);
     HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
