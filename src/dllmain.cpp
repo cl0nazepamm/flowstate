@@ -9,7 +9,6 @@
 #include <custcont.h>
 #include <iparamm2.h>
 #include <iepoly.h>
-#include <maxscript/maxscript.h>
 #include <hold.h>
 #include <windowsx.h>
 #include <string>
@@ -135,7 +134,6 @@ static int          g_epolyOp       = -1;
 static FPInterface* g_epolyFP       = nullptr;
 static bool         g_epolyPreview  = false;
 static bool         g_epolySpent    = false;
-static int          g_epolyPutCount = -1;     // undo stack snapshot when EPoly detected
 static int          g_epolySpentAt  = -1;     // putCount when preview was last spent
 
 static bool     g_suppressClose = false;
@@ -396,18 +394,7 @@ static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int&
 static void EPolyBegin() {
     if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview || g_epolySpent) return;
 
-    // Only undo if nothing else happened since the EPoly operation.
-    // If user moved a box or did anything, the put count will differ.
-    int currentPutCount = theHold.GetGlobalPutCount();
-    if (currentPutCount != g_epolyPutCount) {
-        g_epolySpent = true;
-        g_epolySpentAt = currentPutCount;
-        g_epolyOp = -1;
-        g_epolyFP = nullptr;
-        return;
-    }
-
-    ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
+    // No max undo — epfn_preview_begin re-enters the last operation
     FPParams prms(1, TYPE_ENUM, g_epolyOp);
     FPValue r;
     g_epolyFP->Invoke(epfn_preview_begin, r, &prms);
@@ -533,9 +520,8 @@ static void GatherParams() {
                         if (gh.count > 0) {
                             g_epolyOp = lastOp;
                             g_epolyFP = fp;
+                            // Re-arm preview if a new operation happened since last spent
                             int nowPut = theHold.GetGlobalPutCount();
-                            g_epolyPutCount = nowPut;
-                            // Only re-arm if a NEW operation happened since last spent
                             if (nowPut > g_epolySpentAt)
                                 g_epolySpent = false;
                             g_groups.push_back(gh);
