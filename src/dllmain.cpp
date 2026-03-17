@@ -9,6 +9,7 @@
 #include <custcont.h>
 #include <iparamm2.h>
 #include <iepoly.h>
+#include <maxscript/maxscript.h>
 #include <hold.h>
 #include <windowsx.h>
 #include <string>
@@ -135,6 +136,7 @@ static FPInterface* g_epolyFP       = nullptr;
 static bool         g_epolyPreview  = false;
 static bool         g_epolySpent    = false;
 static int          g_epolySpentAt  = -1;     // putCount when preview was last spent
+static int          g_epolyPutSnap  = -1;     // frozen snapshot — set ONCE, never re-snapshotted
 
 static bool     g_suppressClose = false;
 
@@ -394,7 +396,17 @@ static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int&
 static void EPolyBegin() {
     if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview || g_epolySpent) return;
 
-    // No max undo — epfn_preview_begin re-enters the last operation
+    // Verify undo stack hasn't changed since the operation.
+    // g_epolyPutSnap is frozen at first detection — never re-snapshotted.
+    // If user did ANYTHING since the op, putCount will differ → bail.
+    int now = theHold.GetGlobalPutCount();
+    if (g_epolyPutSnap < 0 || now != g_epolyPutSnap) {
+        g_epolySpent = true;
+        g_epolySpentAt = now;
+        return;
+    }
+
+    ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
     FPParams prms(1, TYPE_ENUM, g_epolyOp);
     FPValue r;
     g_epolyFP->Invoke(epfn_preview_begin, r, &prms);
@@ -419,6 +431,7 @@ static void EPolyAccept() {
     g_epolyPreview = false;
     g_epolySpent = true;
     g_epolySpentAt = theHold.GetGlobalPutCount();
+    g_epolyPutSnap = -1;  // allow fresh snapshot for next operation
 }
 
 static void EPolyCancel() {
@@ -428,6 +441,7 @@ static void EPolyCancel() {
     g_epolyPreview = false;
     g_epolySpent = true;
     g_epolySpentAt = theHold.GetGlobalPutCount();
+    g_epolyPutSnap = -1;
 }
 
 // Accept preview + remove the op group from panel, panel stays open
@@ -520,7 +534,10 @@ static void GatherParams() {
                         if (gh.count > 0) {
                             g_epolyOp = lastOp;
                             g_epolyFP = fp;
-                            // Re-arm preview if a new operation happened since last spent
+                            // Snapshot ONCE — frozen until accept/cancel resets it
+                            if (g_epolyPutSnap < 0)
+                                g_epolyPutSnap = theHold.GetGlobalPutCount();
+                            // Re-arm if a new op happened since last spent
                             int nowPut = theHold.GetGlobalPutCount();
                             if (nowPut > g_epolySpentAt)
                                 g_epolySpent = false;
