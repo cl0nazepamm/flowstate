@@ -532,6 +532,7 @@ static void GatherParams() {
                             g_epolyOp = lastOp;
                             g_epolyFP = fp;
                             g_epolyPutCount = theHold.GetGlobalPutCount();
+                            g_epolySpent = false;  // fresh detection, re-arm preview
                             g_groups.push_back(gh);
                         }
                     }
