@@ -135,6 +135,8 @@ static bool         g_tryEPoly         = true;
 // g_tryEPoly is the only gate for EPoly detection (no dedup needed)
 static ULONG        g_nodeHandle       = 0;
 
+static bool     g_suppressClose = false;  // suppress WM_ACTIVATE close during XButton1
+
 static std::vector<EditField>   g_edits;
 static std::vector<GroupHeader> g_groups;
 static std::wstring             g_nodeName;
@@ -918,6 +920,14 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT:      PaintPanel(hwnd); return 0;
     case WM_ERASEBKGND: return 1;
 
+    case WM_ACTIVATE:
+        if (LOWORD(wp) == WA_INACTIVE && g_open && !g_suppressClose)
+            PostMessage(hwnd, WM_USER + 101, 0, 0);
+        return 0;
+    case WM_USER + 101:
+        if (g_open && !g_suppressClose) ClosePanel();
+        return 0;
+
     case WM_NCHITTEST: {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         ScreenToClient(hwnd, &pt);
@@ -1035,11 +1045,12 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         TogglePanel(); return 0;
 
     case WM_PP_ADDPARAM: {
-        // XButton1: detect spinner under cursor and add it to the list
-        // Temporarily hide panel so WindowFromPoint sees the spinner
+        // Suppress close during detection (HWND_BOTTOM causes WA_INACTIVE)
+        g_suppressClose = true;
         SetWindowPos(g_panel, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         std::wstring key = DetectSpinnerKey();
         SetWindowPos(g_panel, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        g_suppressClose = false;
 
         if (!key.empty() && !g_pinned.count(key)) {
             g_pinned.insert(key);
