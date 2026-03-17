@@ -134,8 +134,6 @@ static ULONG        g_nodeHandle       = 0;
 static int          g_epolyOp       = -1;
 static FPInterface* g_epolyFP       = nullptr;
 static bool         g_epolyPreview  = false;
-static bool         g_epolySpent    = false;
-static int          g_epolySpentAt  = -1;     // putCount when preview was last spent
 static int          g_epolyPutSnap  = -1;     // frozen snapshot — set ONCE, never re-snapshotted
 
 static bool     g_suppressClose = false;
@@ -394,15 +392,13 @@ static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int&
 
 // ── EPoly preview helpers (no state tracking beyond these) ──────
 static void EPolyBegin() {
-    if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview || g_epolySpent) return;
+    if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview) return;
+    if (g_epolyPutSnap < 0) return;  // no snapshot = no preview
 
-    // Verify undo stack hasn't changed since the operation.
-    // g_epolyPutSnap is frozen at first detection — never re-snapshotted.
-    // If user did ANYTHING since the op, putCount will differ → bail.
+    // Frozen snapshot check — if undo stack changed, bail
     int now = theHold.GetGlobalPutCount();
-    if (g_epolyPutSnap < 0 || now != g_epolyPutSnap) {
-        g_epolySpent = true;
-        g_epolySpentAt = now;
+    if (now != g_epolyPutSnap) {
+        g_epolyPutSnap = -1;  // kill it, won't match again
         return;
     }
 
@@ -429,8 +425,6 @@ static void EPolyAccept() {
     FPValue d;
     g_epolyFP->Invoke(epfn_preview_accept, d);
     g_epolyPreview = false;
-    g_epolySpent = true;
-    g_epolySpentAt = theHold.GetGlobalPutCount();
     g_epolyPutSnap = -1;  // allow fresh snapshot for next operation
 }
 
@@ -439,8 +433,6 @@ static void EPolyCancel() {
     FPValue d;
     g_epolyFP->Invoke(epfn_preview_cancel, d);
     g_epolyPreview = false;
-    g_epolySpent = true;
-    g_epolySpentAt = theHold.GetGlobalPutCount();
     g_epolyPutSnap = -1;
 }
 
@@ -537,10 +529,6 @@ static void GatherParams() {
                             // Snapshot ONCE — frozen until accept/cancel resets it
                             if (g_epolyPutSnap < 0)
                                 g_epolyPutSnap = theHold.GetGlobalPutCount();
-                            // Re-arm if a new op happened since last spent
-                            int nowPut = theHold.GetGlobalPutCount();
-                            if (nowPut > g_epolySpentAt)
-                                g_epolySpent = false;
                             g_groups.push_back(gh);
                         }
                     }
