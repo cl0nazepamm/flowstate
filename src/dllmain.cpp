@@ -502,8 +502,11 @@ static void GatherParams() {
     Object* obj = node->GetObjectRef();
     if (!obj) return;
 
-    // ── EPoly last-op detection at the top (always try) ────────
-    TryCollectLiveEPoly(obj);
+    // ── EPoly last-op detection (one-shot: first open only, forgotten after close)
+    if (g_tryEPoly) {
+        TryCollectLiveEPoly(obj);
+        g_tryEPoly = false;  // never again until Max restart
+    }
 
     // ── Full modifier stack — everything, no skipping ───────────
     Object* walkObj = node->GetObjectRef();
