@@ -133,10 +133,20 @@ static ULONG        g_nodeHandle       = 0;
 // EPoly preview state
 static int          g_epolyOp       = -1;
 static FPInterface* g_epolyFP       = nullptr;
+static int          g_epolySelLevel = -1;
 static bool         g_epolyPreview  = false;
 static int          g_epolyPutSnap  = -1;     // frozen snapshot — set ONCE, never re-snapshotted
 
 static bool     g_suppressClose = false;
+
+// "Apply and forget" cache for destructive EPoly last-op groups.
+static int      g_forgottenOp       = -1;
+static int      g_forgottenSelLevel = -1;
+static ULONG    g_forgottenNode     = 0;
+static bool     g_forgottenPending  = false;
+static int      g_forgottenVerts    = -1;
+static int      g_forgottenEdges    = -1;
+static int      g_forgottenFaces    = -1;
 
 static std::vector<EditField>   g_edits;
 static std::vector<GroupHeader> g_groups;
@@ -390,6 +400,68 @@ static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int&
     }
 }
 
+static void ClearForgottenEPolyOp() {
+    g_forgottenOp = -1;
+    g_forgottenSelLevel = -1;
+    g_forgottenNode = 0;
+    g_forgottenPending = false;
+    g_forgottenVerts = -1;
+    g_forgottenEdges = -1;
+    g_forgottenFaces = -1;
+}
+
+static bool ReadEPolyTopoCounts(FPInterface* fp, int& outV, int& outE, int& outF) {
+    outV = outE = outF = -1;
+    if (!fp) return false;
+
+    FPValue v, e, f;
+    v.i = e.i = f.i = -1;
+    fp->Invoke(epfn_get_num_vertices, v);
+    fp->Invoke(epfn_get_num_edges, e);
+    fp->Invoke(epfn_get_num_faces, f);
+
+    outV = v.i;
+    outE = e.i;
+    outF = f.i;
+    return (outV >= 0 && outE >= 0 && outF >= 0);
+}
+
+static void StampForgottenEPolyOp(int op, int selLevel, ULONG nodeHandle, FPInterface* fp) {
+    if (op < 0 || nodeHandle == 0) return;
+    g_forgottenOp = op;
+    g_forgottenSelLevel = selLevel;
+    g_forgottenNode = nodeHandle;
+    g_forgottenPending = true;
+    if (!ReadEPolyTopoCounts(fp, g_forgottenVerts, g_forgottenEdges, g_forgottenFaces)) {
+        g_forgottenVerts = g_forgottenEdges = g_forgottenFaces = -1;
+    }
+}
+
+static bool ShouldSuppressForgottenEPolyOp(int op, int selLevel, ULONG nodeHandle, FPInterface* fp) {
+    if (op < 0 || nodeHandle == 0) return false;
+    if (!g_forgottenPending) return false;
+
+    // Context moved on; stale forget stamp should not live forever.
+    if (g_forgottenNode != nodeHandle || g_forgottenOp != op || g_forgottenSelLevel != selLevel) {
+        ClearForgottenEPolyOp();
+        return false;
+    }
+
+    // If topology changed since we stamped, treat as a fresh operation and unforget.
+    if (g_forgottenVerts >= 0 && g_forgottenEdges >= 0 && g_forgottenFaces >= 0) {
+        int curV = -1, curE = -1, curF = -1;
+        if (ReadEPolyTopoCounts(fp, curV, curE, curF)) {
+            if (curV != g_forgottenVerts || curE != g_forgottenEdges || curF != g_forgottenFaces) {
+                ClearForgottenEPolyOp();
+                return false;
+            }
+        }
+    }
+
+    // Same op on same node with unchanged topology => stale reopen from menu spam.
+    return true;
+}
+
 // ── EPoly preview helpers (no state tracking beyond these) ──────
 static void EPolyBegin() {
     if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview) return;
@@ -439,8 +511,10 @@ static void EPolyCancel() {
 // Accept preview + remove the op group from panel, panel stays open
 static void EPolyDrop() {
     EPolyAccept();
+    StampForgottenEPolyOp(g_epolyOp, g_epolySelLevel, g_nodeHandle, g_epolyFP);
     g_epolyOp = -1;
     g_epolyFP = nullptr;
+    g_epolySelLevel = -1;
     // Remove first group (the op group)
     if (!g_groups.empty()) {
         int cnt = g_groups[0].count;
@@ -499,37 +573,40 @@ static void GatherParams() {
                     fp->Invoke(epfn_get_epoly_sel_level, slVal);
                     int lastOp = opVal.i, selLv = slVal.i;
 
-                    int cnt = 0; std::wstring title;
-                    const FallbackOpParam* fb = LookupFallbackParams(lastOp, selLv, cnt, title);
-                    if (fb && cnt > 0) {
-                        MSTR cn; ((Animatable*)ep)->GetClassName(cn, false);
-                        std::wstring cls = cn.data() ? cn.data() : L"EPoly";
+                    if (!ShouldSuppressForgottenEPolyOp(lastOp, selLv, g_nodeHandle, fp)) {
+                        int cnt = 0; std::wstring title;
+                        const FallbackOpParam* fb = LookupFallbackParams(lastOp, selLv, cnt, title);
+                        if (fb && cnt > 0) {
+                            MSTR cn; ((Animatable*)ep)->GetClassName(cn, false);
+                            std::wstring cls = cn.data() ? cn.data() : L"EPoly";
 
-                        GroupHeader gh;
-                        gh.title = title;
-                        gh.startIdx = (int)g_edits.size();
-                        for (int i = 0; i < cnt; i++) {
-                            // Use label as key — some params (pinch/slide) might not be in IDtoIndex
-                            std::wstring key = cls + L":" + fb[i].label;
-                            if (g_hidden.count(key)) continue;
+                            GroupHeader gh;
+                            gh.title = title;
+                            gh.startIdx = (int)g_edits.size();
+                            for (int i = 0; i < cnt; i++) {
+                                // Use label as key — some params (pinch/slide) might not be in IDtoIndex
+                                std::wstring key = cls + L":" + fb[i].label;
+                                if (g_hidden.count(key)) continue;
 
-                            EditField ef;
-                            ef.label = fb[i].label;
-                            ef.key   = key;
-                            ef.keyOrdinal = GetNextKeyOrdinal(key);
-                            ef.pb    = pb;
-                            ef.id    = fb[i].pid;
-                            ef.type  = (ParamType2)(fb[i].isFloat ? TYPE_FLOAT : TYPE_INT);
-                            g_edits.push_back(ef);
-                        }
-                        gh.count = (int)g_edits.size() - gh.startIdx;
-                        if (gh.count > 0) {
-                            g_epolyOp = lastOp;
-                            g_epolyFP = fp;
-                            // Snapshot ONCE — frozen until accept/cancel resets it
-                            if (g_epolyPutSnap < 0)
-                                g_epolyPutSnap = theHold.GetGlobalPutCount();
-                            g_groups.push_back(gh);
+                                EditField ef;
+                                ef.label = fb[i].label;
+                                ef.key   = key;
+                                ef.keyOrdinal = GetNextKeyOrdinal(key);
+                                ef.pb    = pb;
+                                ef.id    = fb[i].pid;
+                                ef.type  = (ParamType2)(fb[i].isFloat ? TYPE_FLOAT : TYPE_INT);
+                                g_edits.push_back(ef);
+                            }
+                            gh.count = (int)g_edits.size() - gh.startIdx;
+                            if (gh.count > 0) {
+                                g_epolyOp = lastOp;
+                                g_epolyFP = fp;
+                                g_epolySelLevel = selLv;
+                                // Snapshot ONCE — frozen until accept/cancel resets it
+                                if (g_epolyPutSnap < 0)
+                                    g_epolyPutSnap = theHold.GetGlobalPutCount();
+                                g_groups.push_back(gh);
+                            }
                         }
                     }
                 }
@@ -793,7 +870,7 @@ static void PaintPanel(HWND hwnd) {
 
         // Group header
         SelectObject(mem, g_fontBold);
-        bool isLiveOp = (g_epolyPreview && gi == 0 && g_epolyOp >= 0);
+        bool isLiveOp = (gi == 0 && g_epolyOp >= 0);
         SetTextColor(mem, isLiveOp ? kAccent : kGroupClr);
         std::wstring hdr = (collapsed ? L"\x25B8 " : L"\x25BE ") + gh.title;
         if (isLiveOp) hdr += L"  \x2713 Apply";
@@ -1005,8 +1082,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Click on group header
         int gIdx = FindGroupAtY(pt.y);
         if (gIdx >= 0) {
-            // EPoly op group while preview active = apply and drop
-            if (g_epolyPreview && gIdx == 0 && g_epolyOp >= 0) {
+            // EPoly op group = apply and drop
+            if (gIdx == 0 && g_epolyOp >= 0) {
                 EPolyDrop();
                 return 0;
             }
@@ -1126,6 +1203,7 @@ static void OpenPanel() {
 static void ClosePanel() {
     if (!g_open) return;
     EPolyAccept();  // commit preview if active (no-op if not)
+    StampForgottenEPolyOp(g_epolyOp, g_epolySelLevel, g_nodeHandle, g_epolyFP);
     KillTimer(g_panel, 1);
     DestroyEdits();
     g_edits.clear();
@@ -1135,6 +1213,7 @@ static void ClosePanel() {
     g_hoverClose = false;
     g_epolyOp = -1;
     g_epolyFP = nullptr;
+    g_epolySelLevel = -1;
     g_epolyPreview = false;
     g_nodeHandle = 0;
     g_nodeName.clear();
