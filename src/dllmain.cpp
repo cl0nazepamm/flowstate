@@ -971,13 +971,6 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT:      PaintPanel(hwnd); return 0;
     case WM_ERASEBKGND: return 1;
 
-    case WM_ACTIVATE:
-        if (LOWORD(wp) == WA_INACTIVE && g_open)
-            PostMessage(hwnd, WM_USER + 101, 0, 0);
-        return 0;
-    case WM_USER + 101:
-        ClosePanel(); return 0;
-
     case WM_NCHITTEST: {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         ScreenToClient(hwnd, &pt);
