@@ -197,6 +197,14 @@ static void BuildLayout();
 
 // ── Mouse hook — XButton2=panel, XButton1=pin ───────────────────
 static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
+    // Click outside panel = instant close
+    if (nCode >= 0 && g_open && !g_suppressClose && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN)) {
+        MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lp;
+        RECT pr; GetWindowRect(g_panel, &pr);
+        if (!PtInRect(&pr, ms->pt)) {
+            PostMessage(g_panel, WM_USER + 101, 0, 0);
+        }
+    }
     if (nCode >= 0 && wp == WM_XBUTTONDOWN) {
         MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lp;
         WORD xbutton = HIWORD(ms->mouseData);
@@ -494,8 +502,8 @@ static void GatherParams() {
     Object* obj = node->GetObjectRef();
     if (!obj) return;
 
-    // ── EPoly last-op detection at the top (one-shot) ─────────
-    if (g_tryEPoly) TryCollectLiveEPoly(obj);
+    // ── EPoly last-op detection at the top (always try) ────────
+    TryCollectLiveEPoly(obj);
 
     // ── Full modifier stack — everything, no skipping ───────────
     Object* walkObj = node->GetObjectRef();
@@ -928,6 +936,10 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT:      PaintPanel(hwnd); return 0;
     case WM_ERASEBKGND: return 1;
 
+    case WM_USER + 101:
+        if (g_open) ClosePanel();
+        return 0;
+
     case WM_NCHITTEST: {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         ScreenToClient(hwnd, &pt);
@@ -1035,18 +1047,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (HIWORD(wp) == EN_KILLFOCUS) { if (g_open) ApplyEdit((HWND)lp); EnableAccelerators(); InvalidateRect(hwnd, nullptr, FALSE); }
         break;
 
-    case WM_TIMER: {
-        // Click-outside-to-close: check if focus left the panel
-        if (g_open && !g_suppressClose && !g_edits.empty()) {
-            HWND focus = GetFocus();
-            bool ours = false;
-            for (auto& ef : g_edits)
-                if (ef.hwnd && ef.hwnd == focus) { ours = true; break; }
-            if (!ours) { ClosePanel(); return 0; }
-        }
-        RefreshEdits();
-        return 0;
-    }
+    case WM_TIMER: RefreshEdits(); return 0;
 
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) { ClosePanel(false); return 0; }
