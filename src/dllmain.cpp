@@ -70,8 +70,8 @@ static const FallbackOpParam kExtrudeFaceParams[] = { {_T("Height"),(ParamID)ep_
 static const FallbackOpParam kExtrudeEdgeParams[] = { {_T("Height"),(ParamID)ep_edge_extrude_height,true}, {_T("Width"),(ParamID)ep_edge_extrude_width,true} };
 static const FallbackOpParam kExtrudeVertParams[] = { {_T("Width"),(ParamID)ep_vertex_extrude_width,true}, {_T("Height"),(ParamID)ep_vertex_extrude_height,true} };
 static const FallbackOpParam kBevelParams[]       = { {_T("Height"),(ParamID)ep_bevel_height,true}, {_T("Outline"),(ParamID)ep_bevel_outline,true}, {_T("Type"),(ParamID)ep_bevel_type,false} };
-static const FallbackOpParam kChamferEdgeParams[] = { {_T("Amount"),(ParamID)ep_edge_chamfer,true}, {_T("Segments"),(ParamID)ep_edge_chamfer_segments,false} };
-static const FallbackOpParam kChamferVertParams[] = { {_T("Amount"),(ParamID)ep_vertex_chamfer,true} };
+static const FallbackOpParam kChamferEdgeParams[] = { {_T("Amount"),(ParamID)ep_edge_chamfer,true}, {_T("Segments"),(ParamID)ep_edge_chamfer_segments,false}, {_T("Depth"),(ParamID)ep_edge_chamfer_depth,true}, {_T("Tension"),(ParamID)ep_edge_chamfer_tension,true} };
+static const FallbackOpParam kChamferVertParams[] = { {_T("Amount"),(ParamID)ep_vertex_chamfer,true}, {_T("Depth"),(ParamID)ep_vertex_chamfer_depth,true} };
 static const FallbackOpParam kInsetParams[]       = { {_T("Amount"),(ParamID)ep_inset,true}, {_T("Type"),(ParamID)ep_inset_type,false} };
 static const FallbackOpParam kOutlineParams[]     = { {_T("Amount"),(ParamID)ep_outline,true} };
 
@@ -87,8 +87,8 @@ static const FallbackOpParam* LookupFallbackParams(int op, int selLevel, int& co
         title=L"Extrude Face"; count=1; return kExtrudeFaceParams;
     case epop_bevel:            title=L"Bevel";    count=3; return kBevelParams;
     case epop_chamfer:
-        if (selLevel==EP_SL_VERTEX) { title=L"Chamfer Vertex"; count=1; return kChamferVertParams; }
-        title=L"Chamfer Edge"; count=2; return kChamferEdgeParams;
+        if (selLevel==EP_SL_VERTEX) { title=L"Chamfer Vertex"; count=2; return kChamferVertParams; }
+        title=L"Chamfer Edge"; count=4; return kChamferEdgeParams;
     case epop_inset:            title=L"Inset";    count=2; return kInsetParams;
     case epop_outline:          title=L"Outline";  count=1; return kOutlineParams;
     default: count=0; return nullptr;
