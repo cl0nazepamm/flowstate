@@ -134,8 +134,9 @@ static ULONG        g_nodeHandle       = 0;
 static int          g_epolyOp       = -1;
 static FPInterface* g_epolyFP       = nullptr;
 static bool         g_epolyPreview  = false;
-static bool         g_epolySpent    = false;  // true after preview used — never re-arm
+static bool         g_epolySpent    = false;
 static int          g_epolyPutCount = -1;     // undo stack snapshot when EPoly detected
+static int          g_epolySpentAt  = -1;     // putCount when preview was last spent
 
 static bool     g_suppressClose = false;
 
@@ -399,9 +400,8 @@ static void EPolyBegin() {
     // If user moved a box or did anything, the put count will differ.
     int currentPutCount = theHold.GetGlobalPutCount();
     if (currentPutCount != g_epolyPutCount) {
-        // Undo stack changed — something else happened. Don't touch undo.
-        // Params still editable (stored for next execution), just no live preview.
         g_epolySpent = true;
+        g_epolySpentAt = currentPutCount;
         g_epolyOp = -1;
         g_epolyFP = nullptr;
         return;
@@ -431,6 +431,7 @@ static void EPolyAccept() {
     g_epolyFP->Invoke(epfn_preview_accept, d);
     g_epolyPreview = false;
     g_epolySpent = true;
+    g_epolySpentAt = theHold.GetGlobalPutCount();
 }
 
 static void EPolyCancel() {
@@ -439,6 +440,7 @@ static void EPolyCancel() {
     g_epolyFP->Invoke(epfn_preview_cancel, d);
     g_epolyPreview = false;
     g_epolySpent = true;
+    g_epolySpentAt = theHold.GetGlobalPutCount();
 }
 
 // Accept preview + remove the op group from panel, panel stays open
@@ -531,8 +533,11 @@ static void GatherParams() {
                         if (gh.count > 0) {
                             g_epolyOp = lastOp;
                             g_epolyFP = fp;
-                            g_epolyPutCount = theHold.GetGlobalPutCount();
-                            g_epolySpent = false;  // fresh detection, re-arm preview
+                            int nowPut = theHold.GetGlobalPutCount();
+                            g_epolyPutCount = nowPut;
+                            // Only re-arm if a NEW operation happened since last spent
+                            if (nowPut > g_epolySpentAt)
+                                g_epolySpent = false;
                             g_groups.push_back(gh);
                         }
                     }
