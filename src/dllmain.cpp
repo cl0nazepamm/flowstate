@@ -146,6 +146,7 @@ static int          g_epolySelLevel = -1;
 static bool         g_epolyPreview  = false;
 static int          g_epolyPutSnap  = -1;     // frozen putCount snapshot
 static bool         g_epolyToolWasLive = false; // tool was active when panel opened
+static int          g_lastKnownOp  = -1;      // last op we showed — detect changes
 
 static bool     g_suppressClose = false;
 
@@ -582,14 +583,16 @@ static void GatherParams() {
                 int curPut = theHold.GetGlobalPutCount();
 
                 if (g_epolyPutSnap < 0) {
-                    // First detection — only show if a tool was LIVE when panel opened
-                    // This prevents showing stale ops from minutes ago
-                    if (g_epolyToolWasLive) {
+                    // First detection — show if:
+                    // 1. Tool was LIVE (caddy open, command mode active), OR
+                    // 2. Operation CHANGED since last time (new op, even if tool exited)
+                    bool fresh = g_epolyToolWasLive || (lastOp != g_lastKnownOp);
+                    if (fresh) {
                         g_epolyPutSnap = curPut;
                         showOp = true;
                     }
                 } else if (curPut == g_epolyPutSnap) {
-                    // Re-open, nothing changed since last detection — show
+                    // Re-open, nothing changed — show
                     showOp = true;
                 }
                 // else: putCount differs — selection/topology changed, skip
@@ -620,6 +623,7 @@ static void GatherParams() {
                         if (gh.count > 0) {
                             g_epolyOp = lastOp;
                             g_epolyFP = fp;
+                            g_lastKnownOp = lastOp;
                             g_epolySelLevel = selLv;
                             FPValue pv;
                             fp->Invoke(epfn_preview_on, pv);
