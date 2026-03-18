@@ -1381,29 +1381,23 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 // Accept current preview before running new op
                 EPolyAccept();
 
-                // Snapshot putCount to detect if the op actually does something
-                int putBefore = theHold.GetGlobalPutCount();
-
                 // Execute the operation
                 FPParams prms(1, TYPE_ENUM, opHit);
                 FPValue r;
                 g_epolyForButtons->Invoke(epfn_button_op, r, &prms);
 
-                int putAfter = theHold.GetGlobalPutCount();
+                // Reset detection state so re-gather picks up the new op
+                g_epolyOp = -1;
+                g_epolyFP = nullptr;
+                g_epolyPreview = false;
+                g_epolyPutSnap = -1;
+                g_lastKnownOp = -1;
+                g_epolyToolWasLive = true;
+                g_epolyWasCancelled = false;
 
-                if (putAfter != putBefore) {
-                    // Op did something — reset + re-gather with preview
-                    g_epolyOp = -1;
-                    g_epolyFP = nullptr;
-                    g_epolyPreview = false;
-                    g_epolyPutSnap = -1;
-                    g_lastKnownOp = -1;
-                    g_epolyToolWasLive = true;
-                    g_epolyWasCancelled = false;
-                    GatherParams();
-                    BuildLayout();
-                }
-                // else: op was a no-op (nothing selected, etc.) — don't touch undo
+                // Re-gather + rebuild to show new op params + enter preview
+                GatherParams();
+                BuildLayout();
                 if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
                 return 0;
             }
