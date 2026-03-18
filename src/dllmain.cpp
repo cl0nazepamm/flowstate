@@ -29,28 +29,35 @@ static const int             kToggleId  = 1;
 
 // ── Config ──────────────────────────────────────────────────────
 static const TCHAR* kWndClass = _T("PowerParamsPanel");
-static const int kPad       = 12;
-static const int kFontPx    = 12;
-static const int kFontHdr   = 14;
-static const int kLineH     = 22;
+static const int kPad       = 10;
+static const int kFontPx    = 13;
+static const int kFontHdr   = 15;
+static const int kLineH     = 24;
 static const int kHeaderH   = 42;
-static const int kGroupGap  = 8;
-static const int kEditW     = 90;
-static const int kEditH     = 18;
-static const int kMaxParams = 40;
-static const int kMinW      = 240;
+static const int kGroupGap  = 6;
+static const int kEditW     = 96;
+static const int kEditH     = 20;
+static const int kMaxParams = 50;
+static const int kMinW      = 260;
 static const int kRefreshMs = 500;
+static const int kBtnH      = 22;
+static const int kBtnGap    = 3;
+static const int kMaxPanelH = 700;
 
-static const COLORREF kBg        = RGB(28, 28, 32);
-static const COLORREF kBorder    = RGB(55, 55, 65);
-static const COLORREF kAccent    = RGB(100, 170, 255);
-static const COLORREF kGroupClr  = RGB(130, 145, 170);
-static const COLORREF kLabelClr  = RGB(160, 160, 170);
-static const COLORREF kValueClr  = RGB(255, 255, 255);
-static const COLORREF kEditBg    = RGB(38, 38, 44);
-static const COLORREF kEditFocus = RGB(50, 50, 58);
+// 3ds Max dark theme colors
+static const COLORREF kBg        = RGB(56, 56, 56);
+static const COLORREF kBorder    = RGB(42, 42, 42);
+static const COLORREF kAccent    = RGB(38, 148, 168);   // teal
+static const COLORREF kGroupClr  = RGB(190, 190, 190);
+static const COLORREF kLabelClr  = RGB(195, 195, 195);
+static const COLORREF kValueClr  = RGB(230, 230, 230);
+static const COLORREF kEditBg    = RGB(42, 42, 42);
+static const COLORREF kEditFocus = RGB(48, 58, 65);
 static const COLORREF kCloseHov  = RGB(200, 60, 60);
 static const COLORREF kPinClr    = RGB(255, 200, 60);
+static const COLORREF kBtnBg     = RGB(68, 68, 68);
+static const COLORREF kBtnHov    = RGB(80, 80, 80);
+static const COLORREF kBtnAct    = RGB(38, 148, 168);   // active = teal
 
 static std::wstring MakeParamLabel(const MCHAR* rawName) {
     if (!rawName || !rawName[0]) return L"?";
@@ -99,11 +106,12 @@ static const FallbackOpParam* LookupFallbackParams(int op, int selLevel, int& co
 struct EditField {
     HWND         hwnd = nullptr;
     std::wstring label;
-    std::wstring key;        // persistent ID "Group:Label"
-    int          keyOrdinal = 0; // nth occurrence for duplicated keys
+    std::wstring key;
+    int          keyOrdinal = 0;
     IParamBlock2* pb  = nullptr;
     ParamID      id   = 0;
     ParamType2   type = (ParamType2)0;
+    int          logY = 0;   // logical Y before scroll
 };
 
 struct GroupHeader {
@@ -138,6 +146,28 @@ static bool         g_epolyPreview  = false;
 static int          g_epolyPutSnap  = -1;     // frozen snapshot — set ONCE, never re-snapshotted
 
 static bool     g_suppressClose = false;
+
+// Sub-object + operation buttons
+static bool     g_hasEPoly      = false;
+static FPInterface* g_epolyForButtons = nullptr;  // for sub-obj + ops
+struct BtnDef { const TCHAR* label; int id; };
+static const BtnDef kSubObjBtns[] = {
+    {_T("Vert"),1}, {_T("Edge"),2}, {_T("Bord"),3}, {_T("Face"),4}, {_T("Elem"),5}
+};
+static const BtnDef kOpBtns[] = {
+    {_T("Extrude"),epop_extrude}, {_T("Connect"),epop_connect_edges},
+    {_T("Bridge"),epop_bridge_edge}, {_T("Chamfer"),epop_chamfer},
+    {_T("Bevel"),epop_bevel}, {_T("Inset"),epop_inset},
+    {_T("Outline"),epop_outline}, {_T("Remove"),epop_remove}
+};
+static int g_subObjY = 0;   // Y position of sub-object button row
+static int g_opBtnY  = 0;   // Y position of operation button row
+static int g_contentStartY = 0;  // where scrollable content begins
+
+// Scroll
+static int g_scrollY   = 0;
+static int g_contentH  = 0;  // total content height
+static int g_viewH     = 0;  // visible content area height
 
 // "Apply and forget" cache for destructive EPoly last-op groups.
 static int      g_forgottenOp       = -1;
@@ -539,6 +569,9 @@ static void GatherParams() {
     g_epolyFP = nullptr;
     g_epolySelLevel = -1;
     g_epolyPreview = false;
+    g_hasEPoly = false;
+    g_epolyForButtons = nullptr;
+    g_scrollY = 0;
     g_epolyPutSnap = -1;
 
     Interface* ip = GetCOREInterface();
@@ -570,6 +603,8 @@ static void GatherParams() {
             EPoly* ep = (EPoly*)walk->GetInterface(EPOLY_INTERFACE);
             if (ep) {
     found_epoly:
+                g_hasEPoly = true;
+                g_epolyForButtons = (FPInterface*)ep;
                 IParamBlock2* pb = ep->getParamBlock();
                 if (pb) {
                     FPInterface* fp = (FPInterface*)ep;
@@ -784,6 +819,10 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == VK_RETURN || wp == VK_ESCAPE) return 0;
         break;
     case WM_MOUSEWHEEL: {
+        // If mouse is not over this edit, forward to panel for scrolling
+        POINT mp; GetCursorPos(&mp);
+        RECT er; GetWindowRect(h, &er);
+        if (!PtInRect(&er, mp)) return SendMessage(g_panel, msg, wp, lp);
         if (!ef || !ef->pb) break;
         Interface* ip = GetCOREInterface();
         if (!ip) break;
@@ -835,6 +874,20 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return CallWindowProc(g_origEdit, h, msg, wp, lp);
 }
 
+// ── Paint helper: draw a button row ─────────────────────────────
+static void DrawBtnRow(HDC mem, const BtnDef* btns, int count, int x, int y, int w,
+                       int activeID, HFONT font) {
+    int bw = (w - (count - 1) * kBtnGap) / count;
+    SelectObject(mem, font);
+    for (int i = 0; i < count; i++) {
+        RECT br = { x + i * (bw + kBtnGap), y, x + i * (bw + kBtnGap) + bw, y + kBtnH };
+        COLORREF bg = (btns[i].id == activeID) ? kBtnAct : kBtnBg;
+        HBRUSH bb = CreateSolidBrush(bg); FillRect(mem, &br, bb); DeleteObject(bb);
+        SetTextColor(mem, (btns[i].id == activeID) ? RGB(255,255,255) : kLabelClr);
+        DrawText(mem, btns[i].label, -1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
 // ── Paint ───────────────────────────────────────────────────────
 static void PaintPanel(HWND hwnd) {
     PAINTSTRUCT ps;
@@ -844,21 +897,27 @@ static void PaintPanel(HWND hwnd) {
     HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
     HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
 
+    // Background
     HBRUSH bg = CreateSolidBrush(kBg); FillRect(mem, &rc, bg); DeleteObject(bg);
-    RECT bar = {0,0,rc.right,3};
+    // Accent bar
+    RECT bar = {0,0,rc.right,2};
     HBRUSH ab = CreateSolidBrush(kAccent); FillRect(mem, &bar, ab); DeleteObject(ab);
+    // Border
     HPEN bp = CreatePen(PS_SOLID, 1, kBorder);
     SelectObject(mem, bp); SelectObject(mem, (HBRUSH)GetStockObject(NULL_BRUSH));
     Rectangle(mem, 0, 0, rc.right, rc.bottom); DeleteObject(bp);
 
     SetBkMode(mem, TRANSPARENT);
-    int y = kPad + 3, x = kPad, rEdge = rc.right - kPad;
+    int x = kPad, rEdge = rc.right - kPad;
 
+    // Header
+    int y = kPad + 2;
     SelectObject(mem, g_fontBold);
     SetTextColor(mem, kAccent);
     const std::wstring& hdrText = g_nodeName.empty() ? std::wstring(L"PowerParams") : g_nodeName;
     TextOut(mem, x, y, hdrText.c_str(), (int)hdrText.length());
 
+    // Close button
     if (g_hoverClose) {
         HBRUSH hov = CreateSolidBrush(kCloseHov); FillRect(mem, &g_closeRect, hov); DeleteObject(hov);
     }
@@ -866,17 +925,40 @@ static void PaintPanel(HWND hwnd) {
     RECT cr = g_closeRect;
     DrawText(mem, _T("\u00D7"), 1, &cr, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 
-    y += kFontHdr + 6;
+    y += kFontHdr + 4;
     HPEN sep = CreatePen(PS_SOLID, 1, kBorder);
     SelectObject(mem, sep); MoveToEx(mem, x, y, nullptr); LineTo(mem, rEdge, y); DeleteObject(sep);
-    y += 5;
+    y += 4;
 
+    // Sub-object buttons (EPoly only)
+    if (g_hasEPoly) {
+        int curLevel = 0;
+        Interface* ip = GetCOREInterface();
+        if (ip) curLevel = ip->GetSubObjectLevel();
+        DrawBtnRow(mem, kSubObjBtns, 5, x, y, rEdge - x, curLevel, g_font);
+        y += kBtnH + kBtnGap;
+
+        // Operation buttons
+        DrawBtnRow(mem, kOpBtns, 8, x, y, rEdge - x, -1, g_font);
+        y += kBtnH + 4;
+
+        // Separator
+        HPEN s2 = CreatePen(PS_SOLID, 1, kBorder);
+        SelectObject(mem, s2); MoveToEx(mem, x, y, nullptr); LineTo(mem, rEdge, y); DeleteObject(s2);
+        y += 4;
+    }
+
+    // Clip to content area for scrollable groups
+    HRGN clipRgn = CreateRectRgn(0, g_contentStartY, rc.right, rc.bottom - 1);
+    SelectClipRgn(mem, clipRgn);
+
+    // Groups + params (scrolled)
+    y = g_contentStartY - g_scrollY;
     HWND focused = GetFocus();
     for (size_t gi = 0; gi < g_groups.size(); gi++) {
         const auto& gh = g_groups[gi];
         bool collapsed = g_collapsed.count(gh.title) > 0;
 
-        // Group header
         SelectObject(mem, g_fontBold);
         bool isLiveOp = (g_epolyPreview && gi == 0 && g_epolyOp >= 0);
         SetTextColor(mem, isLiveOp ? kAccent : kGroupClr);
@@ -890,30 +972,36 @@ static void PaintPanel(HWND hwnd) {
             for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++) {
                 auto& ef = g_edits[fi];
                 bool isPinned = g_pinned.count(ef.key) > 0;
-
-                // Pin indicator
-                if (isPinned) {
-                    SetTextColor(mem, kPinClr);
-                    TextOut(mem, x, y + 2, _T("\u2605"), 1);
-                }
-
+                if (isPinned) { SetTextColor(mem, kPinClr); TextOut(mem, x, y + 3, _T("\u2605"), 1); }
                 SetTextColor(mem, kLabelClr);
-                TextOut(mem, x + (isPinned ? 16 : 8), y + 2, ef.label.c_str(), (int)ef.label.length());
+                TextOut(mem, x + (isPinned ? 16 : 8), y + 3, ef.label.c_str(), (int)ef.label.length());
 
                 if (ef.hwnd) {
                     RECT er; GetWindowRect(ef.hwnd, &er);
                     MapWindowPoints(HWND_DESKTOP, hwnd, (LPPOINT)&er, 2);
                     InflateRect(&er, 1, 1);
                     COLORREF bc = (focused == ef.hwnd) ? kAccent : kBorder;
-                    HPEN ep = CreatePen(PS_SOLID, 1, bc);
-                    SelectObject(mem, ep);
-                    Rectangle(mem, er.left, er.top, er.right, er.bottom);
-                    DeleteObject(ep);
+                    HPEN ep2 = CreatePen(PS_SOLID, 1, bc);
+                    SelectObject(mem, ep2); Rectangle(mem, er.left, er.top, er.right, er.bottom);
+                    DeleteObject(ep2);
                 }
                 y += kLineH;
             }
         }
         if (gi + 1 < g_groups.size()) y += kGroupGap;
+    }
+
+    SelectClipRgn(mem, nullptr);
+    DeleteObject(clipRgn);
+
+    // Scroll indicator (thin bar on right if scrollable)
+    if (g_contentH > g_viewH && g_viewH > 0) {
+        int trackH = rc.bottom - g_contentStartY - 2;
+        int thumbH = (g_viewH * trackH) / g_contentH;
+        if (thumbH < 20) thumbH = 20;
+        int thumbY = g_contentStartY + (g_scrollY * (trackH - thumbH)) / (g_contentH - g_viewH);
+        RECT thumb = { rc.right - 4, thumbY, rc.right - 1, thumbY + thumbH };
+        HBRUSH tb = CreateSolidBrush(kAccent); FillRect(mem, &thumb, tb); DeleteObject(tb);
     }
 
     BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
@@ -925,6 +1013,18 @@ static void PaintPanel(HWND hwnd) {
 static void DestroyEdits() {
     for (auto& ef : g_edits) {
         if (ef.hwnd) { RemoveProp(ef.hwnd, _T("WF")); DestroyWindow(ef.hwnd); ef.hwnd = nullptr; }
+    }
+}
+
+// ── Apply scroll offset to all edit controls ────────────────────
+static void ApplyScroll(int panelW) {
+    int editX = panelW - kPad - kEditW;
+    for (auto& ef : g_edits) {
+        if (!ef.hwnd) continue;
+        int screenY = ef.logY - g_scrollY;
+        bool vis = (screenY + kEditH > g_contentStartY && screenY < g_contentStartY + g_viewH);
+        SetWindowPos(ef.hwnd, nullptr, editX, screenY + 1, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        ShowWindow(ef.hwnd, vis ? SW_SHOW : SW_HIDE);
     }
 }
 
@@ -941,7 +1041,7 @@ static void BuildLayout() {
     SelectObject(hdc, g_fontBold);
     int maxTitle = 0;
     for (auto& gh : g_groups) {
-        std::wstring hdr = L"\u25BE " + gh.title;
+        std::wstring hdr = L"\u25BE " + gh.title + L"  \x2713 Apply";
         SIZE sz; GetTextExtentPoint32(hdc, hdr.c_str(), (int)hdr.length(), &sz);
         if (sz.cx > maxTitle) maxTitle = sz.cx;
     }
@@ -951,39 +1051,80 @@ static void BuildLayout() {
 
     int contentW = maxLbl + 36 + kEditW;
     if (contentW < maxTitle) contentW = maxTitle;
-    int panelW = contentW + kPad * 2 + 4;
+    int panelW = contentW + kPad * 2 + 8;
     if (panelW < kMinW) panelW = kMinW;
     int editX = panelW - kPad - kEditW;
 
     g_closeRect = { panelW - kPad - 18, kPad, panelW - kPad, kPad + 18 };
 
-    int y = 3 + kPad + kFontHdr + 6 + 1 + 5;
+    // Fixed header area
+    int y = 2 + kPad + kFontHdr + 4 + 1 + 4;
+    if (g_hasEPoly) {
+        g_subObjY = y;
+        y += kBtnH + kBtnGap;
+        g_opBtnY = y;
+        y += kBtnH + 4 + 1 + 4;
+    }
+    g_contentStartY = y;
+
+    // Content (logical Y, before scroll)
+    int contentY = y;
     for (size_t gi = 0; gi < g_groups.size(); gi++) {
-        y += kLineH; // group header
+        contentY += kLineH;
         auto& gh = g_groups[gi];
         bool collapsed = g_collapsed.count(gh.title) > 0;
-
         if (!collapsed) {
             for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++) {
-                auto& ef = g_edits[fi];
-                DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL;
-                if (ef.type == TYPE_BOOL) style |= ES_CENTER | ES_READONLY;
-                else style |= ES_RIGHT;
-
-                ef.hwnd = CreateWindowEx(0, _T("EDIT"), _T(""),
-                    style, editX, y + 1, kEditW, kEditH,
-                    g_panel, nullptr, hInstance, nullptr);
-                SendMessage(ef.hwnd, WM_SETFONT, (WPARAM)g_font, TRUE);
-                if (!g_origEdit) g_origEdit = (WNDPROC)GetWindowLongPtr(ef.hwnd, GWLP_WNDPROC);
-                SetWindowLongPtr(ef.hwnd, GWLP_WNDPROC, (LONG_PTR)EditProc);
-                SetProp(ef.hwnd, _T("WF"), (HANDLE)&ef);
-                y += kLineH;
+                g_edits[fi].logY = contentY;
+                contentY += kLineH;
             }
         }
-        if (gi + 1 < g_groups.size()) y += kGroupGap;
+        if (gi + 1 < g_groups.size()) contentY += kGroupGap;
     }
-    int panelH = y + kPad;
+    g_contentH = contentY - g_contentStartY;
+
+    // Panel height = header + min(content, max)
+    HMONITOR hMon = MonitorFromWindow(g_panel, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) }; GetMonitorInfo(hMon, &mi);
+    int screenH = mi.rcWork.bottom - mi.rcWork.top;
+    int maxH = screenH - 40;
+    if (maxH > kMaxPanelH) maxH = kMaxPanelH;
+
+    int panelH = g_contentStartY + g_contentH + kPad;
+    if (panelH > maxH) panelH = maxH;
     if (panelH < 60) panelH = 60;
+    g_viewH = panelH - g_contentStartY - kPad;
+
+    // Clamp scroll
+    int maxScroll = g_contentH - g_viewH;
+    if (maxScroll < 0) maxScroll = 0;
+    if (g_scrollY > maxScroll) g_scrollY = maxScroll;
+    if (g_scrollY < 0) g_scrollY = 0;
+
+    // Create edit controls at scrolled positions
+    for (size_t gi = 0; gi < g_groups.size(); gi++) {
+        auto& gh = g_groups[gi];
+        bool collapsed = g_collapsed.count(gh.title) > 0;
+        if (collapsed) continue;
+        for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++) {
+            auto& ef = g_edits[fi];
+            int screenY = ef.logY - g_scrollY;
+            bool vis = (screenY + kEditH > g_contentStartY && screenY < g_contentStartY + g_viewH);
+
+            DWORD style = WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL;
+            if (vis) style |= WS_VISIBLE;
+            if (ef.type == TYPE_BOOL) style |= ES_CENTER | ES_READONLY;
+            else style |= ES_RIGHT;
+
+            ef.hwnd = CreateWindowEx(0, _T("EDIT"), _T(""),
+                style, editX, screenY + 1, kEditW, kEditH,
+                g_panel, nullptr, hInstance, nullptr);
+            SendMessage(ef.hwnd, WM_SETFONT, (WPARAM)g_font, TRUE);
+            if (!g_origEdit) g_origEdit = (WNDPROC)GetWindowLongPtr(ef.hwnd, GWLP_WNDPROC);
+            SetWindowLongPtr(ef.hwnd, GWLP_WNDPROC, (LONG_PTR)EditProc);
+            SetProp(ef.hwnd, _T("WF"), (HANDLE)&ef);
+        }
+    }
 
     // Keep current position if panel was dragged
     RECT cur; GetWindowRect(g_panel, &cur);
@@ -992,6 +1133,18 @@ static void BuildLayout() {
     RefreshEdits(true);
     SetWindowPos(g_panel, HWND_TOPMOST, g_panelPos.x, g_panelPos.y, panelW, panelH, SWP_NOACTIVATE);
     InvalidateRect(g_panel, nullptr, FALSE);
+}
+
+// ── Button hit test ─────────────────────────────────────────────
+static int HitBtnRow(const BtnDef* btns, int count, int rowY, int panelW, POINT pt) {
+    int x = kPad, w = panelW - kPad * 2;
+    int bw = (w - (count - 1) * kBtnGap) / count;
+    if (pt.y < rowY || pt.y >= rowY + kBtnH) return -1;
+    for (int i = 0; i < count; i++) {
+        int bx = x + i * (bw + kBtnGap);
+        if (pt.x >= bx && pt.x < bx + bw) return btns[i].id;
+    }
+    return -1;
 }
 
 // ── Find which param the mouse is over ──────────────────────────
@@ -1010,7 +1163,7 @@ static int FindParamAtCursor() {
 
 // ── Find which group header the click is on ─────────────────────
 static int FindGroupAtY(int clickY) {
-    int y = 3 + kPad + kFontHdr + 6 + 1 + 5;
+    int y = g_contentStartY - g_scrollY;
     for (size_t gi = 0; gi < g_groups.size(); gi++) {
         if (clickY >= y && clickY < y + kLineH) return (int)gi;
         y += kLineH;
@@ -1041,6 +1194,30 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_LBUTTONDOWN: {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        RECT wr; GetWindowRect(hwnd, &wr); int pw = wr.right - wr.left;
+
+        // Sub-object button click
+        if (g_hasEPoly) {
+            int subHit = HitBtnRow(kSubObjBtns, 5, g_subObjY, pw, pt);
+            if (subHit >= 0) {
+                Interface* ip = GetCOREInterface();
+                if (ip) {
+                    int cur = ip->GetSubObjectLevel();
+                    ip->SetSubObjectLevel(cur == subHit ? 0 : subHit);
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            // Operation button click
+            int opHit = HitBtnRow(kOpBtns, 8, g_opBtnY, pw, pt);
+            if (opHit >= 0 && g_epolyForButtons) {
+                FPParams prms(1, TYPE_ENUM, opHit);
+                FPValue r;
+                g_epolyForButtons->Invoke(epfn_button_op, r, &prms);
+                if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
+                return 0;
+            }
+        }
         if (PtInRect(&g_closeRect, pt)) { ClosePanel(); return 0; }
 
         // Ctrl+click on param = hide it
@@ -1143,6 +1320,20 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (HIWORD(wp) == EN_SETFOCUS)  { DisableAccelerators(); InvalidateRect(hwnd, nullptr, FALSE); }
         if (HIWORD(wp) == EN_KILLFOCUS) { if (g_open) ApplyEdit((HWND)lp); EnableAccelerators(); InvalidateRect(hwnd, nullptr, FALSE); }
         break;
+
+    case WM_MOUSEWHEEL: {
+        // Panel-level scroll (forwarded from edits when mouse not over them)
+        int delta = GET_WHEEL_DELTA_WPARAM(wp);
+        g_scrollY -= delta / 120 * kLineH;
+        int maxScroll = g_contentH - g_viewH;
+        if (maxScroll < 0) maxScroll = 0;
+        if (g_scrollY < 0) g_scrollY = 0;
+        if (g_scrollY > maxScroll) g_scrollY = maxScroll;
+        RECT wr; GetWindowRect(hwnd, &wr);
+        ApplyScroll(wr.right - wr.left);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
 
     case WM_TIMER: RefreshEdits(); return 0;
 
