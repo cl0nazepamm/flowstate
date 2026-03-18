@@ -13,6 +13,7 @@
 #include <maxscript/maxscript.h>
 #include <hold.h>
 #include <windowsx.h>
+#include "powershader.h"
 #include <string>
 #include <vector>
 #include <set>
@@ -246,6 +247,28 @@ static void LoadSettings() {
     fclose(f);
 }
 
+// ── Material Editor detection ────────────────────────────────────
+static bool IsMaterialEditorFocused() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    // Check window title for material editor keywords
+    TCHAR title[256] = {};
+    GetWindowText(fg, title, 256);
+    if (_tcsstr(title, _T("Material Editor"))) return true;
+    if (_tcsstr(title, _T("Slate Material"))) return true;
+    if (_tcsstr(title, _T("Material/Map Browser"))) return true;
+    // Also check parent
+    HWND parent = GetParent(fg);
+    if (parent) {
+        GetWindowText(parent, title, 256);
+        if (_tcsstr(title, _T("Material Editor"))) return true;
+        if (_tcsstr(title, _T("Slate Material"))) return true;
+    }
+    return false;
+}
+
+static const UINT WM_PP_SHADER = WM_USER + 104;
+
 // ── Forward declarations ────────────────────────────────────────
 static void TogglePanel();
 static void ClosePanel();
@@ -272,7 +295,14 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
         if (!isMax) goto pass;
 
         if (xbutton == XBUTTON2) {
-            PostMessage(g_panel, WM_PP_TOGGLE, 0, 0);
+            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            bool matEd = IsMaterialEditorFocused();
+            if (shift || matEd) {
+                // Shift+XButton2 or Material Editor focused → PowerShader
+                PostMessage(g_panel, WM_PP_SHADER, 0, 0);
+            } else {
+                PostMessage(g_panel, WM_PP_TOGGLE, 0, 0);
+            }
             return 1;
         }
         if (xbutton == XBUTTON1 && g_open) {
@@ -1555,6 +1585,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PP_TOGGLE:
         TogglePanel(); return 0;
 
+    case WM_PP_SHADER:
+        PowerShader::Toggle(); return 0;
+
     case WM_PP_ADDPARAM: {
         // Suppress close during detection (HWND_BOTTOM causes WA_INACTIVE)
         g_suppressClose = true;
@@ -1757,10 +1790,13 @@ public:
         if (am) am->ActivateActionTable(&g_actionCB, kTableId);
         g_mouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseHookProc, hInstance, 0);
 
+        PowerShader::Init(hInstance);
+
         return GUPRESULT_KEEP;
     }
 
     void Stop() override {
+        PowerShader::Shutdown();
         if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
         ClosePanel();
         if (g_toolTip)  { DestroyWindow(g_toolTip); g_toolTip = nullptr; }
