@@ -1596,11 +1596,36 @@ static void ExitActiveEPolyTool() {
 
     FPValue d;
     if (prevVal.i != 0) {
-        // Preview active (user mid-operation) — CANCEL it.
-        // This reverts mesh to pre-op state. Param values stay in PB.
-        // Our preview will re-apply the op fresh with the captured values.
+        // Save selection before cancel (cancel reverts selection too)
+        ExecuteMAXScriptScript(
+            _T("ppSavedSel = #{}\n")
+            _T("local ep = modPanel.getCurrentObject()\n")
+            _T("if ep != undefined do (\n")
+            _T("  local sl = subObjectLevel\n")
+            _T("  if sl == 1 do ppSavedSel = ep.getSelection #vertex\n")
+            _T("  if sl == 2 do ppSavedSel = ep.getSelection #edge\n")
+            _T("  if sl == 3 do ppSavedSel = ep.getSelection #edge\n")
+            _T("  if sl == 4 do ppSavedSel = ep.getSelection #face\n")
+            _T("  if sl == 5 do ppSavedSel = ep.getSelection #face\n")
+            _T(")"),
+            MAXScript::ScriptSource::NotSpecified, TRUE);
+
+        // Cancel preview (revert mesh, param values stay in PB)
         fp->Invoke(epfn_preview_cancel, d);
         g_epolyWasCancelled = true;
+
+        // Restore selection
+        ExecuteMAXScriptScript(
+            _T("local ep = modPanel.getCurrentObject()\n")
+            _T("if ep != undefined do (\n")
+            _T("  local sl = subObjectLevel\n")
+            _T("  if sl == 1 do ep.setSelection #vertex ppSavedSel\n")
+            _T("  if sl == 2 do ep.setSelection #edge ppSavedSel\n")
+            _T("  if sl == 3 do ep.setSelection #edge ppSavedSel\n")
+            _T("  if sl == 4 do ep.setSelection #face ppSavedSel\n")
+            _T("  if sl == 5 do ep.setSelection #face ppSavedSel\n")
+            _T(")"),
+            MAXScript::ScriptSource::NotSpecified, TRUE);
     }
     // Exit command mode + close caddy
     fp->Invoke(epfn_exit_command_modes, d);
