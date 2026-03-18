@@ -1365,7 +1365,44 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ── Open / Close ────────────────────────────────────────────────
+// Exit any active EPoly tool (Chamfer caddy, Extrude, etc.)
+static void ExitActiveEPolyTool() {
+    Interface* ip = GetCOREInterface();
+    if (!ip || ip->GetSelNodeCount() == 0) return;
+    INode* node = ip->GetSelNode(0);
+    if (!node) return;
+
+    // Walk to find EPoly
+    Object* obj = node->GetObjectRef();
+    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        IDerivedObject* d = static_cast<IDerivedObject*>(obj);
+        for (int m = 0; m < d->NumModifiers(); m++) {
+            EPoly* ep = (EPoly*)d->GetModifier(m)->GetInterface(EPOLY_INTERFACE);
+            if (ep) goto found;
+        }
+        obj = d->GetObjRef();
+    }
+    if (obj) {
+        EPoly* ep = (EPoly*)obj->GetInterface(EPOLY_INTERFACE);
+        if (ep) {
+found:
+            FPInterface* fp = (FPInterface*)ep;
+            // If an interactive tool is active (preview on), accept it
+            FPValue pv;
+            fp->Invoke(epfn_preview_on, pv);
+            if (pv.i != 0) {
+                FPValue d;
+                fp->Invoke(epfn_preview_accept, d);
+            }
+            // Close any open caddy/popup
+            FPValue d2;
+            fp->Invoke(epfn_close_popup_dialog, d2);
+        }
+    }
+}
+
 static void OpenPanel() {
+    ExitActiveEPolyTool();
     GatherParams();
 
     // Auto-collapse groups with 10+ params on first encounter
