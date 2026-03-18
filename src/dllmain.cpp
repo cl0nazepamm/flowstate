@@ -139,14 +139,10 @@ static const UINT WM_PP_ADDPARAM = WM_USER + 103;
 
 static ULONG        g_nodeHandle       = 0;
 
-// EPoly preview state
+// EPoly state — wiped on every close
 static int          g_epolyOp       = -1;
 static FPInterface* g_epolyFP       = nullptr;
-static int          g_epolySelLevel = -1;
 static bool         g_epolyPreview  = false;
-static int          g_epolyPutSnap  = -1;     // frozen putCount snapshot
-static bool         g_epolyToolWasLive = false; // tool was active when panel opened
-static int          g_lastKnownOp  = -1;      // last op we showed — detect changes
 
 static bool     g_suppressClose = false;
 
@@ -466,15 +462,6 @@ static EPoly* FindEPoly(INode* node) {
 // ── EPoly preview helpers ───────────────────────────────────────
 static void EPolyBegin() {
     if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview) return;
-    if (g_epolyPutSnap < 0) return;  // no snapshot = no preview
-
-    // Frozen snapshot check — if undo stack changed, bail
-    int now = theHold.GetGlobalPutCount();
-    if (now != g_epolyPutSnap) {
-        g_epolyPutSnap = -1;  // kill it, won't match again
-        return;
-    }
-
     ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
     FPParams prms(1, TYPE_ENUM, g_epolyOp);
     FPValue r;
@@ -498,7 +485,6 @@ static void EPolyAccept() {
     FPValue d;
     g_epolyFP->Invoke(epfn_preview_accept, d);
     g_epolyPreview = false;
-    g_epolyPutSnap = -1;  // allow fresh snapshot for next operation
 }
 
 static void EPolyCancel() {
@@ -506,16 +492,13 @@ static void EPolyCancel() {
     FPValue d;
     g_epolyFP->Invoke(epfn_preview_cancel, d);
     g_epolyPreview = false;
-    g_epolyPutSnap = -1;
 }
 
 // Accept preview + remove the op group from panel, panel stays open
 static void EPolyDrop() {
     EPolyAccept();
-    g_epolyPutSnap = -1;  // reset for next operation
     g_epolyOp = -1;
     g_epolyFP = nullptr;
-    g_epolySelLevel = -1;
     // Remove first group (the op group)
     if (!g_groups.empty()) {
         int cnt = g_groups[0].count;
@@ -538,14 +521,11 @@ static void GatherParams() {
     g_nodeHandle = 0;
     g_epolyOp = -1;
     g_epolyFP = nullptr;
-    g_epolySelLevel = -1;
     g_epolyPreview = false;
     g_ctx = CTX_NONE;
     g_epolyForButtons = nullptr;
     g_splineForButtons = nullptr;
-    // g_epolyToolWasLive is set by ExitActiveEPolyTool before GatherParams runs
     g_scrollY = 0;
-    g_epolyPutSnap = -1;
 
     Interface* ip = GetCOREInterface();
     if (!ip || ip->GetSelNodeCount() == 0) return;
@@ -558,12 +538,7 @@ static void GatherParams() {
     Object* obj = node->GetObjectRef();
     if (!obj) return;
 
-    // ── EPoly detection (robust) ────────────────────────────────
-    // Rules:
-    // - Show last-op params ONLY if nothing changed since the operation
-    // - putCount snapshot is frozen on first detection, never re-snapshotted
-    // - If putCount differs (selection change, any edit) → skip, generic only
-    // - If same op was already handled (putSnap matches last handled) → skip
+    // ── EPoly detection — fresh every open, forgotten on close ──
     {
         EPoly* ep = FindEPoly(node);
         if (ep) {
@@ -578,26 +553,7 @@ static void GatherParams() {
                 fp->Invoke(epfn_get_epoly_sel_level, slVal);
                 int lastOp = opVal.i, selLv = slVal.i;
 
-                // Decide if we should show operation params
-                bool showOp = false;
-                int curPut = theHold.GetGlobalPutCount();
-
-                if (g_epolyPutSnap < 0) {
-                    // First detection — show if:
-                    // 1. Tool was LIVE (caddy open, command mode active), OR
-                    // 2. Operation CHANGED since last time (new op, even if tool exited)
-                    bool fresh = g_epolyToolWasLive || (lastOp != g_lastKnownOp);
-                    if (fresh) {
-                        g_epolyPutSnap = curPut;
-                        showOp = true;
-                    }
-                } else if (curPut == g_epolyPutSnap) {
-                    // Re-open, nothing changed — show
-                    showOp = true;
-                }
-                // else: putCount differs — selection/topology changed, skip
-
-                if (showOp && lastOp >= 0) {
+                if (lastOp >= 0) {
                     int cnt = 0; std::wstring title;
                     const FallbackOpParam* fb = LookupFallbackParams(lastOp, selLv, cnt, title);
                     if (fb && cnt > 0) {
@@ -623,11 +579,6 @@ static void GatherParams() {
                         if (gh.count > 0) {
                             g_epolyOp = lastOp;
                             g_epolyFP = fp;
-                            g_lastKnownOp = lastOp;
-                            g_epolySelLevel = selLv;
-                            FPValue pv;
-                            fp->Invoke(epfn_preview_on, pv);
-                            g_epolyPreview = (pv.i != 0);
                             g_groups.push_back(gh);
                         }
                     }
@@ -1536,14 +1487,9 @@ static void ExitActiveEPolyTool() {
     if (!ep) return;
 
     FPInterface* fp = (FPInterface*)ep;
-
-    // Check if a tool/preview is active BEFORE we exit it
-    FPValue modeVal, prevVal;
+    FPValue modeVal;
     fp->Invoke(epfn_get_command_mode, modeVal);
-    fp->Invoke(epfn_preview_on, prevVal);
-    g_epolyToolWasLive = (modeVal.i >= 0 || prevVal.i != 0);
-
-    if (modeVal.i < 0 && prevVal.i == 0) return;  // nothing active
+    if (modeVal.i < 0) return;  // no active tool
 
     // Use MaxScript — most reliable way to commit and exit the caddy.
     // This mirrors exactly what clicking the caddy OK button does.
@@ -1601,11 +1547,8 @@ static void OpenPanel() {
 static void ClosePanel() {
     if (!g_open) return;
     EPolyAccept();  // commit preview if active
-    // Don't reset g_epolyPutSnap here — keeps the frozen snapshot
-    // so next open can check if anything changed
     g_epolyOp = -1;
     g_epolyFP = nullptr;
-    g_epolySelLevel = -1;
     g_epolyPreview = false;
 
     KillTimer(g_panel, 1);
