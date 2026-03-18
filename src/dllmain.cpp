@@ -835,7 +835,7 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_KEYDOWN:
         if (wp == VK_RETURN)  { ApplyEdit(h); RefreshEdits(true); return 0; }
-        if (wp == VK_ESCAPE)  { EPolyCancel(); ClosePanel(); return 0; }
+        if (wp == VK_ESCAPE)  { ClosePanel(); return 0; }
         if (wp == VK_TAB)     { SetFocus(GetNextDlgTabItem(g_panel, h, GetKeyState(VK_SHIFT)<0)); return 0; }
         break;
     case WM_CHAR:
@@ -1078,7 +1078,7 @@ static void PaintPanel(HWND hwnd) {
         bool isOpGroup = (gi == 0 && g_epolyOp >= 0);
         SetTextColor(mem, isOpGroup ? kAccent : kGroupClr);
         std::wstring hdr = (collapsed ? L"\x25B8 " : L"\x25BE ") + gh.title;
-        if (isOpGroup) hdr += L"  [\x2713 OK]  [\x2717 Cancel]";
+        if (isOpGroup) hdr += L"  [\x2713 OK]";
         TextOut(mem, x, y, hdr.c_str(), (int)hdr.length());
         y += kLineH;
 
@@ -1156,7 +1156,7 @@ static void BuildLayout() {
     SelectObject(hdc, g_fontBold);
     int maxTitle = 0;
     for (auto& gh : g_groups) {
-        std::wstring hdr = L"\u25BE " + gh.title + L"  [\x2713 OK]  [\x2717 Cancel]";
+        std::wstring hdr = L"\u25BE " + gh.title + L"  [\x2713 OK]";
         SIZE sz; GetTextExtentPoint32(hdc, hdr.c_str(), (int)hdr.length(), &sz);
         if (sz.cx > maxTitle) maxTitle = sz.cx;
     }
@@ -1397,24 +1397,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (gIdx >= 0) {
             // EPoly op group — OK or Cancel
             if (gIdx == 0 && g_epolyOp >= 0) {
-                // Find where "Cancel" text starts to distinguish OK vs Cancel click
-                HDC hdc = GetDC(hwnd);
-                SelectObject(hdc, g_fontBold);
-                std::wstring okPart = L"\u25BE " + g_groups[0].title + L"  [\x2713 OK]  ";
-                SIZE okSz; GetTextExtentPoint32(hdc, okPart.c_str(), (int)okPart.length(), &okSz);
-                ReleaseDC(hwnd, hdc);
-
-                if (pt.x >= kPad + okSz.cx) {
-                    // Cancel — revert preview
-                    EPolyCancel();
-                    g_epolyOp = -1; g_epolyFP = nullptr;
-                
-                    GatherParams();
-                    BuildLayout();
-                } else {
-                    // OK — accept and drop
-                    EPolyDrop();
-                }
+                EPolyDrop();
                 return 0;
             }
             // Normal collapse toggle
