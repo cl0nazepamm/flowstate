@@ -507,10 +507,10 @@ static void EPolyCancel() {
     if (!g_epolyPreview || !g_epolyFP) return;
     FPValue d;
     g_epolyFP->Invoke(epfn_preview_cancel, d);
+    g_epolyFP->Invoke(epfn_exit_command_modes, d);
+    g_epolyFP->Invoke(epfn_close_popup_dialog, d);
     g_epolyPreview = false;
     g_epolyPutSnap = -1;
-    // EPolyBegin did max undo — redo to restore the original operation
-    ExecuteMAXScriptScript(_T("max redo"), MAXScript::ScriptSource::NotSpecified, TRUE);
     if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
 }
 
