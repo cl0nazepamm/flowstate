@@ -144,6 +144,9 @@ static int          g_epolyOp       = -1;
 static FPInterface* g_epolyFP       = nullptr;
 static int          g_epolySelLevel = -1;
 static bool         g_epolyPreview  = false;
+static int          g_epolyPutSnap  = -1;     // frozen putCount snapshot
+static bool         g_epolyToolWasLive = false; // tool was active when panel opened
+static int          g_lastKnownOp  = -1;      // last op we showed — detect changes
 
 static bool     g_suppressClose = false;
 
@@ -463,7 +466,16 @@ static EPoly* FindEPoly(INode* node) {
 // ── EPoly preview helpers ───────────────────────────────────────
 static void EPolyBegin() {
     if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview) return;
-    // NO max undo. preview_begin re-enters the operation natively.
+    if (g_epolyPutSnap < 0) return;  // no snapshot = no preview
+
+    // Frozen snapshot check — if undo stack changed, bail
+    int now = theHold.GetGlobalPutCount();
+    if (now != g_epolyPutSnap) {
+        g_epolyPutSnap = -1;  // kill it, won't match again
+        return;
+    }
+
+    ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
     FPParams prms(1, TYPE_ENUM, g_epolyOp);
     FPValue r;
     g_epolyFP->Invoke(epfn_preview_begin, r, &prms);
@@ -486,26 +498,23 @@ static void EPolyAccept() {
     FPValue d;
     g_epolyFP->Invoke(epfn_preview_accept, d);
     g_epolyPreview = false;
+    g_epolyPutSnap = -1;  // allow fresh snapshot for next operation
 }
 
 static void EPolyCancel() {
-    if (!g_epolyFP) return;
+    if (!g_epolyPreview || !g_epolyFP) return;
     FPValue d;
-    // Accept whatever is there (don't lose work), then exit tool
-    if (g_epolyPreview) g_epolyFP->Invoke(epfn_preview_accept, d);
-    g_epolyFP->Invoke(epfn_exit_command_modes, d);
-    g_epolyFP->Invoke(epfn_close_popup_dialog, d);
+    g_epolyFP->Invoke(epfn_preview_cancel, d);
     g_epolyPreview = false;
-    if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
+    g_epolyPutSnap = -1;
 }
 
-// Accept preview + remove the op group from panel, panel stays open
-static void EPolyDrop() {
-    EPolyAccept();
+// Remove the op group from panel
+static void RemoveOpGroup() {
     g_epolyOp = -1;
     g_epolyFP = nullptr;
     g_epolySelLevel = -1;
-    // Remove first group (the op group)
+    g_epolyPutSnap = -1;
     if (!g_groups.empty()) {
         int cnt = g_groups[0].count;
         int start = g_groups[0].startIdx;
@@ -517,6 +526,18 @@ static void EPolyDrop() {
         for (auto& gh : g_groups) gh.startIdx -= cnt;
         BuildLayout();
     }
+}
+
+// EXIT = accept preview + remove op group
+static void EPolyDrop() {
+    EPolyAccept();
+    RemoveOpGroup();
+}
+
+// CANCEL = cancel preview (revert) + remove op group
+static void EPolyCancelDrop() {
+    EPolyCancel();
+    RemoveOpGroup();
 }
 
 // ── Gather params ───────────────────────────────────────────────
@@ -532,8 +553,9 @@ static void GatherParams() {
     g_ctx = CTX_NONE;
     g_epolyForButtons = nullptr;
     g_splineForButtons = nullptr;
+    // g_epolyToolWasLive is set by ExitActiveEPolyTool before GatherParams runs
     g_scrollY = 0;
-
+    g_epolyPutSnap = -1;
 
     Interface* ip = GetCOREInterface();
     if (!ip || ip->GetSelNodeCount() == 0) return;
@@ -566,7 +588,26 @@ static void GatherParams() {
                 fp->Invoke(epfn_get_epoly_sel_level, slVal);
                 int lastOp = opVal.i, selLv = slVal.i;
 
-                if (lastOp >= 0) {
+                // Decide if we should show operation params
+                bool showOp = false;
+                int curPut = theHold.GetGlobalPutCount();
+
+                if (g_epolyPutSnap < 0) {
+                    // First detection — show if:
+                    // 1. Tool was LIVE (caddy open, command mode active), OR
+                    // 2. Operation CHANGED since last time (new op, even if tool exited)
+                    bool fresh = g_epolyToolWasLive || (lastOp != g_lastKnownOp);
+                    if (fresh) {
+                        g_epolyPutSnap = curPut;
+                        showOp = true;
+                    }
+                } else if (curPut == g_epolyPutSnap) {
+                    // Re-open, nothing changed — show
+                    showOp = true;
+                }
+                // else: putCount differs — selection/topology changed, skip
+
+                if (showOp && lastOp >= 0) {
                     int cnt = 0; std::wstring title;
                     const FallbackOpParam* fb = LookupFallbackParams(lastOp, selLv, cnt, title);
                     if (fb && cnt > 0) {
@@ -592,9 +633,16 @@ static void GatherParams() {
                         if (gh.count > 0) {
                             g_epolyOp = lastOp;
                             g_epolyFP = fp;
+                            g_lastKnownOp = lastOp;
                             g_epolySelLevel = selLv;
-                            // Enter preview immediately — don't wait for first value change
-                            EPolyBegin();
+                            // Enter preview immediately — live feedback from the start
+                            FPValue pv;
+                            fp->Invoke(epfn_preview_on, pv);
+                            if (pv.i != 0) {
+                                g_epolyPreview = true;
+                            } else {
+                                EPolyBegin();  // undo + preview_begin
+                            }
                             g_groups.push_back(gh);
                         }
                     }
@@ -818,7 +866,6 @@ static void ApplyEdit(HWND h) {
         }
 
         if (!ef.pb) return;
-        if (g_epolyOp >= 0 && !g_epolyPreview) EPolyBegin();
         theHold.Suspend();
         if (IsFloat(ef.type))       ef.pb->SetValue(ef.id, t, (float)_wtof(txt));
         else if (ef.type==TYPE_BOOL) ef.pb->SetValue(ef.id, t, (_wcsicmp(txt,_T("On"))==0||_wtoi(txt)!=0)?1:0);
@@ -873,7 +920,6 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         float step = (float)GET_WHEEL_DELTA_WPARAM(wp) / 120.0f;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        if (g_epolyOp >= 0 && !g_epolyPreview) EPolyBegin();
         theHold.Suspend();
         if (IsFloat(ef->type)) {
             float cur = ef->pb->GetFloat(ef->id, t);
@@ -1079,7 +1125,7 @@ static void PaintPanel(HWND hwnd) {
         bool isOpGroup = (gi == 0 && g_epolyOp >= 0);
         SetTextColor(mem, isOpGroup ? kAccent : kGroupClr);
         std::wstring hdr = (collapsed ? L"\x25B8 " : L"\x25BE ") + gh.title;
-        if (isOpGroup) hdr += L"  [\x2713 OK]  [\x2717 Cancel]";
+        if (isOpGroup) hdr += L"  [\x2713 EXIT]  [\x2717 CANCEL]";
         TextOut(mem, x, y, hdr.c_str(), (int)hdr.length());
         y += kLineH;
 
@@ -1157,7 +1203,7 @@ static void BuildLayout() {
     SelectObject(hdc, g_fontBold);
     int maxTitle = 0;
     for (auto& gh : g_groups) {
-        std::wstring hdr = L"\u25BE " + gh.title + L"  [\x2713 OK]  [\x2717 Cancel]";
+        std::wstring hdr = L"\u25BE " + gh.title + L"  [\x2713 EXIT]  [\x2717 CANCEL]";
         SIZE sz; GetTextExtentPoint32(hdc, hdr.c_str(), (int)hdr.length(), &sz);
         if (sz.cx > maxTitle) maxTitle = sz.cx;
     }
@@ -1396,26 +1442,22 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Click on group header
         int gIdx = FindGroupAtY(pt.y);
         if (gIdx >= 0) {
-            // EPoly op group — OK or Cancel
+            // EPoly op group — EXIT (left half) or CANCEL (right half)
             if (gIdx == 0 && g_epolyOp >= 0) {
-                // Find where "Cancel" text starts to distinguish OK vs Cancel click
+                // Detect which button: measure "EXIT" text width
                 HDC hdc = GetDC(hwnd);
                 SelectObject(hdc, g_fontBold);
-                std::wstring okPart = L"\u25BE " + g_groups[0].title + L"  [\x2713 OK]  ";
-                SIZE okSz; GetTextExtentPoint32(hdc, okPart.c_str(), (int)okPart.length(), &okSz);
+                std::wstring exitTxt = L"  [\x2713 EXIT]";
+                std::wstring hdrBase = L"\x25BE " + g_groups[0].title;
+                SIZE baseSz, exitSz;
+                GetTextExtentPoint32(hdc, hdrBase.c_str(), (int)hdrBase.length(), &baseSz);
+                GetTextExtentPoint32(hdc, exitTxt.c_str(), (int)exitTxt.length(), &exitSz);
                 ReleaseDC(hwnd, hdc);
-
-                if (pt.x >= kPad + okSz.cx) {
-                    // Cancel — revert preview
-                    EPolyCancel();
-                    g_epolyOp = -1; g_epolyFP = nullptr;
-                
-                    GatherParams();
-                    BuildLayout();
-                } else {
-                    // OK — accept and drop
-                    EPolyDrop();
-                }
+                int exitEnd = kPad + baseSz.cx + exitSz.cx;
+                if (pt.x < exitEnd)
+                    EPolyDrop();      // EXIT = accept
+                else
+                    EPolyCancelDrop(); // CANCEL = revert
                 return 0;
             }
             // Normal collapse toggle
@@ -1520,9 +1562,14 @@ static void ExitActiveEPolyTool() {
     if (!ep) return;
 
     FPInterface* fp = (FPInterface*)ep;
-    FPValue modeVal;
+
+    // Check if a tool/preview is active BEFORE we exit it
+    FPValue modeVal, prevVal;
     fp->Invoke(epfn_get_command_mode, modeVal);
-    if (modeVal.i < 0) return;  // no active tool
+    fp->Invoke(epfn_preview_on, prevVal);
+    g_epolyToolWasLive = (modeVal.i >= 0 || prevVal.i != 0);
+
+    if (modeVal.i < 0 && prevVal.i == 0) return;  // nothing active
 
     // Use MaxScript — most reliable way to commit and exit the caddy.
     // This mirrors exactly what clicking the caddy OK button does.
@@ -1580,6 +1627,8 @@ static void OpenPanel() {
 static void ClosePanel() {
     if (!g_open) return;
     EPolyAccept();  // commit preview if active
+    // Don't reset g_epolyPutSnap here — keeps the frozen snapshot
+    // so next open can check if anything changed
     g_epolyOp = -1;
     g_epolyFP = nullptr;
     g_epolySelLevel = -1;
