@@ -373,6 +373,11 @@ static void EPolyCancel() {
 // Accept preview + remove the op group from panel, panel stays open
 static void EPolyDrop() {
     EPolyAccept();
+    // Stamp topology before clearing — prevents stale redetection
+    if (g_epolyFP) {
+        ReadTopoCounts(g_epolyFP, g_dismissV, g_dismissE, g_dismissF);
+        g_dismissNode = g_nodeHandle;
+    }
     g_epolyOp = -1;
     g_epolyFP = nullptr;
     // Remove first group (the op group)
