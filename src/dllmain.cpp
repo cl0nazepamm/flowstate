@@ -1392,7 +1392,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_epolyPreview = false;
                 g_epolyPutSnap = -1;
                 g_lastKnownOp = -1;
-                g_epolyToolWasLive = true;  // we JUST ran the tool
+                g_epolyToolWasLive = true;
+                g_epolyWasCancelled = false;
 
                 // Re-gather + rebuild to show new op params + enter preview
                 GatherParams();
