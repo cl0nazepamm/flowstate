@@ -346,10 +346,16 @@ static void EPolyAccept() {
 }
 
 static void EPolyCancel() {
-    if (!g_epolyPreview || !g_epolyFP) return;
-    FPValue d;
-    g_epolyFP->Invoke(epfn_preview_cancel, d);
-    g_epolyPreview = false;
+    if (g_epolyPreview && g_epolyFP) {
+        // Preview active — cancel reverts the preview
+        FPValue d;
+        g_epolyFP->Invoke(epfn_preview_cancel, d);
+        g_epolyPreview = false;
+    } else if (g_epolyOp >= 0) {
+        // No preview but op was committed — undo to revert
+        ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
+    }
+    if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
 }
 
 // Accept preview + remove the op group from panel, panel stays open
@@ -1133,10 +1139,17 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             int opHit = HitBtnRow(kEPolyOps, 8, g_opBtnY, pw, pt);
             if (opHit >= 0 && g_epolyForButtons) {
+                // Accept any active preview first
+                EPolyAccept();
+                // Execute the operation
                 FPParams prms(1, TYPE_ENUM, opHit);
                 FPValue r;
                 g_epolyForButtons->Invoke(epfn_button_op, r, &prms);
                 if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
+                // Re-gather to show the new op's params
+                g_epolyDismissed = false;
+                GatherParams();
+                BuildLayout();
                 return 0;
             }
         } else if (g_ctx == CTX_SPLINE) {
