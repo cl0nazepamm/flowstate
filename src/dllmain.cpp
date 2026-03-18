@@ -1389,11 +1389,29 @@ static void ExitActiveEPolyTool() {
     EPoly* ep = FindEPoly(ip->GetSelNode(0));
     if (!ep) return;
 
+    // Check if a command mode is active
     FPInterface* fp = (FPInterface*)ep;
+    FPValue modeVal;
+    fp->Invoke(epfn_get_command_mode, modeVal);
+    if (modeVal.i < 0) return;  // no active tool
+
+    // Use MaxScript — most reliable way to commit and exit the caddy.
+    // This mirrors exactly what clicking the caddy OK button does.
+    ExecuteMAXScriptScript(
+        _T("if (subObjectLevel > 0) do (\n")
+        _T("  local epObj = modPanel.getCurrentObject()\n")
+        _T("  if epObj != undefined and isKindOf epObj Editable_Poly do (\n")
+        _T("    epObj.commitAndRepeat false\n")
+        _T("  )\n")
+        _T("  if epObj != undefined and isKindOf epObj Edit_Poly do (\n")
+        _T("    epObj.commitAndRepeat false\n")
+        _T("  )\n")
+        _T(")"),
+        MAXScript::ScriptSource::NotSpecified, TRUE);
+
+    // Fallback: force exit command modes via FP
     FPValue d;
-    fp->Invoke(epfn_preview_accept, d);       // commit result first
-    fp->Invoke(epfn_close_popup_dialog, d);   // close caddy
-    fp->Invoke(epfn_exit_command_modes, d);    // exit tool
+    fp->Invoke(epfn_exit_command_modes, d);
 }
 
 static void OpenPanel() {
