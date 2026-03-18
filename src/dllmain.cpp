@@ -1407,7 +1407,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
-    case WM_TIMER: RefreshEdits(); UpdateToolTip(); return 0;
+    case WM_TIMER: RefreshEdits(); return 0;
 
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) { ClosePanel(); return 0; }
