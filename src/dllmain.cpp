@@ -535,6 +535,11 @@ static void GatherParams() {
     g_edits.clear();
     g_nodeName.clear();
     g_nodeHandle = 0;
+    g_epolyOp = -1;
+    g_epolyFP = nullptr;
+    g_epolySelLevel = -1;
+    g_epolyPreview = false;
+    g_epolyPutSnap = -1;
 
     Interface* ip = GetCOREInterface();
     if (!ip || ip->GetSelNodeCount() == 0) return;
@@ -602,8 +607,11 @@ static void GatherParams() {
                                 g_epolyOp = lastOp;
                                 g_epolyFP = fp;
                                 g_epolySelLevel = selLv;
+                                FPValue pv;
+                                fp->Invoke(epfn_preview_on, pv);
+                                g_epolyPreview = (pv.i != 0);
                                 // Snapshot ONCE — frozen until accept/cancel resets it
-                                if (g_epolyPutSnap < 0)
+                                if (!g_epolyPreview && g_epolyPutSnap < 0)
                                     g_epolyPutSnap = theHold.GetGlobalPutCount();
                                 g_groups.push_back(gh);
                             }
@@ -870,7 +878,7 @@ static void PaintPanel(HWND hwnd) {
 
         // Group header
         SelectObject(mem, g_fontBold);
-        bool isLiveOp = (gi == 0 && g_epolyOp >= 0);
+        bool isLiveOp = (g_epolyPreview && gi == 0 && g_epolyOp >= 0);
         SetTextColor(mem, isLiveOp ? kAccent : kGroupClr);
         std::wstring hdr = (collapsed ? L"\x25B8 " : L"\x25BE ") + gh.title;
         if (isLiveOp) hdr += L"  \x2713 Apply";
@@ -1082,8 +1090,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Click on group header
         int gIdx = FindGroupAtY(pt.y);
         if (gIdx >= 0) {
-            // EPoly op group = apply and drop
-            if (gIdx == 0 && g_epolyOp >= 0) {
+            // EPoly op group while preview active = apply and drop
+            if (g_epolyPreview && gIdx == 0 && g_epolyOp >= 0) {
                 EPolyDrop();
                 return 0;
             }
@@ -1184,7 +1192,7 @@ static void OpenPanel() {
 
     int estH = 3 + kPad*2 + kFontHdr + 10 + (int)g_edits.size() * kLineH + (int)g_groups.size() * (kLineH + kGroupGap);
     if (estH < 60) estH = 60;
-    int ox = pt.x - kMinW / 2, oy = pt.y - estH / 2;
+    int ox = pt.x - kMinW / 2, oy = pt.y;
     if (ox + kMinW > mi.rcWork.right) ox = mi.rcWork.right - kMinW;
     if (oy + estH > mi.rcWork.bottom) oy = mi.rcWork.bottom - estH;
     if (ox < mi.rcWork.left) ox = mi.rcWork.left;
@@ -1202,8 +1210,23 @@ static void OpenPanel() {
 
 static void ClosePanel() {
     if (!g_open) return;
-    EPolyAccept();  // commit preview if active (no-op if not)
-    StampForgottenEPolyOp(g_epolyOp, g_epolySelLevel, g_nodeHandle, g_epolyFP);
+
+    // Safeguard policy:
+    // - Apply visible: keep history, do not forget, do not force preview exit.
+    // - Apply not visible: force preview exit and force forget.
+    bool applyVisible = (g_epolyOp >= 0 && !g_groups.empty());
+    if (applyVisible) {
+        ClearForgottenEPolyOp();
+    } else {
+        EPolyCancel(); // always exit preview when apply is not visible
+        StampForgottenEPolyOp(g_epolyOp, g_epolySelLevel, g_nodeHandle, g_epolyFP);
+        g_epolyOp = -1;
+        g_epolyFP = nullptr;
+        g_epolySelLevel = -1;
+        g_epolyPreview = false;
+        g_epolyPutSnap = -1;
+    }
+
     KillTimer(g_panel, 1);
     DestroyEdits();
     g_edits.clear();
@@ -1211,10 +1234,6 @@ static void ClosePanel() {
     ShowWindow(g_panel, SW_HIDE);
     g_open = false;
     g_hoverClose = false;
-    g_epolyOp = -1;
-    g_epolyFP = nullptr;
-    g_epolySelLevel = -1;
-    g_epolyPreview = false;
     g_nodeHandle = 0;
     g_nodeName.clear();
     EnableAccelerators();
