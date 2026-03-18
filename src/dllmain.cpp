@@ -156,12 +156,17 @@ struct BtnDef { const TCHAR* label; int id; };
 static const BtnDef kEPolySubObj[] = {
     {_T("Vert"),1}, {_T("Edge"),2}, {_T("Bord"),3}, {_T("Face"),4}, {_T("Elem"),5}
 };
+// Interactive command modes (enter caddy/live tool)
 static const BtnDef kEPolyOps[] = {
-    {_T("Extrude"),epop_extrude}, {_T("Connect"),epop_connect_edges},
-    {_T("Bridge"),epop_bridge_edge}, {_T("Chamfer"),epop_chamfer},
-    {_T("Bevel"),epop_bevel}, {_T("Inset"),epop_inset},
-    {_T("Outline"),epop_outline}, {_T("Remove"),epop_remove}
+    {_T("Extrude"),epmode_extrude_face}, {_T("Connect"),epop_connect_edges},
+    {_T("Bridge"),epmode_bridge_edge}, {_T("Chamfer"),epmode_chamfer_edge},
+    {_T("Bevel"),epmode_bevel}, {_T("Inset"),epmode_inset_face},
+    {_T("Outline"),epmode_outline}, {_T("Remove"),epop_remove}
 };
+// Connect and Remove use epfn_button_op (instant), rest use epfn_toggle_command_mode
+static bool IsInstantOp(int id) {
+    return id == epop_connect_edges || id == epop_remove;
+}
 
 // Spline buttons
 static const BtnDef kSplineSubObj[] = {
@@ -1154,14 +1159,17 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             int opHit = HitBtnRow(kEPolyOps, 8, g_opBtnY, pw, pt);
             if (opHit >= 0 && g_epolyForButtons) {
-                // Accept any active preview first
                 EPolyAccept();
-                // Execute the operation
                 FPParams prms(1, TYPE_ENUM, opHit);
                 FPValue r;
-                g_epolyForButtons->Invoke(epfn_button_op, r, &prms);
+                if (IsInstantOp(opHit)) {
+                    // Instant ops (Connect, Remove) — execute immediately
+                    g_epolyForButtons->Invoke(epfn_button_op, r, &prms);
+                } else {
+                    // Interactive ops — enter command mode (caddy/live tool)
+                    g_epolyForButtons->Invoke(epfn_toggle_command_mode, r, &prms);
+                }
                 if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
-                // Clear dismiss stamp so re-gather detects the new op
                 g_dismissV = g_dismissE = g_dismissF = -1;
                 GatherParams();
                 BuildLayout();
