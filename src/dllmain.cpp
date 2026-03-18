@@ -185,7 +185,8 @@ static int      g_forgottenFaces    = -1;
 static std::vector<EditField>   g_edits;
 static std::vector<GroupHeader> g_groups;
 static std::wstring             g_nodeName;
-static POINT                    g_panelPos = {0,0}; // for relayout
+static POINT                    g_panelPos = {0,0};
+static bool                     g_freshOpen = false; // true during OpenPanel, prevents BuildLayout from overriding cursor pos
 
 // ── Persistent settings ─────────────────────────────────────────
 static std::set<std::wstring> g_collapsed;
@@ -1198,9 +1199,12 @@ static void BuildLayout() {
         }
     }
 
-    // Keep current position if panel was dragged
-    RECT cur; GetWindowRect(g_panel, &cur);
-    if (cur.right - cur.left > 1) { g_panelPos.x = cur.left; g_panelPos.y = cur.top; }
+    // Keep current position if panel was dragged (but not on fresh open)
+    if (!g_freshOpen) {
+        RECT cur; GetWindowRect(g_panel, &cur);
+        if (cur.right - cur.left > 1) { g_panelPos.x = cur.left; g_panelPos.y = cur.top; }
+    }
+    g_freshOpen = false;
 
     RefreshEdits(true);
     SetWindowPos(g_panel, HWND_TOPMOST, g_panelPos.x, g_panelPos.y, panelW, panelH, SWP_NOACTIVATE);
@@ -1511,6 +1515,7 @@ static void OpenPanel() {
     if (ox < mi.rcWork.left) ox = mi.rcWork.left;
     if (oy < mi.rcWork.top)  oy = mi.rcWork.top;
     g_panelPos = { ox, oy };
+    g_freshOpen = true;
 
     ShowWindow(g_panel, SW_SHOWNA);
     BuildLayout();
