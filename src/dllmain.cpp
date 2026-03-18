@@ -680,7 +680,7 @@ static void GatherParams() {
         }
     }
 
-    // ── Spline detection ─────────────────────────────────────────
+    // ── Spline detection + param collection ────────────────────
     if (g_ctx == CTX_NONE) {
         Object* walk = obj;
         while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
@@ -689,7 +689,45 @@ static void GatherParams() {
         }
         if (walk && walk->ClassID() == splineShapeClassID) {
             g_ctx = CTX_SPLINE;
-            g_splineForButtons = static_cast<SplineShape*>(walk);
+            SplineShape* ss = static_cast<SplineShape*>(walk);
+            g_splineForButtons = ss;
+
+            // Collect spline info as a read-only group
+            GroupHeader gh;
+            gh.title = L"Spline Info";
+            gh.startIdx = (int)g_edits.size();
+
+            // Steps
+            EditField efSteps;
+            efSteps.label = L"Steps";
+            efSteps.key = L"SplineShape:steps";
+            efSteps.pb = nullptr;  // no param block — handled specially
+            efSteps.id = (ParamID)0;
+            efSteps.type = (ParamType2)TYPE_INT;
+            g_edits.push_back(efSteps);
+
+            // Spline count
+            EditField efCount;
+            efCount.label = L"Splines";
+            efCount.key = L"SplineShape:splineCount";
+            efCount.pb = nullptr;
+            efCount.id = (ParamID)1;
+            efCount.type = (ParamType2)TYPE_INT;
+            g_edits.push_back(efCount);
+
+            // Knot count (total across all splines)
+            EditField efKnots;
+            efKnots.label = L"Knots";
+            efKnots.key = L"SplineShape:knotCount";
+            efKnots.pb = nullptr;
+            efKnots.id = (ParamID)2;
+            efKnots.type = (ParamType2)TYPE_INT;
+            g_edits.push_back(efKnots);
+
+            gh.count = (int)g_edits.size() - gh.startIdx;
+            if (gh.count > 0) g_groups.push_back(gh);
+
+            // Also collect any modifiers on the spline
         }
     }
 
@@ -778,7 +816,30 @@ static void GatherParams() {
 
 
 // ── Value formatting ────────────────────────────────────────────
+// Read spline virtual params
+static bool FormatSplineValue(const EditField& ef, TCHAR* buf, int len) {
+    if (!g_splineForButtons) return false;
+    SplineShape* ss = g_splineForButtons;
+    int pid = (int)ef.id;
+    if (pid == 0) { swprintf(buf, len, _T("%d"), ss->steps); return true; }
+    if (pid == 1) { swprintf(buf, len, _T("%d"), ss->shape.SplineCount()); return true; }
+    if (pid == 2) {
+        int total = 0;
+        for (int i = 0; i < ss->shape.SplineCount(); i++) total += ss->shape.GetSpline(i)->KnotCount();
+        swprintf(buf, len, _T("%d"), total);
+        return true;
+    }
+    return false;
+}
+
 static void FormatValue(const EditField& ef, TimeValue t, TCHAR* buf, int len) {
+    // Spline virtual params (no param block)
+    if (!ef.pb && g_ctx == CTX_SPLINE) {
+        if (FormatSplineValue(ef, buf, len)) return;
+        swprintf(buf, len, _T("--"));
+        return;
+    }
+    if (!ef.pb) { swprintf(buf, len, _T("--")); return; }
     if (IsFloat(ef.type))      swprintf(buf, len, _T("%.4g"), ef.pb->GetFloat(ef.id, t));
     else if (ef.type==TYPE_BOOL) swprintf(buf, len, _T("%s"), ef.pb->GetInt(ef.id, t)?_T("On"):_T("Off"));
     else                       swprintf(buf, len, _T("%d"), ef.pb->GetInt(ef.id, t));
