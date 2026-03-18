@@ -1221,8 +1221,11 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     else ++it;
                 }
                 SaveSettings();
-                // Re-gather and rebuild to get the params back
+                // Re-gather but preserve dismiss stamp
+                int sv = g_dismissV, se = g_dismissE, sf = g_dismissF;
+                ULONG sn = g_dismissNode;
                 GatherParams();
+                g_dismissV = sv; g_dismissE = se; g_dismissF = sf; g_dismissNode = sn;
                 BuildLayout();
                 return 0;
             }
@@ -1266,7 +1269,10 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g_hidden.empty()) {
             g_hidden.clear();
             SaveSettings();
+            int sv = g_dismissV, se = g_dismissE, sf = g_dismissF;
+            ULONG sn = g_dismissNode;
             GatherParams();
+            g_dismissV = sv; g_dismissE = se; g_dismissF = sf; g_dismissNode = sn;
             BuildLayout();
         }
         return 0;
