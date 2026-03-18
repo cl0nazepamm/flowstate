@@ -139,6 +139,8 @@ static ULONG        g_nodeHandle       = 0;
 static int          g_epolyOp       = -1;
 static FPInterface* g_epolyFP       = nullptr;
 static bool         g_epolyPreview  = false;
+static int          g_epolyDismissedOp = -1;   // last op we closed on — skip same op on reopen
+static ULONG        g_epolyDismissedNode = 0;  // node handle when dismissed
 
 
 // Context-aware tool system
@@ -409,7 +411,9 @@ static void GatherParams() {
                 fp->Invoke(epfn_get_epoly_sel_level, slVal);
                 int lastOp = opVal.i, selLv = slVal.i;
 
-                if (lastOp >= 0) {
+                // Skip if same op on same node was already dismissed
+                bool dismissed = (lastOp == g_epolyDismissedOp && g_nodeHandle == g_epolyDismissedNode);
+                if (lastOp >= 0 && !dismissed) {
                     int cnt = 0; std::wstring title;
                     const FallbackOpParam* fb = LookupFallbackParams(lastOp, selLv, cnt, title);
                     if (fb && cnt > 0) {
@@ -1349,6 +1353,11 @@ static void OpenPanel() {
 static void ClosePanel() {
     if (!g_open) return;
     EPolyAccept();  // commit preview if active
+    // Remember what we dismissed so we don't show the same stale op
+    if (g_epolyOp >= 0) {
+        g_epolyDismissedOp = g_epolyOp;
+        g_epolyDismissedNode = g_nodeHandle;
+    }
     g_epolyOp = -1;
     g_epolyFP = nullptr;
     g_epolyPreview = false;
