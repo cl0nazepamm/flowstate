@@ -164,6 +164,10 @@ static int g_subObjY = 0;   // Y position of sub-object button row
 static int g_opBtnY  = 0;   // Y position of operation button row
 static int g_contentStartY = 0;  // where scrollable content begins
 
+// Tool tip overlay (shows active EPoly tool name near cursor)
+static HWND g_toolTip = nullptr;
+static const TCHAR* kToolTipClass = _T("PPToolTip");
+
 // Scroll
 static int g_scrollY   = 0;
 static int g_contentH  = 0;  // total content height
@@ -874,6 +878,74 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return CallWindowProc(g_origEdit, h, msg, wp, lp);
 }
 
+// ── Tool name overlay near cursor ────────────────────────────────
+static const TCHAR* GetCommandModeName(int mode) {
+    switch (mode) {
+    case epmode_extrude_vertex: case epmode_extrude_edge: case epmode_extrude_face: return _T("Extrude");
+    case epmode_chamfer_vertex: case epmode_chamfer_edge: return _T("Chamfer");
+    case epmode_bevel: return _T("Bevel");
+    case epmode_inset_face: return _T("Inset");
+    case epmode_outline: return _T("Outline");
+    case epmode_cut_vertex: case epmode_cut_edge: case epmode_cut_face: return _T("Cut");
+    case epmode_divide_edge: case epmode_divide_face: return _T("Divide");
+    case epmode_bridge_border: case epmode_bridge_polygon: case epmode_bridge_edge: return _T("Bridge");
+    case epmode_weld: return _T("Weld");
+    case epmode_create_vertex: return _T("Create Vertex");
+    case epmode_create_edge: return _T("Create Edge");
+    case epmode_create_face: return _T("Create Face");
+    default: return _T("Tool Active");
+    }
+}
+
+static LRESULT CALLBACK ToolTipProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        HBRUSH bg = CreateSolidBrush(kBg); FillRect(hdc, &rc, bg); DeleteObject(bg);
+        HPEN bp = CreatePen(PS_SOLID, 1, kAccent);
+        SelectObject(hdc, bp); SelectObject(hdc, (HBRUSH)GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, 0, 0, rc.right, rc.bottom); DeleteObject(bp);
+        SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, kAccent);
+        SelectObject(hdc, g_fontBold);
+        TCHAR txt[64]; GetWindowText(hwnd, txt, 64);
+        RECT tr = { 6, 3, rc.right - 6, rc.bottom };
+        DrawText(hdc, txt, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_NCHITTEST: return HTTRANSPARENT;
+    case WM_ERASEBKGND: return 1;
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+static void UpdateToolTip() {
+    if (!g_open || !g_hasEPoly || !g_epolyForButtons) {
+        if (g_toolTip) ShowWindow(g_toolTip, SW_HIDE);
+        return;
+    }
+    FPValue modeVal;
+    g_epolyForButtons->Invoke(epfn_get_command_mode, modeVal);
+    if (modeVal.i < 0) {
+        if (g_toolTip) ShowWindow(g_toolTip, SW_HIDE);
+        return;
+    }
+    const TCHAR* name = GetCommandModeName(modeVal.i);
+    if (!g_toolTip) return;
+
+    SetWindowText(g_toolTip, name);
+    HDC hdc = GetDC(g_toolTip);
+    SelectObject(hdc, g_fontBold);
+    SIZE sz; GetTextExtentPoint32(hdc, name, (int)_tcslen(name), &sz);
+    ReleaseDC(g_toolTip, hdc);
+
+    POINT pt; GetCursorPos(&pt);
+    int w = sz.cx + 16, h = sz.cy + 8;
+    SetWindowPos(g_toolTip, HWND_TOPMOST, pt.x + 18, pt.y - 8, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(g_toolTip, nullptr, FALSE);
+}
+
 // ── Paint helper: draw a button row ─────────────────────────────
 static void DrawBtnRow(HDC mem, const BtnDef* btns, int count, int x, int y, int w,
                        int activeID, HFONT font) {
@@ -960,10 +1032,10 @@ static void PaintPanel(HWND hwnd) {
         bool collapsed = g_collapsed.count(gh.title) > 0;
 
         SelectObject(mem, g_fontBold);
-        bool isLiveOp = (g_epolyPreview && gi == 0 && g_epolyOp >= 0);
-        SetTextColor(mem, isLiveOp ? kAccent : kGroupClr);
+        bool isOpGroup = (gi == 0 && g_epolyOp >= 0);
+        SetTextColor(mem, isOpGroup ? kAccent : kGroupClr);
         std::wstring hdr = (collapsed ? L"\x25B8 " : L"\x25BE ") + gh.title;
-        if (isLiveOp) hdr += L"  \x2713 Apply";
+        if (isOpGroup) hdr += L"  [\x2717 EXIT]";
         TextOut(mem, x, y, hdr.c_str(), (int)hdr.length());
         y += kLineH;
 
@@ -1041,7 +1113,7 @@ static void BuildLayout() {
     SelectObject(hdc, g_fontBold);
     int maxTitle = 0;
     for (auto& gh : g_groups) {
-        std::wstring hdr = L"\u25BE " + gh.title + L"  \x2713 Apply";
+        std::wstring hdr = L"\u25BE " + gh.title + L"  [\x2717 EXIT]";
         SIZE sz; GetTextExtentPoint32(hdc, hdr.c_str(), (int)hdr.length(), &sz);
         if (sz.cx > maxTitle) maxTitle = sz.cx;
     }
@@ -1267,8 +1339,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Click on group header
         int gIdx = FindGroupAtY(pt.y);
         if (gIdx >= 0) {
-            // EPoly op group while preview active = apply and drop
-            if (g_epolyPreview && gIdx == 0 && g_epolyOp >= 0) {
+            // EPoly op group = EXIT and drop
+            if (gIdx == 0 && g_epolyOp >= 0) {
                 EPolyDrop();
                 return 0;
             }
@@ -1335,7 +1407,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
-    case WM_TIMER: RefreshEdits(); return 0;
+    case WM_TIMER: RefreshEdits(); UpdateToolTip(); return 0;
 
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) { ClosePanel(); return 0; }
@@ -1473,6 +1545,7 @@ static void ClosePanel() {
     g_edits.clear();
     g_groups.clear();
     ShowWindow(g_panel, SW_HIDE);
+    if (g_toolTip) ShowWindow(g_toolTip, SW_HIDE);
     g_open = false;
     g_hoverClose = false;
     g_nodeHandle = 0;
@@ -1540,6 +1613,17 @@ public:
         g_panel = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,
             kWndClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
 
+        // Tool name tooltip window
+        WNDCLASSEX wc2 = {};
+        wc2.cbSize = sizeof(wc2);
+        wc2.lpfnWndProc = ToolTipProc;
+        wc2.hInstance = hInstance;
+        wc2.lpszClassName = kToolTipClass;
+        wc2.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        RegisterClassEx(&wc2);
+        g_toolTip = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
+            kToolTipClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
+
         IActionManager* am = GetCOREInterface()->GetActionManager();
         if (am) am->ActivateActionTable(&g_actionCB, kTableId);
         g_mouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseHookProc, hInstance, 0);
@@ -1550,6 +1634,7 @@ public:
     void Stop() override {
         if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
         ClosePanel();
+        if (g_toolTip)  { DestroyWindow(g_toolTip); g_toolTip = nullptr; }
         if (g_panel)    { DestroyWindow(g_panel);  g_panel = nullptr; }
         if (g_font)     { DeleteObject(g_font);     g_font = nullptr; }
         if (g_fontBold) { DeleteObject(g_fontBold); g_fontBold = nullptr; }
