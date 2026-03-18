@@ -9,6 +9,7 @@
 #include <custcont.h>
 #include <iparamm2.h>
 #include <iepoly.h>
+#include <splshape.h>
 #include <maxscript/maxscript.h>
 #include <hold.h>
 #include <windowsx.h>
@@ -147,18 +148,34 @@ static int          g_epolyPutSnap  = -1;     // frozen snapshot — set ONCE, n
 
 static bool     g_suppressClose = false;
 
-// Sub-object + operation buttons
-static bool     g_hasEPoly      = false;
-static FPInterface* g_epolyForButtons = nullptr;  // for sub-obj + ops
+// Context-aware tool system
+enum ObjContext { CTX_NONE, CTX_EPOLY, CTX_SPLINE };
+static ObjContext g_ctx = CTX_NONE;
+static FPInterface* g_epolyForButtons = nullptr;
+static SplineShape* g_splineForButtons = nullptr;
+
 struct BtnDef { const TCHAR* label; int id; };
-static const BtnDef kSubObjBtns[] = {
+
+// EPoly buttons
+static const BtnDef kEPolySubObj[] = {
     {_T("Vert"),1}, {_T("Edge"),2}, {_T("Bord"),3}, {_T("Face"),4}, {_T("Elem"),5}
 };
-static const BtnDef kOpBtns[] = {
+static const BtnDef kEPolyOps[] = {
     {_T("Extrude"),epop_extrude}, {_T("Connect"),epop_connect_edges},
     {_T("Bridge"),epop_bridge_edge}, {_T("Chamfer"),epop_chamfer},
     {_T("Bevel"),epop_bevel}, {_T("Inset"),epop_inset},
     {_T("Outline"),epop_outline}, {_T("Remove"),epop_remove}
+};
+
+// Spline buttons
+static const BtnDef kSplineSubObj[] = {
+    {_T("Vert"),SS_VERTEX}, {_T("Seg"),SS_SEGMENT}, {_T("Spline"),SS_SPLINE}
+};
+static const BtnDef kSplineOps[] = {
+    {_T("Refine"),ScmRefine}, {_T("Fillet"),ScmFillet},
+    {_T("Chamfer"),ScmChamfer}, {_T("Outline"),ScmOutline},
+    {_T("Connect"),ScmConnect}, {_T("Trim"),ScmTrim},
+    {_T("Extend"),ScmExtend}, {_T("Boolean"),ScmUnion}
 };
 static int g_subObjY = 0;   // Y position of sub-object button row
 static int g_opBtnY  = 0;   // Y position of operation button row
@@ -574,8 +591,9 @@ static void GatherParams() {
     g_epolyFP = nullptr;
     g_epolySelLevel = -1;
     g_epolyPreview = false;
-    g_hasEPoly = false;
+    g_ctx = CTX_NONE;
     g_epolyForButtons = nullptr;
+    g_splineForButtons = nullptr;
     g_scrollY = 0;
     g_epolyPutSnap = -1;
 
@@ -608,7 +626,7 @@ static void GatherParams() {
             EPoly* ep = (EPoly*)walk->GetInterface(EPOLY_INTERFACE);
             if (ep) {
     found_epoly:
-                g_hasEPoly = true;
+                g_ctx = CTX_EPOLY;
                 g_epolyForButtons = (FPInterface*)ep;
                 IParamBlock2* pb = ep->getParamBlock();
                 if (pb) {
@@ -659,6 +677,19 @@ static void GatherParams() {
                     }
                 }
             }
+        }
+    }
+
+    // ── Spline detection ─────────────────────────────────────────
+    if (g_ctx == CTX_NONE) {
+        Object* walk = obj;
+        while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+            IDerivedObject* d = static_cast<IDerivedObject*>(walk);
+            walk = d->GetObjRef();
+        }
+        if (walk && walk->ClassID() == splineShapeClassID) {
+            g_ctx = CTX_SPLINE;
+            g_splineForButtons = static_cast<SplineShape*>(walk);
         }
     }
 
@@ -922,7 +953,7 @@ static LRESULT CALLBACK ToolTipProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 static void UpdateToolTip() {
-    if (!g_open || !g_hasEPoly || !g_epolyForButtons) {
+    if (!g_open || g_ctx != CTX_EPOLY || !g_epolyForButtons) {
         if (g_toolTip) ShowWindow(g_toolTip, SW_HIDE);
         return;
     }
@@ -1003,16 +1034,21 @@ static void PaintPanel(HWND hwnd) {
     SelectObject(mem, sep); MoveToEx(mem, x, y, nullptr); LineTo(mem, rEdge, y); DeleteObject(sep);
     y += 4;
 
-    // Sub-object buttons (EPoly only)
-    if (g_hasEPoly) {
+    // Context-aware buttons
+    if (g_ctx != CTX_NONE) {
         int curLevel = 0;
         Interface* ip = GetCOREInterface();
         if (ip) curLevel = ip->GetSubObjectLevel();
-        DrawBtnRow(mem, kSubObjBtns, 5, x, y, rEdge - x, curLevel, g_font);
-        y += kBtnH + kBtnGap;
 
-        // Operation buttons
-        DrawBtnRow(mem, kOpBtns, 8, x, y, rEdge - x, -1, g_font);
+        if (g_ctx == CTX_EPOLY) {
+            DrawBtnRow(mem, kEPolySubObj, 5, x, y, rEdge - x, curLevel, g_font);
+            y += kBtnH + kBtnGap;
+            DrawBtnRow(mem, kEPolyOps, 8, x, y, rEdge - x, -1, g_font);
+        } else if (g_ctx == CTX_SPLINE) {
+            DrawBtnRow(mem, kSplineSubObj, 3, x, y, rEdge - x, curLevel, g_font);
+            y += kBtnH + kBtnGap;
+            DrawBtnRow(mem, kSplineOps, 8, x, y, rEdge - x, -1, g_font);
+        }
         y += kBtnH + 4;
 
         // Separator
@@ -1132,7 +1168,7 @@ static void BuildLayout() {
 
     // Fixed header area
     int y = 2 + kPad + kFontHdr + 4 + 1 + 4;
-    if (g_hasEPoly) {
+    if (g_ctx != CTX_NONE) {
         g_subObjY = y;
         y += kBtnH + kBtnGap;
         g_opBtnY = y;
@@ -1272,24 +1308,34 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         RECT wr; GetWindowRect(hwnd, &wr); int pw = wr.right - wr.left;
 
-        // Sub-object button click
-        if (g_hasEPoly) {
-            int subHit = HitBtnRow(kSubObjBtns, 5, g_subObjY, pw, pt);
+        // Context-aware button clicks
+        if (g_ctx == CTX_EPOLY) {
+            int subHit = HitBtnRow(kEPolySubObj, 5, g_subObjY, pw, pt);
             if (subHit >= 0) {
                 Interface* ip = GetCOREInterface();
-                if (ip) {
-                    int cur = ip->GetSubObjectLevel();
-                    ip->SetSubObjectLevel(cur == subHit ? 0 : subHit);
-                }
+                if (ip) ip->SetSubObjectLevel(ip->GetSubObjectLevel() == subHit ? 0 : subHit);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            // Operation button click
-            int opHit = HitBtnRow(kOpBtns, 8, g_opBtnY, pw, pt);
+            int opHit = HitBtnRow(kEPolyOps, 8, g_opBtnY, pw, pt);
             if (opHit >= 0 && g_epolyForButtons) {
                 FPParams prms(1, TYPE_ENUM, opHit);
                 FPValue r;
                 g_epolyForButtons->Invoke(epfn_button_op, r, &prms);
+                if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
+                return 0;
+            }
+        } else if (g_ctx == CTX_SPLINE) {
+            int subHit = HitBtnRow(kSplineSubObj, 3, g_subObjY, pw, pt);
+            if (subHit >= 0) {
+                Interface* ip = GetCOREInterface();
+                if (ip) ip->SetSubObjectLevel(ip->GetSubObjectLevel() == subHit ? 0 : subHit);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            int opHit = HitBtnRow(kSplineOps, 8, g_opBtnY, pw, pt);
+            if (opHit >= 0 && g_splineForButtons) {
+                g_splineForButtons->StartCommandMode((splineCommandMode)opHit);
                 if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
                 return 0;
             }
