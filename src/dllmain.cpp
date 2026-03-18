@@ -55,7 +55,6 @@ static const COLORREF kValueClr  = RGB(230, 230, 230);
 static const COLORREF kEditBg    = RGB(42, 42, 42);
 static const COLORREF kEditFocus = RGB(48, 58, 65);
 static const COLORREF kCloseHov  = RGB(200, 60, 60);
-static const COLORREF kPinClr    = RGB(255, 200, 60);
 static const COLORREF kBtnBg     = RGB(68, 68, 68);
 static const COLORREF kBtnHov    = RGB(80, 80, 80);
 static const COLORREF kBtnAct    = RGB(38, 148, 168);   // active = teal
@@ -108,7 +107,6 @@ struct EditField {
     HWND         hwnd = nullptr;
     std::wstring label;
     std::wstring key;
-    int          keyOrdinal = 0;
     IParamBlock2* pb  = nullptr;
     ParamID      id   = 0;
     ParamType2   type = (ParamType2)0;
@@ -134,8 +132,6 @@ static bool     g_hoverClose = false;
 static RECT     g_closeRect  = {};
 
 static const UINT WM_PP_TOGGLE   = WM_USER + 100;
-static const UINT WM_PP_PIN      = WM_USER + 102;
-static const UINT WM_PP_ADDPARAM = WM_USER + 103;
 
 static ULONG        g_nodeHandle       = 0;
 
@@ -144,7 +140,6 @@ static int          g_epolyOp       = -1;
 static FPInterface* g_epolyFP       = nullptr;
 static bool         g_epolyPreview  = false;
 
-static bool     g_suppressClose = false;
 
 // Context-aware tool system
 enum ObjContext { CTX_NONE, CTX_EPOLY, CTX_SPLINE };
@@ -197,7 +192,6 @@ static bool                     g_freshOpen = false; // true during OpenPanel, p
 
 // ── Persistent settings ─────────────────────────────────────────
 static std::set<std::wstring> g_collapsed;
-static std::set<std::wstring> g_pinned;
 static std::set<std::wstring> g_hidden;
 
 static std::wstring GetCfgPath() {
@@ -215,13 +209,12 @@ static void SaveSettings() {
     FILE* f = _wfopen(path.c_str(), L"w");
     if (!f) return;
     for (auto& s : g_collapsed) fwprintf(f, L"C:%s\n", s.c_str());
-    for (auto& s : g_pinned)    fwprintf(f, L"P:%s\n", s.c_str());
     for (auto& s : g_hidden)    fwprintf(f, L"H:%s\n", s.c_str());
     fclose(f);
 }
 
 static void LoadSettings() {
-    g_collapsed.clear(); g_pinned.clear(); g_hidden.clear();
+    g_collapsed.clear(); g_hidden.clear();
     std::wstring path = GetCfgPath();
     if (path.empty()) return;
     FILE* f = _wfopen(path.c_str(), L"r");
@@ -234,7 +227,6 @@ static void LoadSettings() {
         std::wstring val(line + 2);
         switch (line[0]) {
         case L'C': g_collapsed.insert(val); break;
-        case L'P': g_pinned.insert(val);    break;
         case L'H': g_hidden.insert(val);    break;
         }
     }
@@ -251,7 +243,7 @@ static void BuildLayout();
 // ── Mouse hook — XButton2=panel, XButton1=pin ───────────────────
 static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     // Click outside panel = instant close
-    if (nCode >= 0 && g_open && !g_suppressClose && !g_epolyPreview && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN)) {
+    if (nCode >= 0 && g_open && !g_epolyPreview && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN)) {
         MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lp;
         RECT pr; GetWindowRect(g_panel, &pr);
         if (!PtInRect(&pr, ms->pt)) {
@@ -270,11 +262,6 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             PostMessage(g_panel, WM_PP_TOGGLE, 0, 0);
             return 1;
         }
-        // XButton1 disabled for now — spinner detection needs rework
-        // if (xbutton == XBUTTON1 && g_open) {
-        //     PostMessage(g_panel, WM_PP_ADDPARAM, 0, 0);
-        //     return 1;
-        // }
     }
 pass:
     return CallNextHookEx(g_mouseHook, nCode, wp, lp);
@@ -285,138 +272,6 @@ static bool IsFloat(ParamType2 t) { return t==TYPE_FLOAT||t==TYPE_ANGLE||t==TYPE
 static bool IsInt(ParamType2 t)   { return t==TYPE_INT||t==TYPE_TIMEVALUE||t==TYPE_RADIOBTN_INDEX||t==TYPE_INDEX; }
 
 // ── Detect spinner under cursor → return its persistent key ─────
-static std::wstring DetectSpinnerKey() {
-    POINT pt; GetCursorPos(&pt);
-    HWND hwnd = WindowFromPoint(pt);
-    if (!hwnd) return L"";
-
-    // Must be a Max spinner or edit control
-    TCHAR cls[64]; GetClassName(hwnd, cls, 64);
-    if (_tcscmp(cls, SPINNERWINDOWCLASS) != 0 && _tcscmp(cls, CUSTEDITWINDOWCLASS) != 0)
-        return L"";
-
-    int ctrlID = GetDlgCtrlID(hwnd);
-    if (ctrlID <= 0) return L"";
-
-    Interface* ip = GetCOREInterface();
-    if (!ip || ip->GetSelNodeCount() == 0) return L"";
-    INode* node = ip->GetSelNode(0);
-    if (!node) return L"";
-
-    // Match ctrl ID against all param blocks — no param map dependency
-    auto tryPB = [&](IParamBlock2* pb, const MCHAR* className) -> std::wstring {
-        if (!pb) return L"";
-        for (int i = 0; i < pb->NumParams(); i++) {
-            ParamID pid = pb->IndextoID(i);
-            const ParamDef& def = pb->GetParamDef(pid);
-            if (!def.int_name) continue;
-            for (int c = 0; c < def.ctrl_count; c++) {
-                if (def.ctrl_IDs[c] == ctrlID) {
-                    return std::wstring(className) + L":" + def.int_name;
-                }
-            }
-        }
-        return L"";
-    };
-
-    Object* obj = node->GetObjectRef();
-    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-        IDerivedObject* d = static_cast<IDerivedObject*>(obj);
-        for (int m = 0; m < d->NumModifiers(); m++) {
-            Modifier* mod = d->GetModifier(m);
-            if (!mod) continue;
-            MSTR cn; mod->GetClassName(cn, false);
-            for (int b = 0; b < mod->NumParamBlocks(); b++) {
-                std::wstring key = tryPB(mod->GetParamBlock(b), cn.data());
-                if (!key.empty()) return key;
-            }
-        }
-        obj = d->GetObjRef();
-    }
-    if (obj) {
-        MSTR cn; obj->GetClassName(cn, false);
-        for (int b = 0; b < obj->NumParamBlocks(); b++) {
-            std::wstring key = tryPB(obj->GetParamBlock(b), cn.data());
-            if (!key.empty()) return key;
-        }
-        EPoly* ep = (EPoly*)obj->GetInterface(EPOLY_INTERFACE);
-        if (ep) {
-            std::wstring key = tryPB(ep->getParamBlock(), cn.data());
-            if (!key.empty()) return key;
-        }
-    }
-    return L"";
-}
-
-// ── Find a param by persistent key on current selection ─────────
-static bool FindParamByKey(INode* node, const std::wstring& key,
-                           IParamBlock2*& outPB, ParamID& outID, ParamType2& outType,
-                           int keyOrdinal = 0) {
-    size_t sep = key.find(L':');
-    if (sep == std::wstring::npos) return false;
-    std::wstring wantClass = key.substr(0, sep);
-    std::wstring wantParam = key.substr(sep + 1);
-    int seen = 0;
-
-    auto searchPB = [&](IParamBlock2* pb) -> bool {
-        if (!pb) return false;
-        for (int i = 0; i < pb->NumParams(); i++) {
-            ParamID pid = pb->IndextoID(i);
-            const ParamDef& def = pb->GetParamDef(pid);
-            if (def.int_name && std::wstring(def.int_name) == wantParam) {
-                if (seen == keyOrdinal) {
-                    outPB = pb; outID = pid; outType = def.type;
-                    return true;
-                }
-                ++seen;
-            }
-        }
-        return false;
-    };
-
-    Object* obj = node->GetObjectRef();
-    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-        IDerivedObject* d = static_cast<IDerivedObject*>(obj);
-        for (int m = 0; m < d->NumModifiers(); m++) {
-            Modifier* mod = d->GetModifier(m);
-            if (!mod) continue;
-            MSTR cn; mod->GetClassName(cn, false);
-            if (std::wstring(cn.data()) != wantClass) continue;
-            for (int b = 0; b < mod->NumParamBlocks(); b++)
-                if (searchPB(mod->GetParamBlock(b))) return true;
-        }
-        obj = d->GetObjRef();
-    }
-    if (obj) {
-        MSTR cn; obj->GetClassName(cn, false);
-        if (std::wstring(cn.data()) == wantClass) {
-            for (int b = 0; b < obj->NumParamBlocks(); b++)
-                if (searchPB(obj->GetParamBlock(b))) return true;
-            EPoly* ep = (EPoly*)obj->GetInterface(EPOLY_INTERFACE);
-            if (ep && searchPB(ep->getParamBlock())) return true;
-        }
-    }
-    return false;
-}
-
-static bool ResolveEditBinding(INode* node, EditField& ef) {
-    IParamBlock2* pb = nullptr;
-    ParamID pid = 0;
-    ParamType2 ptype = (ParamType2)0;
-    if (!FindParamByKey(node, ef.key, pb, pid, ptype, ef.keyOrdinal)) return false;
-    ef.pb = pb;
-    ef.id = pid;
-    ef.type = ptype;
-    return true;
-}
-
-static int GetNextKeyOrdinal(const std::wstring& key) {
-    int ord = 0;
-    for (const auto& ef : g_edits)
-        if (ef.key == key) ++ord;
-    return ord;
-}
-
 static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int& total) {
     if (!pb) return;
     int n = pb->NumParams();
@@ -434,7 +289,7 @@ static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int&
         EditField ef;
         ef.label = label;
         ef.key   = key;
-        ef.keyOrdinal = GetNextKeyOrdinal(key);
+
         ef.pb    = pb;
         ef.id    = pid;
         ef.type  = d.type;
@@ -570,7 +425,7 @@ static void GatherParams() {
                             EditField ef;
                             ef.label = fb[i].label;
                             ef.key   = key;
-                            ef.keyOrdinal = GetNextKeyOrdinal(key);
+                    
                             ef.pb    = pb;
                             ef.id    = fb[i].pid;
                             ef.type  = (ParamType2)(fb[i].isFloat ? TYPE_FLOAT : TYPE_INT);
@@ -674,42 +529,6 @@ static void GatherParams() {
         if (gh.count > 0) g_groups.push_back(gh);
     }
 
-    // ── Collect pinned params not already in panel ──────────────
-    if (!g_pinned.empty() && node) {
-        // Build set of keys already collected
-        std::set<std::wstring> existing;
-        for (auto& ef : g_edits) existing.insert(ef.key);
-
-        GroupHeader pgh;
-        pgh.title    = L"\u2605 Pinned";
-        pgh.startIdx = (int)g_edits.size();
-
-        for (auto& key : g_pinned) {
-            if (existing.count(key)) continue;  // already shown
-            if (g_hidden.count(key)) continue;
-
-            IParamBlock2* pb = nullptr;
-            ParamID pid = 0;
-            ParamType2 ptype = (ParamType2)0;
-            if (FindParamByKey(node, key, pb, pid, ptype)) {
-                if (ptype & TYPE_TAB) continue;
-                if (!IsFloat(ptype) && !IsInt(ptype) && ptype != TYPE_BOOL) continue;
-
-                size_t sep = key.find(L':');
-                EditField ef;
-                ef.label = (sep != std::wstring::npos) ? key.substr(sep + 1) : key;
-                ef.key   = key;
-                ef.keyOrdinal = GetNextKeyOrdinal(key);
-                ef.pb    = pb;
-                ef.id    = pid;
-                ef.type  = ptype;
-                g_edits.push_back(ef);
-            }
-        }
-
-        pgh.count = (int)g_edits.size() - pgh.startIdx;
-        if (pgh.count > 0) g_groups.push_back(pgh);
-    }
 }
 
 
@@ -1072,10 +891,8 @@ static void PaintPanel(HWND hwnd) {
             SelectObject(mem, g_font);
             for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++) {
                 auto& ef = g_edits[fi];
-                bool isPinned = g_pinned.count(ef.key) > 0;
-                if (isPinned) { SetTextColor(mem, kPinClr); TextOut(mem, x, y + 3, _T("\u2605"), 1); }
                 SetTextColor(mem, kLabelClr);
-                TextOut(mem, x + (isPinned ? 16 : 8), y + 3, ef.label.c_str(), (int)ef.label.length());
+                TextOut(mem, x + 8, y + 3, ef.label.c_str(), (int)ef.label.length());
 
                 if (ef.hwnd) {
                     RECT er; GetWindowRect(ef.hwnd, &er);
@@ -1458,22 +1275,6 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PP_TOGGLE:
         TogglePanel(); return 0;
 
-    case WM_PP_ADDPARAM: {
-        // Suppress close during detection (HWND_BOTTOM causes WA_INACTIVE)
-        g_suppressClose = true;
-        SetWindowPos(g_panel, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-        std::wstring key = DetectSpinnerKey();
-        SetWindowPos(g_panel, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-        g_suppressClose = false;
-
-        if (!key.empty() && !g_pinned.count(key)) {
-            g_pinned.insert(key);
-            SaveSettings();
-            GatherParams();
-            BuildLayout();
-        }
-        return 0;
-    }
     }
     return DefWindowProc(hwnd, msg, wp, lp);
 }
