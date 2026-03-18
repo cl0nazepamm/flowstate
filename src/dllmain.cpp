@@ -148,7 +148,6 @@ static int          g_epolyPutSnap  = -1;     // frozen putCount snapshot
 static bool         g_epolyToolWasLive = false; // tool was active when panel opened
 static bool         g_epolyWasCancelled = false; // we cancelled Max's preview — skip undo in EPolyBegin
 static int          g_lastKnownOp  = -1;      // last op we showed — detect changes
-static int          g_lastKnownPut = -1;      // putCount of the last op we showed
 
 static bool     g_suppressClose = false;
 
@@ -595,20 +594,15 @@ static void GatherParams() {
                 fp->Invoke(epfn_get_epoly_sel_level, slVal);
                 int lastOp = opVal.i, selLv = slVal.i;
 
-                // Decide if we should show operation params.
-                // Connect can report the same last-op ID repeatedly, so we also
-                // use hold putCount to detect a fresh committed operation.
+                // Decide if we should show operation params
                 bool showOp = false;
                 int curPut = theHold.GetGlobalPutCount();
 
                 if (g_epolyPutSnap < 0) {
                     // First detection — show if:
                     // 1. Tool was LIVE (caddy open, command mode active), OR
-                    // 2. Operation CHANGED since last time, OR
-                    // 3. putCount advanced since the last handled op.
-                    bool fresh = g_epolyToolWasLive
-                        || (lastOp != g_lastKnownOp)
-                        || (curPut != g_lastKnownPut);
+                    // 2. Operation CHANGED since last time (new op, even if tool exited)
+                    bool fresh = g_epolyToolWasLive || (lastOp != g_lastKnownOp);
                     if (fresh) {
                         g_epolyPutSnap = curPut;
                         showOp = true;
@@ -646,7 +640,6 @@ static void GatherParams() {
                             g_epolyOp = lastOp;
                             g_epolyFP = fp;
                             g_lastKnownOp = lastOp;
-                            g_lastKnownPut = curPut;
                             g_epolySelLevel = selLv;
                             // Enter preview immediately — live feedback from the start
                             FPValue pv;
