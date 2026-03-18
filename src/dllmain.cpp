@@ -146,6 +146,7 @@ static int          g_epolySelLevel = -1;
 static bool         g_epolyPreview  = false;
 static int          g_epolyPutSnap  = -1;     // frozen putCount snapshot
 static bool         g_epolyToolWasLive = false; // tool was active when panel opened
+static bool         g_epolyWasCancelled = false; // we cancelled Max's preview — skip undo in EPolyBegin
 static int          g_lastKnownOp  = -1;      // last op we showed — detect changes
 
 static bool     g_suppressClose = false;
@@ -475,7 +476,12 @@ static void EPolyBegin() {
         return;
     }
 
-    ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
+    // If we cancelled Max's own preview, mesh is already clean — no undo needed.
+    // If the operation was committed normally, undo to revert before re-previewing.
+    if (!g_epolyWasCancelled)
+        ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
+    g_epolyWasCancelled = false;
+
     FPParams prms(1, TYPE_ENUM, g_epolyOp);
     FPValue r;
     g_epolyFP->Invoke(epfn_preview_begin, r, &prms);
@@ -1578,6 +1584,7 @@ static void ExitActiveEPolyTool() {
     if (!ep) return;
 
     FPInterface* fp = (FPInterface*)ep;
+    g_epolyWasCancelled = false;
 
     // Check if a tool/preview is active BEFORE we exit it
     FPValue modeVal, prevVal;
@@ -1587,23 +1594,17 @@ static void ExitActiveEPolyTool() {
 
     if (modeVal.i < 0 && prevVal.i == 0) return;  // nothing active
 
-    // Use MaxScript — most reliable way to commit and exit the caddy.
-    // This mirrors exactly what clicking the caddy OK button does.
-    ExecuteMAXScriptScript(
-        _T("if (subObjectLevel > 0) do (\n")
-        _T("  local epObj = modPanel.getCurrentObject()\n")
-        _T("  if epObj != undefined and isKindOf epObj Editable_Poly do (\n")
-        _T("    epObj.commitAndRepeat false\n")
-        _T("  )\n")
-        _T("  if epObj != undefined and isKindOf epObj Edit_Poly do (\n")
-        _T("    epObj.commitAndRepeat false\n")
-        _T("  )\n")
-        _T(")"),
-        MAXScript::ScriptSource::NotSpecified, TRUE);
-
-    // Fallback: force exit command modes via FP
     FPValue d;
+    if (prevVal.i != 0) {
+        // Preview active (user mid-operation) — CANCEL it.
+        // This reverts mesh to pre-op state. Param values stay in PB.
+        // Our preview will re-apply the op fresh with the captured values.
+        fp->Invoke(epfn_preview_cancel, d);
+        g_epolyWasCancelled = true;
+    }
+    // Exit command mode + close caddy
     fp->Invoke(epfn_exit_command_modes, d);
+    fp->Invoke(epfn_close_popup_dialog, d);
 }
 
 static void OpenPanel() {
