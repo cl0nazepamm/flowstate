@@ -1596,35 +1596,27 @@ static void ExitActiveEPolyTool() {
 
     FPValue d;
     if (prevVal.i != 0) {
-        // Save selection before cancel (cancel reverts selection too)
+        // Save sub-object selection before cancel
         ExecuteMAXScriptScript(
-            _T("ppSavedSel = #{}\n")
-            _T("local ep = modPanel.getCurrentObject()\n")
-            _T("if ep != undefined do (\n")
-            _T("  local sl = subObjectLevel\n")
-            _T("  if sl == 1 do ppSavedSel = ep.getSelection #vertex\n")
-            _T("  if sl == 2 do ppSavedSel = ep.getSelection #edge\n")
-            _T("  if sl == 3 do ppSavedSel = ep.getSelection #edge\n")
-            _T("  if sl == 4 do ppSavedSel = ep.getSelection #face\n")
-            _T("  if sl == 5 do ppSavedSel = ep.getSelection #face\n")
-            _T(")"),
+            _T("global __ppSel = #{}\n")
+            _T("global __ppLvl = subObjectLevel\n")
+            _T("try(if __ppLvl==1 do __ppSel=polyOp.getVertSelection $)catch()\n")
+            _T("try(if __ppLvl==2 do __ppSel=polyOp.getEdgeSelection $)catch()\n")
+            _T("try(if __ppLvl==4 or __ppLvl==5 do __ppSel=polyOp.getFaceSelection $)catch()\n"),
             MAXScript::ScriptSource::NotSpecified, TRUE);
 
-        // Cancel preview (revert mesh, param values stay in PB)
+        // Cancel preview — reverts mesh, param values stay in PB
         fp->Invoke(epfn_preview_cancel, d);
         g_epolyWasCancelled = true;
 
-        // Restore selection
+        // Restore selection after cancel
         ExecuteMAXScriptScript(
-            _T("local ep = modPanel.getCurrentObject()\n")
-            _T("if ep != undefined do (\n")
-            _T("  local sl = subObjectLevel\n")
-            _T("  if sl == 1 do ep.setSelection #vertex ppSavedSel\n")
-            _T("  if sl == 2 do ep.setSelection #edge ppSavedSel\n")
-            _T("  if sl == 3 do ep.setSelection #edge ppSavedSel\n")
-            _T("  if sl == 4 do ep.setSelection #face ppSavedSel\n")
-            _T("  if sl == 5 do ep.setSelection #face ppSavedSel\n")
-            _T(")"),
+            _T("try(\n")
+            _T("  subObjectLevel = __ppLvl\n")
+            _T("  if __ppLvl==1 do polyOp.setVertSelection $ __ppSel\n")
+            _T("  if __ppLvl==2 do polyOp.setEdgeSelection $ __ppSel\n")
+            _T("  if __ppLvl==4 or __ppLvl==5 do polyOp.setFaceSelection $ __ppSel\n")
+            _T(")catch()\n"),
             MAXScript::ScriptSource::NotSpecified, TRUE);
     }
     // Exit command mode + close caddy
