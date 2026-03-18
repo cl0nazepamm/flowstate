@@ -465,22 +465,19 @@ static EPoly* FindEPoly(INode* node) {
 }
 
 // ── EPoly preview helpers ───────────────────────────────────────
-static bool g_epolySkipPutCheck = false;  // skip putCount check for button-triggered ops
-
 static void EPolyBegin() {
     if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview) return;
-    if (g_epolyPutSnap < 0) return;
+    if (g_epolyPutSnap < 0) return;  // no snapshot = no preview
 
-    // Frozen snapshot check — skip for button-triggered ops (we know it's fresh)
-    if (!g_epolySkipPutCheck) {
-        int now = theHold.GetGlobalPutCount();
-        if (now != g_epolyPutSnap) {
-            g_epolyPutSnap = -1;
-            return;
-        }
+    // Frozen snapshot check — if undo stack changed, bail
+    int now = theHold.GetGlobalPutCount();
+    if (now != g_epolyPutSnap) {
+        g_epolyPutSnap = -1;  // kill it, won't match again
+        return;
     }
-    g_epolySkipPutCheck = false;
 
+    // If we cancelled Max's own preview, mesh is already clean — no undo needed.
+    // If the operation was committed normally, undo to revert before re-previewing.
     if (!g_epolyWasCancelled)
         ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
     g_epolyWasCancelled = false;
@@ -1384,24 +1381,29 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 // Accept current preview before running new op
                 EPolyAccept();
 
+                // Snapshot putCount to detect if the op actually does something
+                int putBefore = theHold.GetGlobalPutCount();
+
                 // Execute the operation
                 FPParams prms(1, TYPE_ENUM, opHit);
                 FPValue r;
                 g_epolyForButtons->Invoke(epfn_button_op, r, &prms);
 
-                // Reset detection state so re-gather picks up the new op
-                g_epolyOp = -1;
-                g_epolyFP = nullptr;
-                g_epolyPreview = false;
-                g_epolyPutSnap = -1;
-                g_lastKnownOp = -1;
-                g_epolyToolWasLive = true;
-                g_epolyWasCancelled = false;
-                g_epolySkipPutCheck = true;  // we JUST ran it, skip putCount verify
+                int putAfter = theHold.GetGlobalPutCount();
 
-                // Re-gather + rebuild to show new op params + enter preview
-                GatherParams();
-                BuildLayout();
+                if (putAfter != putBefore) {
+                    // Op did something — reset + re-gather with preview
+                    g_epolyOp = -1;
+                    g_epolyFP = nullptr;
+                    g_epolyPreview = false;
+                    g_epolyPutSnap = -1;
+                    g_lastKnownOp = -1;
+                    g_epolyToolWasLive = true;
+                    g_epolyWasCancelled = false;
+                    GatherParams();
+                    BuildLayout();
+                }
+                // else: op was a no-op (nothing selected, etc.) — don't touch undo
                 if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
                 return 0;
             }
