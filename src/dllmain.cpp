@@ -245,7 +245,8 @@ static void BuildLayout();
 // ── Mouse hook — XButton2=panel, XButton1=pin ───────────────────
 static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     // Click outside panel = instant close
-    if (nCode >= 0 && g_open && !g_epolyPreview && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN)) {
+    // Click outside to close — but NOT when EPoly op is showing (user is selecting geometry)
+    if (nCode >= 0 && g_open && g_epolyOp < 0 && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN)) {
         MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lp;
         RECT pr; GetWindowRect(g_panel, &pr);
         if (!PtInRect(&pr, ms->pt)) {
