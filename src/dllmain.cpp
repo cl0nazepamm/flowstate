@@ -465,19 +465,22 @@ static EPoly* FindEPoly(INode* node) {
 }
 
 // ── EPoly preview helpers ───────────────────────────────────────
+static bool g_epolySkipPutCheck = false;  // skip putCount check for button-triggered ops
+
 static void EPolyBegin() {
     if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview) return;
-    if (g_epolyPutSnap < 0) return;  // no snapshot = no preview
+    if (g_epolyPutSnap < 0) return;
 
-    // Frozen snapshot check — if undo stack changed, bail
-    int now = theHold.GetGlobalPutCount();
-    if (now != g_epolyPutSnap) {
-        g_epolyPutSnap = -1;  // kill it, won't match again
-        return;
+    // Frozen snapshot check — skip for button-triggered ops (we know it's fresh)
+    if (!g_epolySkipPutCheck) {
+        int now = theHold.GetGlobalPutCount();
+        if (now != g_epolyPutSnap) {
+            g_epolyPutSnap = -1;
+            return;
+        }
     }
+    g_epolySkipPutCheck = false;
 
-    // If we cancelled Max's own preview, mesh is already clean — no undo needed.
-    // If the operation was committed normally, undo to revert before re-previewing.
     if (!g_epolyWasCancelled)
         ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
     g_epolyWasCancelled = false;
@@ -641,23 +644,14 @@ static void GatherParams() {
                             g_epolyFP = fp;
                             g_lastKnownOp = lastOp;
                             g_epolySelLevel = selLv;
-                            // Only previewable ops get live preview
-                            // Connect/Remove are immediate — no caddy, no preview
-                            bool previewable = (lastOp == epop_extrude ||
-                                lastOp == epop_chamfer || lastOp == epop_bevel ||
-                                lastOp == epop_inset || lastOp == epop_outline ||
-                                lastOp == epop_bridge_border || lastOp == epop_bridge_polygon ||
-                                lastOp == epop_bridge_edge);
-
-                            if (previewable) {
-                                FPValue pv;
-                                fp->Invoke(epfn_preview_on, pv);
-                                if (pv.i != 0)
-                                    g_epolyPreview = true;
-                                else
-                                    EPolyBegin();
+                            // Enter preview immediately — live feedback from the start
+                            FPValue pv;
+                            fp->Invoke(epfn_preview_on, pv);
+                            if (pv.i != 0) {
+                                g_epolyPreview = true;
+                            } else {
+                                EPolyBegin();  // undo + preview_begin
                             }
-                            // else: immediate op — params shown for next execution
                             g_groups.push_back(gh);
                         }
                     }
@@ -1403,6 +1397,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_lastKnownOp = -1;
                 g_epolyToolWasLive = true;
                 g_epolyWasCancelled = false;
+                g_epolySkipPutCheck = true;  // we JUST ran it, skip putCount verify
 
                 // Re-gather + rebuild to show new op params + enter preview
                 GatherParams();
