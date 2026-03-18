@@ -1668,13 +1668,13 @@ static void OpenPanel() {
 
 static void ClosePanel() {
     if (!g_open) return;
-    EPolyAccept();          // commit preview if active
-    ExitActiveEPolyTool();  // closing the panel should behave like an exit
+    EPolyAccept();  // commit preview if active
+    // Don't reset g_epolyPutSnap here — keeps the frozen snapshot
+    // so next open can check if anything changed
     g_epolyOp = -1;
     g_epolyFP = nullptr;
     g_epolySelLevel = -1;
     g_epolyPreview = false;
-    g_epolyToolWasLive = false;
 
     KillTimer(g_panel, 1);
     DestroyEdits();
