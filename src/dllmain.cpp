@@ -1372,9 +1372,25 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             int opHit = HitBtnRow(kEPolyOps, 8, g_opBtnY, pw, pt);
             if (opHit >= 0 && g_epolyForButtons) {
+                // Accept current preview before running new op
+                EPolyAccept();
+
+                // Execute the operation
                 FPParams prms(1, TYPE_ENUM, opHit);
                 FPValue r;
                 g_epolyForButtons->Invoke(epfn_button_op, r, &prms);
+
+                // Reset detection state so re-gather picks up the new op
+                g_epolyOp = -1;
+                g_epolyFP = nullptr;
+                g_epolyPreview = false;
+                g_epolyPutSnap = -1;
+                g_lastKnownOp = -1;
+                g_epolyToolWasLive = true;  // we JUST ran the tool
+
+                // Re-gather + rebuild to show new op params + enter preview
+                GatherParams();
+                BuildLayout();
                 if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
                 return 0;
             }
