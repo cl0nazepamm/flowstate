@@ -482,6 +482,8 @@ static void EPolyBegin() {
     g_epolyPreview = true;
     FPValue d;
     g_epolyFP->Invoke(epfn_preview_invalidate, d);
+    // Update snapshot — max undo changed putCount
+    g_epolyPutSnap = theHold.GetGlobalPutCount();
     if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
     InvalidateRect(g_panel, nullptr, FALSE);
 }
@@ -507,6 +509,9 @@ static void EPolyCancel() {
     g_epolyFP->Invoke(epfn_preview_cancel, d);
     g_epolyPreview = false;
     g_epolyPutSnap = -1;
+    // EPolyBegin did max undo — redo to restore the original operation
+    ExecuteMAXScriptScript(_T("max redo"), MAXScript::ScriptSource::NotSpecified, TRUE);
+    if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
 }
 
 // Accept preview + remove the op group from panel, panel stays open
