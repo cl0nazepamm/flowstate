@@ -641,14 +641,23 @@ static void GatherParams() {
                             g_epolyFP = fp;
                             g_lastKnownOp = lastOp;
                             g_epolySelLevel = selLv;
-                            // Enter preview immediately — live feedback from the start
-                            FPValue pv;
-                            fp->Invoke(epfn_preview_on, pv);
-                            if (pv.i != 0) {
-                                g_epolyPreview = true;
-                            } else {
-                                EPolyBegin();  // undo + preview_begin
+                            // Only previewable ops get live preview
+                            // Connect/Remove are immediate — no caddy, no preview
+                            bool previewable = (lastOp == epop_extrude ||
+                                lastOp == epop_chamfer || lastOp == epop_bevel ||
+                                lastOp == epop_inset || lastOp == epop_outline ||
+                                lastOp == epop_bridge_border || lastOp == epop_bridge_polygon ||
+                                lastOp == epop_bridge_edge);
+
+                            if (previewable) {
+                                FPValue pv;
+                                fp->Invoke(epfn_preview_on, pv);
+                                if (pv.i != 0)
+                                    g_epolyPreview = true;
+                                else
+                                    EPolyBegin();
                             }
+                            // else: immediate op — params shown for next execution
                             g_groups.push_back(gh);
                         }
                     }
