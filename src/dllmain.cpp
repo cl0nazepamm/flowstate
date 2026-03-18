@@ -253,7 +253,6 @@ static void ClosePanel();
 static void RefreshEdits(bool forceAll = false);
 static void ApplyEdit(HWND h);
 static void BuildLayout();
-static void ExitActiveEPolyTool();
 
 // ── Mouse hook — XButton2=panel, XButton1=pin ───────────────────
 static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
@@ -517,13 +516,6 @@ static void EPolyCancel() {
     g_epolyPutSnap = -1;
 }
 
-static void ForgetCurrentEPolyOp() {
-    if (g_epolyOp >= 0) g_lastKnownOp = g_epolyOp;
-    g_lastKnownPut = theHold.GetGlobalPutCount();
-    g_epolyPutSnap = -1;
-    g_epolyToolWasLive = false;
-}
-
 // Remove the op group from panel
 static void RemoveOpGroup() {
     g_epolyOp = -1;
@@ -546,16 +538,12 @@ static void RemoveOpGroup() {
 // EXIT = accept preview + remove op group
 static void EPolyDrop() {
     EPolyAccept();
-    ExitActiveEPolyTool();
-    ForgetCurrentEPolyOp();
     RemoveOpGroup();
 }
 
 // CANCEL = cancel preview (revert) + remove op group
 static void EPolyCancelDrop() {
     EPolyCancel();
-    ExitActiveEPolyTool();
-    ForgetCurrentEPolyOp();
     RemoveOpGroup();
 }
 
@@ -1682,11 +1670,11 @@ static void ClosePanel() {
     if (!g_open) return;
     EPolyAccept();          // commit preview if active
     ExitActiveEPolyTool();  // closing the panel should behave like an exit
-    ForgetCurrentEPolyOp(); // closing/accepting should consume the current op
     g_epolyOp = -1;
     g_epolyFP = nullptr;
     g_epolySelLevel = -1;
     g_epolyPreview = false;
+    g_epolyToolWasLive = false;
 
     KillTimer(g_panel, 1);
     DestroyEdits();
