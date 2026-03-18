@@ -1507,13 +1507,11 @@ static void OpenPanel() {
     HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = { sizeof(mi) }; GetMonitorInfo(hMon, &mi);
 
-    int estH = 3 + kPad*2 + kFontHdr + 10 + (int)g_edits.size() * kLineH + (int)g_groups.size() * (kLineH + kGroupGap);
-    if (estH < 60) estH = 60;
     int ox = pt.x - kMinW / 2, oy = pt.y;
     if (ox + kMinW > mi.rcWork.right) ox = mi.rcWork.right - kMinW;
-    if (oy + estH > mi.rcWork.bottom) oy = mi.rcWork.bottom - estH;
     if (ox < mi.rcWork.left) ox = mi.rcWork.left;
     if (oy < mi.rcWork.top)  oy = mi.rcWork.top;
+    // Don't clamp bottom here — BuildLayout handles max height + scroll
     g_panelPos = { ox, oy };
     g_freshOpen = true;
 
