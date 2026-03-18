@@ -144,7 +144,8 @@ static int          g_epolyOp       = -1;
 static FPInterface* g_epolyFP       = nullptr;
 static int          g_epolySelLevel = -1;
 static bool         g_epolyPreview  = false;
-static int          g_epolyPutSnap  = -1;     // frozen snapshot — set ONCE, never re-snapshotted
+static int          g_epolyPutSnap  = -1;     // frozen putCount snapshot
+static bool         g_epolyToolWasLive = false; // tool was active when panel opened
 
 static bool     g_suppressClose = false;
 
@@ -541,6 +542,7 @@ static void GatherParams() {
     g_ctx = CTX_NONE;
     g_epolyForButtons = nullptr;
     g_splineForButtons = nullptr;
+    // g_epolyToolWasLive is set by ExitActiveEPolyTool before GatherParams runs
     g_scrollY = 0;
     g_epolyPutSnap = -1;
 
@@ -580,14 +582,17 @@ static void GatherParams() {
                 int curPut = theHold.GetGlobalPutCount();
 
                 if (g_epolyPutSnap < 0) {
-                    // First detection — take snapshot
-                    g_epolyPutSnap = curPut;
-                    showOp = true;
+                    // First detection — only show if a tool was LIVE when panel opened
+                    // This prevents showing stale ops from minutes ago
+                    if (g_epolyToolWasLive) {
+                        g_epolyPutSnap = curPut;
+                        showOp = true;
+                    }
                 } else if (curPut == g_epolyPutSnap) {
-                    // Nothing changed since last detection — safe to show
+                    // Re-open, nothing changed since last detection — show
                     showOp = true;
                 }
-                // else: putCount differs — user did something, skip op params
+                // else: putCount differs — selection/topology changed, skip
 
                 if (showOp && lastOp >= 0) {
                     int cnt = 0; std::wstring title;
@@ -1526,11 +1531,15 @@ static void ExitActiveEPolyTool() {
     EPoly* ep = FindEPoly(ip->GetSelNode(0));
     if (!ep) return;
 
-    // Check if a command mode is active
     FPInterface* fp = (FPInterface*)ep;
-    FPValue modeVal;
+
+    // Check if a tool/preview is active BEFORE we exit it
+    FPValue modeVal, prevVal;
     fp->Invoke(epfn_get_command_mode, modeVal);
-    if (modeVal.i < 0) return;  // no active tool
+    fp->Invoke(epfn_preview_on, prevVal);
+    g_epolyToolWasLive = (modeVal.i >= 0 || prevVal.i != 0);
+
+    if (modeVal.i < 0 && prevVal.i == 0) return;  // nothing active
 
     // Use MaxScript — most reliable way to commit and exit the caddy.
     // This mirrors exactly what clicking the caddy OK button does.
