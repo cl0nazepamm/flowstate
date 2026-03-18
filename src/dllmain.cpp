@@ -572,7 +572,7 @@ static void GatherParams() {
     g_ctx = CTX_NONE;
     g_epolyForButtons = nullptr;
     g_splineForButtons = nullptr;
-    // g_epolyToolWasLive is set by ExitActiveEPolyTool before GatherParams runs
+    // g_epolyToolWasLive is set when the panel itself launches an op.
     g_scrollY = 0;
     g_epolyPutSnap = -1;
 
@@ -602,10 +602,12 @@ static void GatherParams() {
             FPInterface* fp = (FPInterface*)ep;
 
             if (pb && fp) {
-                FPValue opVal, slVal;
+                FPValue opVal, slVal, pvVal;
                 fp->Invoke(epfn_get_last_operation, opVal);
                 fp->Invoke(epfn_get_epoly_sel_level, slVal);
+                fp->Invoke(epfn_preview_on, pvVal);
                 int lastOp = opVal.i, selLv = slVal.i;
+                bool previewLive = (pvVal.i != 0);
 
                 // Decide if we should show operation params.
                 // Connect can report the same last-op ID repeatedly, so we also
@@ -615,10 +617,11 @@ static void GatherParams() {
 
                 if (g_epolyPutSnap < 0) {
                     // First detection — show if:
-                    // 1. Tool was LIVE (caddy open, command mode active), OR
+                    // 1. Preview is LIVE right now, OR
                     // 2. Operation CHANGED since last time, OR
                     // 3. putCount advanced since the last handled op.
-                    bool fresh = g_epolyToolWasLive
+                    bool fresh = previewLive
+                        || g_epolyToolWasLive
                         || (lastOp != g_lastKnownOp)
                         || (curPut != g_lastKnownPut);
                     if (fresh) {
@@ -1645,7 +1648,7 @@ static void ExitActiveEPolyTool() {
 }
 
 static void OpenPanel() {
-    ExitActiveEPolyTool();
+    g_epolyToolWasLive = false;
     GatherParams();
 
     // Auto-collapse groups with 10+ params on first encounter
