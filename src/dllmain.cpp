@@ -1387,16 +1387,15 @@ static void ExitActiveEPolyTool() {
         if (ep) {
 found:
             FPInterface* fp = (FPInterface*)ep;
-            // If an interactive tool is active (preview on), accept it
+            FPValue d;
+            // Accept any active preview (commits interactive tool result)
             FPValue pv;
             fp->Invoke(epfn_preview_on, pv);
-            if (pv.i != 0) {
-                FPValue d;
-                fp->Invoke(epfn_preview_accept, d);
-            }
-            // Close any open caddy/popup
-            FPValue d2;
-            fp->Invoke(epfn_close_popup_dialog, d2);
+            if (pv.i != 0) fp->Invoke(epfn_preview_accept, d);
+            // Exit all command modes (Chamfer, Extrude, Cut, etc.)
+            fp->Invoke(epfn_exit_command_modes, d);
+            // Close any open caddy/popup dialog
+            fp->Invoke(epfn_close_popup_dialog, d);
         }
     }
 }
