@@ -1365,37 +1365,35 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ── Open / Close ────────────────────────────────────────────────
-// Exit any active EPoly tool (Chamfer caddy, Extrude, etc.)
-static void ExitActiveEPolyTool() {
-    Interface* ip = GetCOREInterface();
-    if (!ip || ip->GetSelNodeCount() == 0) return;
-    INode* node = ip->GetSelNode(0);
-    if (!node) return;
-
-    // Walk to find EPoly
+// Find EPoly interface on the selected node
+static EPoly* FindEPoly(INode* node) {
+    if (!node) return nullptr;
     Object* obj = node->GetObjectRef();
     while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
         IDerivedObject* d = static_cast<IDerivedObject*>(obj);
         for (int m = 0; m < d->NumModifiers(); m++) {
             EPoly* ep = (EPoly*)d->GetModifier(m)->GetInterface(EPOLY_INTERFACE);
-            if (ep) goto found;
+            if (ep) return ep;
         }
         obj = d->GetObjRef();
     }
-    if (obj) {
-        EPoly* ep = (EPoly*)obj->GetInterface(EPOLY_INTERFACE);
-        if (ep) {
-found:
-            FPInterface* fp = (FPInterface*)ep;
-            FPValue d;
-            // 1. Accept preview first (commits the tool's result, no-op if none)
-            fp->Invoke(epfn_preview_accept, d);
-            // 2. Close caddy (before exiting modes, so it doesn't fight)
-            fp->Invoke(epfn_close_popup_dialog, d);
-            // 3. Exit command modes last (clean exit, result already committed)
-            fp->Invoke(epfn_exit_command_modes, d);
-        }
-    }
+    if (obj) return (EPoly*)obj->GetInterface(EPOLY_INTERFACE);
+    return nullptr;
+}
+
+// Exit any active EPoly tool (Chamfer caddy, Extrude, etc.)
+static void ExitActiveEPolyTool() {
+    Interface* ip = GetCOREInterface();
+    if (!ip || ip->GetSelNodeCount() == 0) return;
+
+    EPoly* ep = FindEPoly(ip->GetSelNode(0));
+    if (!ep) return;
+
+    FPInterface* fp = (FPInterface*)ep;
+    FPValue d;
+    fp->Invoke(epfn_preview_accept, d);       // commit result first
+    fp->Invoke(epfn_close_popup_dialog, d);   // close caddy
+    fp->Invoke(epfn_exit_command_modes, d);    // exit tool
 }
 
 static void OpenPanel() {
