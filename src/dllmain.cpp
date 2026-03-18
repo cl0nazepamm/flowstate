@@ -139,9 +139,7 @@ static ULONG        g_nodeHandle       = 0;
 static int          g_epolyOp       = -1;
 static FPInterface* g_epolyFP       = nullptr;
 static bool         g_epolyPreview  = false;
-// Dismiss tracking: store topology on close, compare on open
-static int g_dismissV = -1, g_dismissE = -1, g_dismissF = -1;
-static ULONG g_dismissNode = 0;
+static bool g_opDismissed = false;  // close = true (forever), tool button = false
 
 
 // Context-aware tool system
@@ -320,15 +318,6 @@ static EPoly* FindEPoly(INode* node) {
     return nullptr;
 }
 
-// ── Read EPoly topology counts ──────────────────────────────────
-static void ReadTopoCounts(FPInterface* fp, int& v, int& e, int& f) {
-    FPValue vv, ee, ff;
-    fp->Invoke(epfn_get_num_vertices, vv);
-    fp->Invoke(epfn_get_num_edges, ee);
-    fp->Invoke(epfn_get_num_faces, ff);
-    v = vv.i; e = ee.i; f = ff.i;
-}
-
 // ── EPoly preview helpers ───────────────────────────────────────
 static void EPolyBegin() {
     if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview) return;
@@ -373,11 +362,7 @@ static void EPolyCancel() {
 // Accept preview + remove the op group from panel, panel stays open
 static void EPolyDrop() {
     EPolyAccept();
-    // Stamp topology before clearing — prevents stale redetection
-    if (g_epolyFP) {
-        ReadTopoCounts(g_epolyFP, g_dismissV, g_dismissE, g_dismissF);
-        g_dismissNode = g_nodeHandle;
-    }
+    g_opDismissed = true;
     g_epolyOp = -1;
     g_epolyFP = nullptr;
     // Remove first group (the op group)
@@ -434,14 +419,7 @@ static void GatherParams() {
                 fp->Invoke(epfn_get_epoly_sel_level, slVal);
                 int lastOp = opVal.i, selLv = slVal.i;
 
-                // Skip if topology unchanged since last dismiss (stale op)
-                bool stale = false;
-                if (g_dismissNode == g_nodeHandle && g_dismissV >= 0) {
-                    int cv, ce, cf;
-                    ReadTopoCounts(fp, cv, ce, cf);
-                    stale = (cv == g_dismissV && ce == g_dismissE && cf == g_dismissF);
-                }
-                if (lastOp >= 0 && !stale) {
+                if (lastOp >= 0 && !g_opDismissed) {
                     int cnt = 0; std::wstring title;
                     const FallbackOpParam* fb = LookupFallbackParams(lastOp, selLv, cnt, title);
                     if (fb && cnt > 0) {
@@ -1167,7 +1145,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_epolyForButtons->Invoke(epfn_button_op, r, &prms);
                 if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
                 // Show params for live adjustment
-                g_dismissV = g_dismissE = g_dismissF = -1;
+                g_opDismissed = false;
                 GatherParams();
                 BuildLayout();
                 return 0;
@@ -1226,11 +1204,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     else ++it;
                 }
                 SaveSettings();
-                // Re-gather but preserve dismiss stamp
-                int sv = g_dismissV, se = g_dismissE, sf = g_dismissF;
-                ULONG sn = g_dismissNode;
+                bool wasDismissed = g_opDismissed;
                 GatherParams();
-                g_dismissV = sv; g_dismissE = se; g_dismissF = sf; g_dismissNode = sn;
+                g_opDismissed = wasDismissed;
                 BuildLayout();
                 return 0;
             }
@@ -1274,10 +1250,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g_hidden.empty()) {
             g_hidden.clear();
             SaveSettings();
-            int sv = g_dismissV, se = g_dismissE, sf = g_dismissF;
-            ULONG sn = g_dismissNode;
+            bool wasDismissed = g_opDismissed;
             GatherParams();
-            g_dismissV = sv; g_dismissE = se; g_dismissF = sf; g_dismissNode = sn;
+            g_opDismissed = wasDismissed;
             BuildLayout();
         }
         return 0;
@@ -1407,11 +1382,7 @@ static void OpenPanel() {
 static void ClosePanel() {
     if (!g_open) return;
     EPolyAccept();  // commit preview if active
-    // Stamp topology so we can detect real changes on reopen
-    if (g_epolyOp >= 0 && g_epolyFP) {
-        ReadTopoCounts(g_epolyFP, g_dismissV, g_dismissE, g_dismissF);
-        g_dismissNode = g_nodeHandle;
-    }
+    if (g_epolyOp >= 0) g_opDismissed = true;
     g_epolyOp = -1;
     g_epolyFP = nullptr;
     g_epolyPreview = false;
