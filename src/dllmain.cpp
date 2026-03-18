@@ -270,10 +270,11 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             PostMessage(g_panel, WM_PP_TOGGLE, 0, 0);
             return 1;
         }
-        if (xbutton == XBUTTON1 && g_open) {
-            PostMessage(g_panel, WM_PP_ADDPARAM, 0, 0);
-            return 1;
-        }
+        // XButton1 disabled for now — spinner detection needs rework
+        // if (xbutton == XBUTTON1 && g_open) {
+        //     PostMessage(g_panel, WM_PP_ADDPARAM, 0, 0);
+        //     return 1;
+        // }
     }
 pass:
     return CallNextHookEx(g_mouseHook, nCode, wp, lp);
