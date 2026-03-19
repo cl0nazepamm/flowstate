@@ -42,8 +42,8 @@ static const int kEditH     = 20;
 static const int kMaxParams = 50;
 static const int kMinW      = 260;
 static const int kRefreshMs = 500;
-static const int kBtnH      = 22;
-static const int kBtnGap    = 3;
+static const int kBtnH      = 24;
+static const int kBtnGap    = 4;
 static const int kMaxPanelH = 700;
 
 // 3ds Max dark theme colors
@@ -181,8 +181,9 @@ static const BtnDef kSplineOps[] = {
     {_T("Connect"),ScmConnect}, {_T("Trim"),ScmTrim},
     {_T("Extend"),ScmExtend}, {_T("Boolean"),ScmUnion}
 };
-static int g_subObjY = 0;   // Y position of sub-object button row
-static int g_opBtnY  = 0;   // Y position of operation button row
+static int g_subObjY  = 0;   // Y position of sub-object button row
+static int g_opBtnY   = 0;   // Y position of operation button row 1
+static int g_opBtnY2  = 0;   // Y position of operation button row 2
 static int g_contentStartY = 0;  // where scrollable content begins
 
 // Tool tip overlay (shows active EPoly tool name near cursor)
@@ -277,28 +278,28 @@ static void ApplyEdit(HWND h);
 static void BuildLayout();
 
 // ── Mouse hook — XButton2=panel, XButton1=pin ───────────────────
+// Uses WH_MOUSE (thread-level) instead of WH_MOUSE_LL (system-wide)
+// to avoid blocking the system input pipeline when Max is busy.
 static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
+    if (nCode < 0) return CallNextHookEx(g_mouseHook, nCode, wp, lp);
+
+    MOUSEHOOKSTRUCT* ms = (MOUSEHOOKSTRUCT*)lp;
+
     // Click outside panel = instant close
-    if (nCode >= 0 && g_open && !g_suppressClose && !g_epolyPreview && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN)) {
-        MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lp;
-        RECT pr; GetWindowRect(g_panel, &pr);
-        if (!PtInRect(&pr, ms->pt)) {
+    if (g_open && !g_suppressClose && !g_epolyPreview &&
+        (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN)) {
+        if (ms->hwnd != g_panel && !IsChild(g_panel, ms->hwnd)) {
             PostMessage(g_panel, WM_USER + 101, 0, 0);
         }
     }
-    if (nCode >= 0 && wp == WM_XBUTTONDOWN) {
-        MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lp;
-        WORD xbutton = HIWORD(ms->mouseData);
-        HWND fg = GetForegroundWindow();
-        Interface* ip = GetCOREInterface();
-        bool isMax = ip && (fg == ip->GetMAXHWnd() || IsChild(ip->GetMAXHWnd(), fg) || fg == g_panel);
-        if (!isMax) goto pass;
+
+    if (wp == WM_XBUTTONDOWN) {
+        WORD xbutton = HIWORD(reinterpret_cast<MOUSEHOOKSTRUCTEX*>(lp)->mouseData);
 
         if (xbutton == XBUTTON2) {
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             bool matEd = IsMaterialEditorFocused();
             if (shift || matEd) {
-                // Shift+XButton2 or Material Editor focused → PowerShader
                 PostMessage(g_panel, WM_PP_SHADER, 0, 0);
             } else {
                 PostMessage(g_panel, WM_PP_TOGGLE, 0, 0);
@@ -310,7 +311,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             return 1;
         }
     }
-pass:
+
     return CallNextHookEx(g_mouseHook, nCode, wp, lp);
 }
 
@@ -868,7 +869,10 @@ static void RefreshEdits(bool forceAll) {
         if (!forceAll && ef.hwnd == focused) continue;
         TCHAR buf[64];
         FormatValue(ef, t, buf, 64);
-        SetWindowText(ef.hwnd, buf);
+        TCHAR old[64];
+        GetWindowText(ef.hwnd, old, 64);
+        if (_tcscmp(old, buf) != 0)
+            SetWindowText(ef.hwnd, buf);
     }
 }
 
@@ -1088,24 +1092,25 @@ static void PaintPanel(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
     HDC mem = CreateCompatibleDC(hdc);
     HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
-    HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
+    HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
+
+    // Shared GDI objects — created once, properly cleaned up
+    HPEN penBorder = CreatePen(PS_SOLID, 1, kBorder);
+    HPEN penAccent = CreatePen(PS_SOLID, 1, kAccent);
+    HPEN origPen   = (HPEN)SelectObject(mem, penBorder);
+    HFONT origFont = (HFONT)SelectObject(mem, g_fontBold);
+    HBRUSH origBr  = (HBRUSH)SelectObject(mem, GetStockObject(NULL_BRUSH));
 
     // Background
-    HBRUSH bg = CreateSolidBrush(kBg); FillRect(mem, &rc, bg); DeleteObject(bg);
-    // Accent bar
-    RECT bar = {0,0,rc.right,2};
-    HBRUSH ab = CreateSolidBrush(kAccent); FillRect(mem, &bar, ab); DeleteObject(ab);
+    { HBRUSH b = CreateSolidBrush(kBg); FillRect(mem, &rc, b); DeleteObject(b); }
     // Border
-    HPEN bp = CreatePen(PS_SOLID, 1, kBorder);
-    SelectObject(mem, bp); SelectObject(mem, (HBRUSH)GetStockObject(NULL_BRUSH));
-    Rectangle(mem, 0, 0, rc.right, rc.bottom); DeleteObject(bp);
+    Rectangle(mem, 0, 0, rc.right, rc.bottom);
 
     SetBkMode(mem, TRANSPARENT);
     int x = kPad, rEdge = rc.right - kPad;
 
     // Header
     int y = kPad + 2;
-    SelectObject(mem, g_fontBold);
     SetTextColor(mem, kAccent);
     const std::wstring& hdrText = g_nodeName.empty() ? std::wstring(L"PowerParams") : g_nodeName;
     TextOut(mem, x, y, hdrText.c_str(), (int)hdrText.length());
@@ -1119,8 +1124,7 @@ static void PaintPanel(HWND hwnd) {
     DrawText(mem, _T("\u00D7"), 1, &cr, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 
     y += kFontHdr + 4;
-    HPEN sep = CreatePen(PS_SOLID, 1, kBorder);
-    SelectObject(mem, sep); MoveToEx(mem, x, y, nullptr); LineTo(mem, rEdge, y); DeleteObject(sep);
+    MoveToEx(mem, x, y, nullptr); LineTo(mem, rEdge, y);
     y += 4;
 
     // Context-aware buttons
@@ -1131,18 +1135,21 @@ static void PaintPanel(HWND hwnd) {
 
         if (g_ctx == CTX_EPOLY) {
             DrawBtnRow(mem, kEPolySubObj, 5, x, y, rEdge - x, curLevel, g_font);
+            y += kBtnH + kBtnGap + 2;
+            DrawBtnRow(mem, kEPolyOps, 4, x, y, rEdge - x, -1, g_font);
             y += kBtnH + kBtnGap;
-            DrawBtnRow(mem, kEPolyOps, 8, x, y, rEdge - x, -1, g_font);
+            DrawBtnRow(mem, kEPolyOps + 4, 4, x, y, rEdge - x, -1, g_font);
         } else if (g_ctx == CTX_SPLINE) {
             DrawBtnRow(mem, kSplineSubObj, 3, x, y, rEdge - x, curLevel, g_font);
+            y += kBtnH + kBtnGap + 2;
+            DrawBtnRow(mem, kSplineOps, 4, x, y, rEdge - x, -1, g_font);
             y += kBtnH + kBtnGap;
-            DrawBtnRow(mem, kSplineOps, 8, x, y, rEdge - x, -1, g_font);
+            DrawBtnRow(mem, kSplineOps + 4, 4, x, y, rEdge - x, -1, g_font);
         }
         y += kBtnH + 4;
 
         // Separator
-        HPEN s2 = CreatePen(PS_SOLID, 1, kBorder);
-        SelectObject(mem, s2); MoveToEx(mem, x, y, nullptr); LineTo(mem, rEdge, y); DeleteObject(s2);
+        MoveToEx(mem, x, y, nullptr); LineTo(mem, rEdge, y);
         y += 4;
     }
 
@@ -1178,10 +1185,8 @@ static void PaintPanel(HWND hwnd) {
                     RECT er; GetWindowRect(ef.hwnd, &er);
                     MapWindowPoints(HWND_DESKTOP, hwnd, (LPPOINT)&er, 2);
                     InflateRect(&er, 1, 1);
-                    COLORREF bc = (focused == ef.hwnd) ? kAccent : kBorder;
-                    HPEN ep2 = CreatePen(PS_SOLID, 1, bc);
-                    SelectObject(mem, ep2); Rectangle(mem, er.left, er.top, er.right, er.bottom);
-                    DeleteObject(ep2);
+                    SelectObject(mem, (focused == ef.hwnd) ? penAccent : penBorder);
+                    Rectangle(mem, er.left, er.top, er.right, er.bottom);
                 }
                 y += kLineH;
             }
@@ -1191,6 +1196,9 @@ static void PaintPanel(HWND hwnd) {
 
     SelectClipRgn(mem, nullptr);
     DeleteObject(clipRgn);
+
+    // Restore border pen for scroll indicator frame
+    SelectObject(mem, penBorder);
 
     // Scroll indicator (thin bar on right if scrollable)
     if (g_contentH > g_viewH && g_viewH > 0) {
@@ -1203,7 +1211,14 @@ static void PaintPanel(HWND hwnd) {
     }
 
     BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
-    SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
+
+    // Clean up — deselect all, then delete
+    SelectObject(mem, origPen);
+    SelectObject(mem, origFont);
+    SelectObject(mem, origBr);
+    DeleteObject(penBorder);
+    DeleteObject(penAccent);
+    SelectObject(mem, oldBmp); DeleteObject(bmp); DeleteDC(mem);
     EndPaint(hwnd, &ps);
 }
 
@@ -1216,17 +1231,20 @@ static void DestroyEdits() {
 
 // ── Apply scroll offset to all edit controls ────────────────────
 static void ApplyScroll(int panelW) {
+    SendMessage(g_panel, WM_SETREDRAW, FALSE, 0);
     int editX = panelW - kPad - kEditW;
     for (auto& ef : g_edits) {
         if (!ef.hwnd) continue;
         int screenY = ef.logY - g_scrollY;
         bool vis = (screenY + kEditH > g_contentStartY && screenY < g_contentStartY + g_viewH);
-        SetWindowPos(ef.hwnd, nullptr, editX, screenY + 1, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(ef.hwnd, nullptr, editX, screenY + 1, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
         ShowWindow(ef.hwnd, vis ? SW_SHOW : SW_HIDE);
     }
+    SendMessage(g_panel, WM_SETREDRAW, TRUE, 0);
 }
 
 static void BuildLayout() {
+    SendMessage(g_panel, WM_SETREDRAW, FALSE, 0);
     DestroyEdits();
 
     HDC hdc = GetDC(g_panel);
@@ -1259,8 +1277,10 @@ static void BuildLayout() {
     int y = 2 + kPad + kFontHdr + 4 + 1 + 4;
     if (g_ctx != CTX_NONE) {
         g_subObjY = y;
-        y += kBtnH + kBtnGap;
+        y += kBtnH + kBtnGap + 2;
         g_opBtnY = y;
+        y += kBtnH + kBtnGap;
+        g_opBtnY2 = y;
         y += kBtnH + 4 + 1 + 4;
     }
     g_contentStartY = y;
@@ -1333,7 +1353,8 @@ static void BuildLayout() {
 
     RefreshEdits(true);
     SetWindowPos(g_panel, HWND_TOPMOST, g_panelPos.x, g_panelPos.y, panelW, panelH, SWP_NOACTIVATE);
-    InvalidateRect(g_panel, nullptr, FALSE);
+    SendMessage(g_panel, WM_SETREDRAW, TRUE, 0);
+    RedrawWindow(g_panel, nullptr, nullptr, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN);
 }
 
 // ── Button hit test ─────────────────────────────────────────────
@@ -1406,7 +1427,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            int opHit = HitBtnRow(kEPolyOps, 8, g_opBtnY, pw, pt);
+            int opHit = HitBtnRow(kEPolyOps, 4, g_opBtnY, pw, pt);
+            if (opHit < 0) opHit = HitBtnRow(kEPolyOps + 4, 4, g_opBtnY2, pw, pt);
             if (opHit >= 0 && g_epolyForButtons) {
                 // Accept current preview before running new op
                 EPolyAccept();
@@ -1439,7 +1461,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            int opHit = HitBtnRow(kSplineOps, 8, g_opBtnY, pw, pt);
+            int opHit = HitBtnRow(kSplineOps, 4, g_opBtnY, pw, pt);
+            if (opHit < 0) opHit = HitBtnRow(kSplineOps + 4, 4, g_opBtnY2, pw, pt);
             if (opHit >= 0 && g_splineForButtons) {
                 g_splineForButtons->StartCommandMode((splineCommandMode)opHit);
                 if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
@@ -1558,8 +1581,16 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_COMMAND:
-        if (HIWORD(wp) == EN_SETFOCUS)  { DisableAccelerators(); InvalidateRect(hwnd, nullptr, FALSE); }
-        if (HIWORD(wp) == EN_KILLFOCUS) { if (g_open) ApplyEdit((HWND)lp); EnableAccelerators(); InvalidateRect(hwnd, nullptr, FALSE); }
+        if (HIWORD(wp) == EN_SETFOCUS || HIWORD(wp) == EN_KILLFOCUS) {
+            if (HIWORD(wp) == EN_SETFOCUS) DisableAccelerators();
+            else { if (g_open) ApplyEdit((HWND)lp); EnableAccelerators(); }
+            // Only invalidate the border area around the affected edit
+            HWND eh = (HWND)lp;
+            RECT er; GetWindowRect(eh, &er);
+            MapWindowPoints(HWND_DESKTOP, hwnd, (LPPOINT)&er, 2);
+            InflateRect(&er, 2, 2);
+            InvalidateRect(hwnd, &er, FALSE);
+        }
         break;
 
     case WM_MOUSEWHEEL: {
@@ -1683,8 +1714,8 @@ static void OpenPanel() {
     g_panelPos = { ox, oy };
     g_freshOpen = true;
 
-    ShowWindow(g_panel, SW_SHOWNA);
     BuildLayout();
+    ShowWindow(g_panel, SW_SHOWNA);
     SetTimer(g_panel, 1, kRefreshMs, nullptr);
 
     // Focus first visible edit
@@ -1788,7 +1819,7 @@ public:
 
         IActionManager* am = GetCOREInterface()->GetActionManager();
         if (am) am->ActivateActionTable(&g_actionCB, kTableId);
-        g_mouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseHookProc, hInstance, 0);
+        g_mouseHook = SetWindowsHookEx(WH_MOUSE, MouseHookProc, nullptr, GetCurrentThreadId());
 
         PowerShader::Init(hInstance);
 

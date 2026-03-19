@@ -6,8 +6,10 @@
 #include <cctype>
 #include <cwctype>
 #include <iterator>
+#include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <max.h>
@@ -52,41 +54,57 @@ HWND FindSmeNodeViewWindowAtPoint(const POINT& screenPos)
     return nullptr;
 }
 
-bool TryDropMtlBaseToSmeUnderCursor(MtlBase* mb, bool* outHoveringSme = nullptr)
+// Try DAD drop on a specific window.
+bool TryDadDrop(HWND hwnd, MtlBase* mb, const POINT& screenPos)
+{
+    if (!hwnd || !mb) return false;
+    IDADWindow* dadWindow = GetIDADWindow(hwnd);
+    if (!dadWindow) return false;
+    DADMgr* dadMgr = dadWindow->GetDADMgr();
+    if (!dadMgr) { ReleaseIDADWindow(dadWindow); return false; }
+
+    POINT clientPos = screenPos;
+    if (!ScreenToClient(hwnd, &clientPos)) { ReleaseIDADWindow(dadWindow); return false; }
+
+    ReferenceTarget* dropThis = static_cast<ReferenceTarget*>(mb);
+    const SClass_ID type = mb->SuperClassID();
+    const BOOL ok = dadMgr->OkToDrop(dropThis, nullptr, hwnd, clientPos, type, FALSE);
+    if (ok) dadMgr->Drop(dropThis, hwnd, clientPos, type, nullptr, FALSE);
+
+    ReleaseIDADWindow(dadWindow);
+    return ok == TRUE;
+}
+
+// Try DAD drop at cursor: first the exact window, then walk up parents.
+// Sets outHoveringSme if cursor is over an SME node view.
+bool TryDropAtCursor(MtlBase* mb, bool* outHoveringSme = nullptr)
 {
     if (outHoveringSme) *outHoveringSme = false;
     if (!mb) return false;
 
     POINT screenPos{};
     if (!GetCursorPos(&screenPos)) return false;
-    HWND viewHwnd = FindSmeNodeViewWindowAtPoint(screenPos);
-    if (!viewHwnd) return false;
-    if (outHoveringSme) *outHoveringSme = true;
 
-    IDADWindow* dadWindow = GetIDADWindow(viewHwnd);
-    if (!dadWindow) return false;
-    DADMgr* dadMgr = dadWindow->GetDADMgr();
-    if (!dadMgr)
+    // Try the window directly under cursor (compact medit map buttons, etc.)
+    HWND hit = WindowFromPoint(screenPos);
+    if (hit && TryDadDrop(hit, mb, screenPos)) return true;
+
+    // Walk parents to find SME node view or other DAD containers
+    HWND walk = hit;
+    while (walk)
     {
-        ReleaseIDADWindow(dadWindow);
-        return false;
+        if (IsWindowClass(walk, kSmeNodeViewClass))
+        {
+            if (outHoveringSme) *outHoveringSme = true;
+            return TryDadDrop(walk, mb, screenPos);
+        }
+        HWND parent = GetParent(walk);
+        if (!parent || parent == walk) break;
+        // Try DAD on each parent (handles nested DAD controls)
+        if (parent != hit && TryDadDrop(parent, mb, screenPos)) return true;
+        walk = parent;
     }
-
-    POINT clientPos = screenPos;
-    if (!ScreenToClient(viewHwnd, &clientPos))
-    {
-        ReleaseIDADWindow(dadWindow);
-        return false;
-    }
-
-    ReferenceTarget* dropThis = static_cast<ReferenceTarget*>(mb);
-    const SClass_ID type = mb->SuperClassID();
-    const BOOL canDrop = dadMgr->OkToDrop(dropThis, nullptr, viewHwnd, clientPos, type, FALSE);
-    if (canDrop)
-        dadMgr->Drop(dropThis, viewHwnd, clientPos, type, nullptr, FALSE);
-
-    ReleaseIDADWindow(dadWindow);
-    return canDrop == TRUE;
+    return false;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -155,7 +173,8 @@ constexpr int kTabMapId  = 1007;
 constexpr int kQuickBase = 1100;
 constexpr int kQuickCount = 11;
 constexpr int kWindowWidth  = 380;
-constexpr int kWindowHeight = 560;
+constexpr int kWindowHeight = 540;
+constexpr int kHeaderH      = 34;
 constexpr UINT_PTR kSearchTimerId = 1;
 constexpr UINT kSearchDebounceMs = 14;
 
@@ -165,11 +184,12 @@ enum class ItemKind { ClassMaterial, ClassMap, SceneMaterial };
 struct Item
 {
     std::wstring label;
+    std::wstring normLabel;   // pre-normalized for scoring
     std::wstring search;
     std::wstring key;
     std::wstring scriptName;
     std::wstring scriptKey;
-    std::wstring display;
+    std::wstring category;
     ItemKind kind = ItemKind::ClassMaterial;
     ClassDesc* classDesc = nullptr;
     MtlBase* live = nullptr;
@@ -237,32 +257,34 @@ std::vector<std::wstring> TokenizeQuery(const std::wstring& query)
     return tokens;
 }
 
-bool MatchOrderedTokens(const std::wstring& haystack,
-                        const std::vector<std::wstring>& tokens)
+// Score an item against search tokens. Returns 0 = no match.
+int ScoreMatch(const std::wstring& search, const std::wstring& label,
+               const std::vector<std::wstring>& tokens)
 {
-    size_t cursor = 0;
-    for (const std::wstring& token : tokens)
-    {
-        cursor = haystack.find(token, cursor);
-        if (cursor == std::wstring::npos) return false;
-        cursor += token.size();
-    }
-    return true;
-}
+    if (tokens.empty()) return 1;
 
-bool StartsWith(const std::wstring& value, const std::wstring& prefix)
-{
-    return value.size() >= prefix.size()
-        && value.compare(0, prefix.size(), prefix) == 0;
+    int score = 100;
+    for (const std::wstring& tok : tokens)
+    {
+        size_t pos = search.find(tok);
+        if (pos == std::wstring::npos) return 0;
+        // Word-boundary bonus
+        if (pos == 0 || search[pos - 1] == L' ') score += 10;
+    }
+    // First-token prefix bonus (matches label start)
+    if (label.find(tokens[0]) == 0) score += 50;
+    // Brevity bonus — shorter names rank higher
+    score += std::max(0, 40 - static_cast<int>(label.size()));
+    return score;
 }
 
 const wchar_t* TagForKind(ItemKind kind)
 {
     switch (kind)
     {
-    case ItemKind::SceneMaterial: return L" [SCENE]";
-    case ItemKind::ClassMap:      return L" [MAP]";
-    default:                      return L" [MAT]";
+    case ItemKind::SceneMaterial: return L"SCENE";
+    case ItemKind::ClassMap:      return L"MAP";
+    default:                      return L"MAT";
     }
 }
 
@@ -351,7 +373,7 @@ public:
         hotkeyWnd_ = CreateWindowExW(0, kHotkeyClass, L"", 0, 0, 0, 0, 0,
             HWND_MESSAGE, nullptr, hInstance, this);
         if (!hotkeyWnd_) return false;
-        EnsureClassCache();
+        // Class cache is built lazily on first PowerShader open
         return true;
     }
 
@@ -417,13 +439,95 @@ private:
             self->Hide();
             return 0;
 
-        // ─── Dark theme color handlers ──────────────────────────
+        // ─── Custom header + border ─────────────────────────────
         case WM_ERASEBKGND:
         {
+            HDC hdc = reinterpret_cast<HDC>(w);
             RECT rc; GetClientRect(h, &rc);
-            FillRect(reinterpret_cast<HDC>(w), &rc, Theme::brBg);
+            FillRect(hdc, &rc, Theme::brBg);
+            // Border
+            HPEN bp = CreatePen(PS_SOLID, 1, Theme::border);
+            SelectObject(hdc, bp); SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            Rectangle(hdc, 0, 0, rc.right, rc.bottom); DeleteObject(bp);
+            // Title
+            SetBkMode(hdc, TRANSPARENT);
+            HFONT oldF = static_cast<HFONT>(SelectObject(hdc, Theme::fontBold));
+            SetTextColor(hdc, Theme::accent);
+            TextOutW(hdc, 10, 10, L"Power Shader", 12);
+            // Close button
+            if (self->hoverClose_) {
+                HBRUSH hov = CreateSolidBrush(RGB(200, 60, 60));
+                FillRect(hdc, &self->closeRect_, hov); DeleteObject(hov);
+            }
+            SetTextColor(hdc, Theme::text);
+            DrawTextW(hdc, L"\u00D7", 1, &self->closeRect_,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            // Separator
+            HPEN sep = CreatePen(PS_SOLID, 1, Theme::border);
+            SelectObject(hdc, sep);
+            MoveToEx(hdc, 8, kHeaderH - 4, nullptr);
+            LineTo(hdc, rc.right - 8, kHeaderH - 4);
+            DeleteObject(sep);
+            SelectObject(hdc, oldF);
             return 1;
         }
+
+        case WM_NCHITTEST:
+        {
+            POINT pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+            ScreenToClient(h, &pt);
+            if (PtInRect(&self->closeRect_, pt)) return HTCLIENT;
+            if (pt.y < kHeaderH) return HTCAPTION;
+            return HTCLIENT;
+        }
+
+        case WM_LBUTTONDOWN:
+        {
+            POINT pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+            if (PtInRect(&self->closeRect_, pt)) { self->Hide(); return 0; }
+            break;
+        }
+
+        case WM_LBUTTONUP:
+        {
+            if (self->quickDragging_ && self->quickDragId_ >= kQuickBase)
+            {
+                ReleaseCapture();
+                int btnIdx = self->quickDragId_ - kQuickBase;
+                self->quickDragging_ = false;
+                self->quickDragId_ = -1;
+                if (btnIdx >= 0 && btnIdx < static_cast<int>(std::size(kQuickButtons)))
+                    self->ActivateAlias(kQuickButtons[btnIdx].alias, true);
+                return 0;
+            }
+            break;
+        }
+
+        case WM_MOUSEMOVE:
+        {
+            POINT pt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+            bool hover = PtInRect(&self->closeRect_, pt) != 0;
+            if (hover != self->hoverClose_) {
+                self->hoverClose_ = hover;
+                InvalidateRect(h, &self->closeRect_, TRUE);
+            }
+            if (!self->trackingMouse_) {
+                TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, h, 0 };
+                TrackMouseEvent(&tme);
+                self->trackingMouse_ = true;
+            }
+            break;
+        }
+
+        case WM_MOUSELEAVE:
+            if (self->hoverClose_) {
+                self->hoverClose_ = false;
+                InvalidateRect(h, &self->closeRect_, TRUE);
+            }
+            self->trackingMouse_ = false;
+            break;
+
+        // ─── Dark theme color handlers ──────────────────────────
         case WM_CTLCOLOREDIT:
         {
             HDC hdc = reinterpret_cast<HDC>(w);
@@ -457,7 +561,7 @@ private:
         case WM_MEASUREITEM:
         {
             auto* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(l);
-            mis->itemHeight = 26;
+            mis->itemHeight = 24;
             return TRUE;
         }
         case WM_DRAWITEM:
@@ -465,7 +569,9 @@ private:
             auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(l);
             if (dis->CtlID == kListId)
                 { self->DrawListItem(dis); return TRUE; }
-            if (dis->CtlID >= kQuickBase && dis->CtlID < kQuickBase + kQuickCount)
+            if ((dis->CtlID >= kQuickBase && dis->CtlID < kQuickBase + kQuickCount) ||
+                dis->CtlID == kTabAllId || dis->CtlID == kTabMatId || dis->CtlID == kTabMapId ||
+                dis->CtlID == kApplyId || dis->CtlID == kSceneId)
                 { self->DrawButton(dis); return TRUE; }
             break;
         }
@@ -530,18 +636,49 @@ private:
         return DefSubclassProc(h, m, w, l);
     }
 
+    static LRESULT CALLBACK QuickBtnProc(HWND h, UINT m, WPARAM w, LPARAM l,
+                                         UINT_PTR, DWORD_PTR ref)
+    {
+        auto* self = reinterpret_cast<Palette*>(ref);
+        switch (m)
+        {
+        case WM_LBUTTONDOWN:
+            self->quickDragId_ = GetDlgCtrlID(h);
+            self->quickDragging_ = false;
+            GetCursorPos(&self->dragStart_);
+            break;
+        case WM_MOUSEMOVE:
+            if (self->quickDragId_ >= 0 && (w & MK_LBUTTON) && !self->quickDragging_)
+            {
+                POINT p{}; GetCursorPos(&p);
+                if (std::abs(p.x - self->dragStart_.x) > 6 ||
+                    std::abs(p.y - self->dragStart_.y) > 6)
+                {
+                    self->quickDragging_ = true;
+                    ReleaseCapture();
+                    SetCapture(self->wnd_);
+                    return 0;
+                }
+            }
+            break;
+        case WM_LBUTTONUP:
+            self->quickDragId_ = -1;
+            break;
+        }
+        return DefSubclassProc(h, m, w, l);
+    }
+
     // ─── Window management ──────────────────────────────────────
     bool EnsureWindow()
     {
         if (wnd_) return true;
         wnd_ = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kPaletteClass,
-            L"Power Shader r4  |  Ctrl+Shift+P",
-            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            nullptr,
+            WS_POPUP,
             CW_USEDEFAULT, CW_USEDEFAULT, kWindowWidth, kWindowHeight,
             GetCOREInterface() ? GetCOREInterface()->GetMAXHWnd() : nullptr,
             nullptr, hInstance, this);
-        if (wnd_) EnableDarkTitleBar(wnd_);
         return wnd_ != nullptr;
     }
 
@@ -552,69 +689,68 @@ private:
         const int pad = 8;
         RECT cr; GetClientRect(h, &cr);
         const int cw = cr.right - 2 * pad;
-        int y = pad;
+        closeRect_ = { cr.right - pad - 18, pad, cr.right - pad, pad + 18 };
+        int y = kHeaderH;
 
         // Search box
         edit_ = CreateWindowExW(0, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-            pad, y, cw, 28, h,
+            pad, y, cw, 24, h,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSearchId)),
             hInstance, nullptr);
         SendMessageW(edit_, WM_SETFONT, reinterpret_cast<WPARAM>(Theme::fontBold), TRUE);
         SendMessageW(edit_, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Search shaders..."));
         SetWindowSubclass(edit_, EditProc, 1, reinterpret_cast<DWORD_PTR>(this));
-        y += 36;
+        y += 28;
 
-        // Tab radio buttons
-        int tabW = cw / 3;
-        HWND tabAll = CreateWindowExW(0, L"BUTTON", L"All",
-            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP,
-            pad, y, tabW, 22, h,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTabAllId)), hInstance, nullptr);
-        HWND tabMat = CreateWindowExW(0, L"BUTTON", L"Materials",
-            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-            pad + tabW, y, tabW, 22, h,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTabMatId)), hInstance, nullptr);
-        HWND tabMap = CreateWindowExW(0, L"BUTTON", L"Maps",
-            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
-            pad + tabW * 2, y, tabW, 22, h,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTabMapId)), hInstance, nullptr);
-        CheckRadioButton(h, kTabAllId, kTabMapId, kTabAllId);
-        y += 30;
+        // Tab buttons (owner-drawn)
+        const int tabGap = 3;
+        int tabW = (cw - 2 * tabGap) / 3;
+        for (int i = 0; i < 3; ++i) {
+            static const wchar_t* tabLabels[] = { L"All", L"Materials", L"Maps" };
+            static const int tabIds[] = { kTabAllId, kTabMatId, kTabMapId };
+            CreateWindowExW(0, L"BUTTON", tabLabels[i],
+                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                pad + i * (tabW + tabGap), y, tabW, 22, h,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(tabIds[i])), hInstance, nullptr);
+        }
+        y += 26;
 
         // Quick buttons (owner-drawn)
         int x = pad;
-        int btnW = 50, btnH = 26, gap = 4;
+        int btnW = 50, btnH = 24, gap = 3;
         for (int i = 0; i < static_cast<int>(std::size(kQuickButtons)); ++i)
         {
             std::wstring lbl = kQuickButtons[i].label;
-            int bw = (lbl == L"NOISE" || lbl == L"GRAD") ? 60 : btnW;
+            int bw = (lbl == L"NOISE" || lbl == L"GRAD") ? 58 : btnW;
             if (x + bw > pad + cw) { x = pad; y += btnH + gap; }
-            CreateWindowExW(0, L"BUTTON", kQuickButtons[i].label,
+            HWND btn = CreateWindowExW(0, L"BUTTON", kQuickButtons[i].label,
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
                 x, y, bw, btnH, h,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(kQuickBase + i)),
                 hInstance, nullptr);
+            SetWindowSubclass(btn, QuickBtnProc, 1, reinterpret_cast<DWORD_PTR>(this));
             x += bw + gap;
         }
-        y += btnH + 8;
+        y += btnH + 6;
 
-        // Checkboxes
-        apply_ = CreateWindowExW(0, L"BUTTON", L"Apply to selection",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            pad, y, 140, 20, h,
+        // Toggle buttons (owner-drawn)
+        int halfW = (cw - gap) / 2;
+        apply_ = CreateWindowExW(0, L"BUTTON", L"Apply to Sel",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            pad, y, halfW, 22, h,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kApplyId)), hInstance, nullptr);
-        scene_ = CreateWindowExW(0, L"BUTTON", L"Scene items",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-            pad + 148, y, 110, 20, h,
+        scene_ = CreateWindowExW(0, L"BUTTON", L"Scene Items",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            pad + halfW + gap, y, cw - halfW - gap, 22, h,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSceneId)), hInstance, nullptr);
-        y += 28;
+        y += 26;
 
         // Results list (owner-drawn)
-        int listH = cr.bottom - y - 32;
+        int listH = cr.bottom - y - 26;
         list_ = CreateWindowExW(0, L"LISTBOX", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY |
-            LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
+            LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_NODATA,
             pad, y, cw, listH, h,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kListId)), hInstance, nullptr);
         SetWindowSubclass(list_, ListProc, 1, reinterpret_cast<DWORD_PTR>(this));
@@ -622,20 +758,16 @@ private:
         // Status bar
         status_ = CreateWindowExW(0, L"STATIC", L"Ready r4",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
-            pad, cr.bottom - 24, cw, 20, h, nullptr, hInstance, nullptr);
+            pad, cr.bottom - 22, cw, 18, h, nullptr, hInstance, nullptr);
+        SendMessageW(status_, WM_SETFONT, reinterpret_cast<WPARAM>(Theme::fontUI), TRUE);
 
-        // Fonts + dark theme on themed controls
-        for (HWND c : {tabAll, tabMat, tabMap, apply_, scene_, status_})
-            SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(Theme::fontUI), TRUE);
-        // Dark mode theme on controls (Win10 1903+)
+        // Dark scrollbar on list
         HMODULE hUx = LoadLibraryW(L"uxtheme.dll");
         if (hUx)
         {
             typedef HRESULT(WINAPI* SWTF)(HWND, LPCWSTR, LPCWSTR);
             auto swt = reinterpret_cast<SWTF>(GetProcAddress(hUx, "SetWindowTheme"));
-            if (swt)
-                for (HWND c : {tabAll, tabMat, tabMap, apply_, scene_, list_})
-                    swt(c, L"DarkMode_Explorer", nullptr);
+            if (swt) swt(list_, L"DarkMode_Explorer", nullptr);
         }
     }
 
@@ -643,30 +775,49 @@ private:
     void DrawListItem(DRAWITEMSTRUCT* dis)
     {
         if (dis->itemID == static_cast<UINT>(-1)) return;
+        int fi = static_cast<int>(dis->itemID);
+        if (!activeItems_ || fi < 0 || fi >= static_cast<int>(filtered_.size())) return;
+        int si = filtered_[static_cast<size_t>(fi)];
+        if (si < 0 || si >= static_cast<int>(activeItems_->size())) return;
+        const Item& item = (*activeItems_)[static_cast<size_t>(si)];
 
         bool sel = (dis->itemState & ODS_SELECTED) != 0;
         FillRect(dis->hDC, &dis->rcItem, sel ? Theme::brAccent : Theme::brBg);
 
-        wchar_t buf[256] = {};
-        SendMessageW(dis->hwndItem, LB_GETTEXT, dis->itemID, reinterpret_cast<LPARAM>(buf));
-
+        // Name color by type
         COLORREF tc = sel ? Theme::textBrt : Theme::text;
         if (!sel)
         {
-            const LRESULT kindRaw = SendMessageW(dis->hwndItem, LB_GETITEMDATA, dis->itemID, 0);
-            const ItemKind kind = static_cast<ItemKind>(kindRaw);
-            if (kind == ItemKind::ClassMap) tc = Theme::mapClr;
-            if (kind == ItemKind::SceneMaterial) tc = Theme::sceneClr;
+            if (item.kind == ItemKind::ClassMap) tc = Theme::mapClr;
+            if (item.kind == ItemKind::SceneMaterial) tc = Theme::sceneClr;
         }
 
         SetBkMode(dis->hDC, TRANSPARENT);
+        HFONT oldF = static_cast<HFONT>(SelectObject(dis->hDC, Theme::fontUI));
+
+        // Right side: category · TAG
+        std::wstring info = item.category;
+        if (!info.empty()) info += L" \u00B7 ";
+        info += TagForKind(item.kind);
+        RECT rr = dis->rcItem;
+        rr.right -= 6;
+        SetTextColor(dis->hDC, sel ? Theme::textBrt : Theme::textDim);
+        DrawTextW(dis->hDC, info.c_str(), -1, &rr,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+        // Measure right text to clip left
+        SIZE infoSz{};
+        GetTextExtentPoint32W(dis->hDC, info.c_str(), static_cast<int>(info.size()), &infoSz);
+
+        // Left side: item name
+        RECT lr = dis->rcItem;
+        lr.left += 8;
+        lr.right -= infoSz.cx + 12;
         SetTextColor(dis->hDC, tc);
-        HFONT old = static_cast<HFONT>(SelectObject(dis->hDC, Theme::fontUI));
-        RECT rc = dis->rcItem;
-        rc.left += 8;
-        DrawTextW(dis->hDC, buf, -1, &rc,
+        DrawTextW(dis->hDC, item.label.c_str(), -1, &lr,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        SelectObject(dis->hDC, old);
+
+        SelectObject(dis->hDC, oldF);
 
         if (!sel)
         {
@@ -681,9 +832,18 @@ private:
 
     void DrawButton(DRAWITEMSTRUCT* dis)
     {
-        bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+        int id = static_cast<int>(dis->CtlID);
+        bool active = false;
 
-        COLORREF bgc = pressed ? Theme::accent : Theme::panelLt;
+        // Determine active state based on control type
+        if (id == kTabAllId)      active = (tab_ == TabMode::All);
+        else if (id == kTabMatId) active = (tab_ == TabMode::Materials);
+        else if (id == kTabMapId) active = (tab_ == TabMode::Maps);
+        else if (id == kApplyId)  active = applyToSel_;
+        else if (id == kSceneId)  active = sceneOnly_;
+        else                      active = (dis->itemState & ODS_SELECTED) != 0;
+
+        COLORREF bgc = active ? Theme::accent : Theme::panelLt;
         HBRUSH br = CreateSolidBrush(bgc);
         FillRect(dis->hDC, &dis->rcItem, br);
         DeleteObject(br);
@@ -701,7 +861,7 @@ private:
         wchar_t buf[32] = {};
         GetWindowTextW(dis->hwndItem, buf, 32);
         SetBkMode(dis->hDC, TRANSPARENT);
-        SetTextColor(dis->hDC, pressed ? Theme::textBrt : Theme::text);
+        SetTextColor(dis->hDC, active ? Theme::textBrt : Theme::text);
         HFONT old = static_cast<HFONT>(SelectObject(dis->hDC, Theme::fontUI));
         DrawTextW(dis->hDC, buf, -1, &dis->rcItem,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -712,6 +872,7 @@ private:
     void Show()
     {
         CancelPendingRebuild();
+        SetWindowTextW(edit_, L"");
         EnsureClassCache();
         if (IsSceneOnly()) RefreshSceneCache();
         Rebuild(true);
@@ -745,16 +906,36 @@ private:
     void OnCommand(int id, int code)
     {
         if (id == kSearchId && code == EN_CHANGE) { ScheduleRebuild(); return; }
+        if (id == kApplyId)
+        {
+            applyToSel_ = !applyToSel_;
+            InvalidateRect(apply_, nullptr, FALSE);
+            return;
+        }
         if (id == kSceneId)
         {
+            sceneOnly_ = !sceneOnly_;
+            InvalidateRect(scene_, nullptr, FALSE);
             CancelPendingRebuild();
-            if (IsSceneOnly()) RefreshSceneCache();
+            if (sceneOnly_) RefreshSceneCache();
             Rebuild(true);
             return;
         }
-        if (id == kTabAllId) { CancelPendingRebuild(); tab_ = TabMode::All;       Rebuild(true); return; }
-        if (id == kTabMatId) { CancelPendingRebuild(); tab_ = TabMode::Materials; Rebuild(true); return; }
-        if (id == kTabMapId) { CancelPendingRebuild(); tab_ = TabMode::Maps;      Rebuild(true); return; }
+        if (id == kTabAllId || id == kTabMatId || id == kTabMapId)
+        {
+            TabMode newTab = (id == kTabMatId) ? TabMode::Materials
+                           : (id == kTabMapId) ? TabMode::Maps
+                           : TabMode::All;
+            if (newTab != tab_) {
+                tab_ = newTab;
+                // Invalidate all three tab buttons
+                for (int tid : {kTabAllId, kTabMatId, kTabMapId})
+                    if (HWND tw = GetDlgItem(wnd_, tid)) InvalidateRect(tw, nullptr, FALSE);
+                CancelPendingRebuild();
+                Rebuild(true);
+            }
+            return;
+        }
         if (id == kListId && code == LBN_DBLCLK)
             { ActivateCurrent(false); return; }
         if (id >= kQuickBase && id < kQuickBase + kQuickCount)
@@ -771,7 +952,7 @@ private:
     // ─── Data scanning ─────────────────────────────────────────
     bool IsSceneOnly() const
     {
-        return SendMessageW(scene_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        return sceneOnly_;
     }
 
     std::wstring ReadNormalizedQuery() const
@@ -828,11 +1009,12 @@ private:
                 item.label = m->GetName().Length()
                     ? std::wstring(m->GetName().data())
                     : std::wstring(className.data());
+                item.normLabel = Normalize(item.label, true);
                 item.search = Normalize(
                     item.label + L" " + std::wstring(className.data()), true);
                 item.key = Normalize(item.label, false);
                 item.kind = ItemKind::SceneMaterial;
-                item.display = item.label + TagForKind(item.kind);
+                item.category = std::wstring(className.data());
                 item.live = m;
                 sceneItems_.push_back(std::move(item));
             }
@@ -846,23 +1028,19 @@ private:
     {
         SubClassList* list = ClassDirectory::GetInstance().GetClassList(sid);
         if (!list) return;
-        std::vector<Class_ID> seenClassIds;
-        seenClassIds.reserve(static_cast<size_t>(list->Count(ACC_ALL)));
+        using CIDPair = std::pair<ULONG, ULONG>;
+        std::set<CIDPair> seen;
 
-        for (int i = list->GetFirst(ACC_ALL); i != -1;
-             i = list->GetNext(ACC_ALL))
+        for (int i = list->GetFirst(ACC_PUBLIC); i != -1;
+             i = list->GetNext(ACC_PUBLIC))
         {
             ClassEntry& ce = (*list)[i];
             ClassDesc* cd = ce.FullCD();
             if (!cd) continue;
 
             const Class_ID classId = ce.ClassID();
-            bool seen = false;
-            for (const Class_ID& id : seenClassIds)
-            {
-                if (id == classId) { seen = true; break; }
-            }
-            if (seen) continue;
+            if (!seen.insert({classId.PartA(), classId.PartB()}).second)
+                continue;
 
             const MCHAR* nonLocalized = cd->NonLocalizedClassName();
             const MCHAR* className    = cd->ClassName();
@@ -877,6 +1055,7 @@ private:
             if (key.empty()) continue;
             Item item;
             item.label      = name;
+            item.normLabel  = Normalize(name, true);
             item.search     = Normalize(
                 name + L" " +
                 std::wstring(className ? className : L"") + L" " +
@@ -887,9 +1066,9 @@ private:
                 ? std::wstring(internalName) : L"";
             item.scriptKey  = Normalize(item.scriptName, false);
             item.kind       = kind;
-            item.display    = item.label + TagForKind(item.kind);
+            item.category   = (categoryName && categoryName[0])
+                ? std::wstring(categoryName) : L"";
             item.classDesc  = cd;
-            seenClassIds.push_back(classId);
             out.push_back(std::move(item));
         }
     }
@@ -905,20 +1084,10 @@ private:
         activeItems_ = &source;
 
         const std::wstring q = ReadNormalizedQuery();
-        const std::vector<std::wstring> tokens = TokenizeQuery(q);
+        const std::wstring normQ = Normalize(q, true);
+        const std::vector<std::wstring> tokens = TokenizeQuery(normQ);
 
-        const bool sameMode = (sceneOnly == lastSceneOnly_) &&
-                              (sceneOnly || tab_ == lastTab_);
-        const bool canIncremental = !forceFull &&
-            sameMode &&
-            !lastQuery_.empty() &&
-            q.size() > lastQuery_.size() &&
-            StartsWith(q, lastQuery_);
-
-        std::vector<int> nextFiltered;
-        nextFiltered.reserve(canIncremental ? filtered_.size() : source.size());
-
-        auto passes = [&](const Item& item) -> bool
+        auto passesTab = [&](const Item& item) -> bool
         {
             bool isScene = item.kind == ItemKind::SceneMaterial;
             if (sceneOnly != isScene) return false;
@@ -929,63 +1098,54 @@ private:
                 if (tab_ == TabMode::Maps &&
                     item.kind != ItemKind::ClassMap) return false;
             }
-            return tokens.empty() || MatchOrderedTokens(item.search, tokens);
+            return true;
         };
 
-        if (canIncremental)
+        struct Scored { int idx; int score; };
+        std::vector<Scored> scored;
+        scored.reserve(source.size());
+
+        for (size_t i = 0; i < source.size(); ++i)
         {
-            for (int idx : filtered_)
-            {
-                if (idx < 0 || idx >= static_cast<int>(source.size())) continue;
-                if (passes(source[static_cast<size_t>(idx)]))
-                    nextFiltered.push_back(idx);
-            }
+            const Item& item = source[i];
+            if (!passesTab(item)) continue;
+            int s = ScoreMatch(item.search, item.normLabel, tokens);
+            if (s > 0) scored.push_back({static_cast<int>(i), s});
         }
-        else
-        {
-            for (size_t i = 0; i < source.size(); ++i)
-                if (passes(source[i])) nextFiltered.push_back(static_cast<int>(i));
-        }
+
+        // Sort by score descending when searching, alphabetical otherwise
+        if (!tokens.empty())
+            std::sort(scored.begin(), scored.end(),
+                [](const Scored& a, const Scored& b) { return a.score > b.score; });
+
+        filtered_.clear();
+        filtered_.reserve(scored.size());
+        for (const auto& s : scored) filtered_.push_back(s.idx);
 
         SendMessageW(list_, WM_SETREDRAW, FALSE, 0);
         SendMessageW(list_, LB_RESETCONTENT, 0, 0);
-        size_t chars = 0;
-        for (int idx : nextFiltered)
-            chars += source[static_cast<size_t>(idx)].display.size() + 1;
-        SendMessageW(list_, LB_INITSTORAGE,
-            static_cast<WPARAM>(nextFiltered.size()),
-            static_cast<LPARAM>(chars * sizeof(wchar_t)));
-        for (int idx : nextFiltered)
-        {
-            const Item& item = source[static_cast<size_t>(idx)];
-            LRESULT row = SendMessageW(list_, LB_ADDSTRING, 0,
-                reinterpret_cast<LPARAM>(item.display.c_str()));
-            if (row >= 0)
-                SendMessageW(list_, LB_SETITEMDATA, static_cast<WPARAM>(row),
-                    static_cast<LPARAM>(item.kind));
-        }
-        if (!nextFiltered.empty()) SendMessageW(list_, LB_SETCURSEL, 0, 0);
+        SendMessageW(list_, LB_SETCOUNT, static_cast<WPARAM>(filtered_.size()), 0);
+        if (!filtered_.empty()) SendMessageW(list_, LB_SETCURSEL, 0, 0);
         SendMessageW(list_, WM_SETREDRAW, TRUE, 0);
         RedrawWindow(list_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
 
-        filtered_.swap(nextFiltered);
-        lastQuery_ = q;
+        lastQuery_ = normQ;
         lastTab_ = tab_;
         lastSceneOnly_ = sceneOnly;
 
         SetStatus(std::to_wstring(filtered_.size()) + L" items" +
-            (q.empty() ? L"" : (L"  |  " + q)));
+            (normQ.empty() ? L"" : (L"  |  " + normQ)));
     }
 
     // ─── Activation (C++ API core) ──────────────────────────────
-    void ActivateAlias(const std::wstring& alias)
+    void ActivateAlias(const std::wstring& alias, bool drag = false)
     {
         EnsureClassCache();
         std::wstring key = Normalize(alias, false);
         for (const Item& item : classItems_)
             if (!item.live &&
                 (item.key == key || item.scriptKey == key))
-                { Activate(item, false); return; }
+                { Activate(item, drag); return; }
 
         // Retry once after forcing a fresh cache build.
         if (!forcedAliasRetry_)
@@ -996,7 +1156,7 @@ private:
             for (const Item& item : classItems_)
                 if (!item.live &&
                     (item.key == key || item.scriptKey == key))
-                    { Activate(item, false); return; }
+                    { Activate(item, drag); return; }
         }
 
         SetStatus(L"Class not available.");
@@ -1042,8 +1202,7 @@ private:
             mb->SetName(MSTR((item.label + L"_" +
                 std::to_wstring((GetTickCount() % 9000) + 1000)).c_str()));
 
-        const bool applyChecked =
-            SendMessageW(apply_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        const bool applyChecked = applyToSel_;
 
         // ── C++ API: Apply to selected scene nodes ──────────────
         if (applyChecked && mb->SuperClassID() == MATERIAL_CLASS_ID)
@@ -1065,8 +1224,8 @@ private:
         if (drag)
         {
             bool hoveringSme = false;
-            const bool droppedIntoSme = TryDropMtlBaseToSmeUnderCursor(mb, &hoveringSme);
-            if (!droppedIntoSme)
+            const bool dropped = TryDropAtCursor(mb, &hoveringSme);
+            if (!dropped)
             {
                 if (!hoveringSme)
                 {
@@ -1075,7 +1234,6 @@ private:
                 }
                 else
                 {
-                    // Avoid wrong-coordinate fallback if we're over SME but DAD failed.
                     activationFailed = true;
                 }
             }
@@ -1138,6 +1296,13 @@ private:
     bool  dragging_  = false;
     int   dragIndex_ = -1;
     POINT dragStart_ = {};
+    RECT  closeRect_ = {};
+    bool  hoverClose_ = false;
+    bool  trackingMouse_ = false;
+    bool  applyToSel_ = false;
+    bool  sceneOnly_  = false;
+    int   quickDragId_    = -1;
+    bool  quickDragging_  = false;
 };
 
 } // anonymous namespace
