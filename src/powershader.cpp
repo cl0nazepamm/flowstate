@@ -54,19 +54,19 @@ HWND FindSmeNodeViewWindowAtPoint(const POINT& screenPos)
     return nullptr;
 }
 
-bool InvokeDadDrop(DADMgr* dadMgr, ReferenceTarget* dropThis, HWND hwnd,
+bool InvokeDadDrop(DADMgr* dadMgr, ReferenceTarget* dropThis, HWND targetHwnd,
                    const POINT& clientPos, SClass_ID type, bool isNew)
 {
-    if (!dadMgr || !dropThis) return false;
+    if (!dadMgr || !dropThis || !targetHwnd) return false;
 
     // Host DAD managers are not robust against arbitrary external callers.
     // Keep failures local to the plugin instead of letting Max AV here.
     __try
     {
         const BOOL ok = dadMgr->OkToDrop(
-            dropThis, nullptr, hwnd, clientPos, type, isNew ? TRUE : FALSE);
+            dropThis, nullptr, targetHwnd, clientPos, type, isNew ? TRUE : FALSE);
         if (!ok) return false;
-        dadMgr->Drop(dropThis, hwnd, clientPos, type, nullptr, FALSE);
+        dadMgr->Drop(dropThis, targetHwnd, clientPos, type, nullptr, FALSE);
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -75,22 +75,25 @@ bool InvokeDadDrop(DADMgr* dadMgr, ReferenceTarget* dropThis, HWND hwnd,
     }
 }
 
-// Try DAD drop on a specific window via IDADWindow or ICustButton.
-bool TryDadDrop(HWND hwnd, MtlBase* mb, const POINT& screenPos, bool isNew)
+// Try DAD drop by resolving a DAD manager from ownerHwnd, but always target
+// the exact window under the cursor so ParamDlg::FindSubTexFromHWND() can map
+// the child control back to the correct shader slot.
+bool TryDadDrop(HWND ownerHwnd, HWND targetHwnd, MtlBase* mb,
+                const POINT& screenPos, bool isNew)
 {
-    if (!hwnd || !mb) return false;
+    if (!ownerHwnd || !targetHwnd || !mb) return false;
     ReferenceTarget* dropThis = static_cast<ReferenceTarget*>(mb);
     const SClass_ID type = mb->SuperClassID();
     POINT clientPos = screenPos;
-    if (!ScreenToClient(hwnd, &clientPos)) return false;
+    if (!ScreenToClient(targetHwnd, &clientPos)) return false;
 
     // Path 1: IDADWindow (SME node view, etc.)
-    IDADWindow* dadWindow = GetIDADWindow(hwnd);
+    IDADWindow* dadWindow = GetIDADWindow(ownerHwnd);
     if (dadWindow) {
         DADMgr* dadMgr = dadWindow->GetDADMgr();
         if (dadMgr) {
             const bool dropped =
-                InvokeDadDrop(dadMgr, dropThis, hwnd, clientPos, type, isNew);
+                InvokeDadDrop(dadMgr, dropThis, targetHwnd, clientPos, type, isNew);
             ReleaseIDADWindow(dadWindow);
             return dropped;
         }
@@ -100,14 +103,14 @@ bool TryDadDrop(HWND hwnd, MtlBase* mb, const POINT& screenPos, bool isNew)
     // Path 2: ICustButton (compact medit map slots)
     // Only safe to call GetICustButton on actual CustButton windows
     wchar_t cls[64] = {};
-    GetClassNameW(hwnd, cls, 64);
+    GetClassNameW(ownerHwnd, cls, 64);
     if (_wcsicmp(cls, CUSTBUTTONWINDOWCLASS) == 0) {
-        ICustButton* btn = GetICustButton(hwnd);
+        ICustButton* btn = GetICustButton(ownerHwnd);
         if (btn) {
             DADMgr* dadMgr = btn->GetDADMgr();
             if (dadMgr) {
                 const bool dropped =
-                    InvokeDadDrop(dadMgr, dropThis, hwnd, clientPos, type, isNew);
+                    InvokeDadDrop(dadMgr, dropThis, targetHwnd, clientPos, type, isNew);
                 ReleaseICustButton(btn);
                 return dropped;
             }
@@ -130,7 +133,7 @@ bool TryDropAtCursor(MtlBase* mb, bool isNew, bool* outHoveringSme = nullptr)
 
     // Try the window directly under cursor (compact medit map buttons, etc.)
     HWND hit = WindowFromPoint(screenPos);
-    if (hit && TryDadDrop(hit, mb, screenPos, isNew)) return true;
+    if (hit && TryDadDrop(hit, hit, mb, screenPos, isNew)) return true;
 
     // Walk parents to find SME node view or other DAD containers
     HWND walk = hit;
@@ -139,12 +142,13 @@ bool TryDropAtCursor(MtlBase* mb, bool isNew, bool* outHoveringSme = nullptr)
         if (IsWindowClass(walk, kSmeNodeViewClass))
         {
             if (outHoveringSme) *outHoveringSme = true;
-            return TryDadDrop(walk, mb, screenPos, isNew);
+            return TryDadDrop(walk, walk, mb, screenPos, isNew);
         }
         HWND parent = GetParent(walk);
         if (!parent || parent == walk) break;
-        // Try DAD on each parent (handles nested DAD controls)
-        if (parent != hit && TryDadDrop(parent, mb, screenPos, isNew)) return true;
+        // Parent may own the DAD manager even when the actionable target is
+        // the child directly under the cursor.
+        if (TryDadDrop(parent, hit ? hit : walk, mb, screenPos, isNew)) return true;
         walk = parent;
     }
     return false;
