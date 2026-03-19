@@ -54,30 +54,73 @@ HWND FindSmeNodeViewWindowAtPoint(const POINT& screenPos)
     return nullptr;
 }
 
-// Try DAD drop on a specific window.
-bool TryDadDrop(HWND hwnd, MtlBase* mb, const POINT& screenPos)
+bool InvokeDadDrop(DADMgr* dadMgr, ReferenceTarget* dropThis, HWND hwnd,
+                   const POINT& clientPos, SClass_ID type, bool isNew)
+{
+    if (!dadMgr || !dropThis) return false;
+
+    // Host DAD managers are not robust against arbitrary external callers.
+    // Keep failures local to the plugin instead of letting Max AV here.
+    __try
+    {
+        const BOOL ok = dadMgr->OkToDrop(
+            dropThis, nullptr, hwnd, clientPos, type, isNew ? TRUE : FALSE);
+        if (!ok) return false;
+        dadMgr->Drop(dropThis, hwnd, clientPos, type, nullptr, FALSE);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// Try DAD drop on a specific window via IDADWindow or ICustButton.
+bool TryDadDrop(HWND hwnd, MtlBase* mb, const POINT& screenPos, bool isNew)
 {
     if (!hwnd || !mb) return false;
-    IDADWindow* dadWindow = GetIDADWindow(hwnd);
-    if (!dadWindow) return false;
-    DADMgr* dadMgr = dadWindow->GetDADMgr();
-    if (!dadMgr) { ReleaseIDADWindow(dadWindow); return false; }
-
-    POINT clientPos = screenPos;
-    if (!ScreenToClient(hwnd, &clientPos)) { ReleaseIDADWindow(dadWindow); return false; }
-
     ReferenceTarget* dropThis = static_cast<ReferenceTarget*>(mb);
     const SClass_ID type = mb->SuperClassID();
-    const BOOL ok = dadMgr->OkToDrop(dropThis, nullptr, hwnd, clientPos, type, FALSE);
-    if (ok) dadMgr->Drop(dropThis, hwnd, clientPos, type, nullptr, FALSE);
+    POINT clientPos = screenPos;
+    if (!ScreenToClient(hwnd, &clientPos)) return false;
 
-    ReleaseIDADWindow(dadWindow);
-    return ok == TRUE;
+    // Path 1: IDADWindow (SME node view, etc.)
+    IDADWindow* dadWindow = GetIDADWindow(hwnd);
+    if (dadWindow) {
+        DADMgr* dadMgr = dadWindow->GetDADMgr();
+        if (dadMgr) {
+            const bool dropped =
+                InvokeDadDrop(dadMgr, dropThis, hwnd, clientPos, type, isNew);
+            ReleaseIDADWindow(dadWindow);
+            return dropped;
+        }
+        ReleaseIDADWindow(dadWindow);
+    }
+
+    // Path 2: ICustButton (compact medit map slots)
+    // Only safe to call GetICustButton on actual CustButton windows
+    wchar_t cls[64] = {};
+    GetClassNameW(hwnd, cls, 64);
+    if (_wcsicmp(cls, CUSTBUTTONWINDOWCLASS) == 0) {
+        ICustButton* btn = GetICustButton(hwnd);
+        if (btn) {
+            DADMgr* dadMgr = btn->GetDADMgr();
+            if (dadMgr) {
+                const bool dropped =
+                    InvokeDadDrop(dadMgr, dropThis, hwnd, clientPos, type, isNew);
+                ReleaseICustButton(btn);
+                return dropped;
+            }
+            ReleaseICustButton(btn);
+        }
+    }
+
+    return false;
 }
 
 // Try DAD drop at cursor: first the exact window, then walk up parents.
 // Sets outHoveringSme if cursor is over an SME node view.
-bool TryDropAtCursor(MtlBase* mb, bool* outHoveringSme = nullptr)
+bool TryDropAtCursor(MtlBase* mb, bool isNew, bool* outHoveringSme = nullptr)
 {
     if (outHoveringSme) *outHoveringSme = false;
     if (!mb) return false;
@@ -87,7 +130,7 @@ bool TryDropAtCursor(MtlBase* mb, bool* outHoveringSme = nullptr)
 
     // Try the window directly under cursor (compact medit map buttons, etc.)
     HWND hit = WindowFromPoint(screenPos);
-    if (hit && TryDadDrop(hit, mb, screenPos)) return true;
+    if (hit && TryDadDrop(hit, mb, screenPos, isNew)) return true;
 
     // Walk parents to find SME node view or other DAD containers
     HWND walk = hit;
@@ -96,12 +139,12 @@ bool TryDropAtCursor(MtlBase* mb, bool* outHoveringSme = nullptr)
         if (IsWindowClass(walk, kSmeNodeViewClass))
         {
             if (outHoveringSme) *outHoveringSme = true;
-            return TryDadDrop(walk, mb, screenPos);
+            return TryDadDrop(walk, mb, screenPos, isNew);
         }
         HWND parent = GetParent(walk);
         if (!parent || parent == walk) break;
         // Try DAD on each parent (handles nested DAD controls)
-        if (parent != hit && TryDadDrop(parent, mb, screenPos)) return true;
+        if (parent != hit && TryDadDrop(parent, mb, screenPos, isNew)) return true;
         walk = parent;
     }
     return false;
@@ -432,7 +475,8 @@ private:
             return 0;
 
         case WM_ACTIVATE:
-            if (LOWORD(w) == WA_INACTIVE && !self->dragging_) self->Hide();
+            if (LOWORD(w) == WA_INACTIVE && !self->dragging_ && !self->inDrop_)
+                self->Hide();
             return 0;
 
         case WM_CLOSE:
@@ -1196,6 +1240,7 @@ private:
         if (!mb && item.classDesc)
             mb = static_cast<MtlBase*>(item.classDesc->Create(FALSE));
         if (!mb) { SetStatus(L"Create failed."); return; }
+        const bool isNewItem = (item.live == nullptr);
 
         // ── C++ API: Name new instances ─────────────────────────
         if (!item.live)
@@ -1217,6 +1262,11 @@ private:
         if (IMtlEditInterface* me = GetMtlEditInterface())
             slot = std::max(0, me->GetActiveMtlSlot());
 
+        // Compact map-slot DAD handlers are much happier when the texmap
+        // already exists in Medit and is marked as a new instance.
+        if (drag && isNewItem && mb->SuperClassID() == TEXMAP_CLASS_ID)
+            ip->PutMtlToMtlEditor(mb, slot);
+
         // ── SME / viewport placement ────────────────────────────
         // Node creation in SME is handled through native DragDropWindow DAD.
         // Viewport assignment still uses MaxScript ray-hit path.
@@ -1224,7 +1274,9 @@ private:
         if (drag)
         {
             bool hoveringSme = false;
-            const bool dropped = TryDropAtCursor(mb, &hoveringSme);
+            inDrop_ = true;
+            const bool dropped = TryDropAtCursor(mb, isNewItem, &hoveringSme);
+            inDrop_ = false;
             if (!dropped)
             {
                 if (!hoveringSme)
@@ -1293,6 +1345,7 @@ private:
     bool forcedAliasRetry_ = false;
     bool sceneCacheReady_ = false;
     bool rebuildPending_ = false;
+    bool inDrop_ = false;
     bool  dragging_  = false;
     int   dragIndex_ = -1;
     POINT dragStart_ = {};

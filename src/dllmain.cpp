@@ -14,6 +14,7 @@
 #include <hold.h>
 #include <windowsx.h>
 #include "powershader.h"
+#include "modstack.h"
 #include <string>
 #include <vector>
 #include <set>
@@ -42,8 +43,10 @@ static const int kEditH     = 20;
 static const int kMaxParams = 50;
 static const int kMinW      = 260;
 static const int kRefreshMs = 500;
-static const int kBtnH      = 24;
-static const int kBtnGap    = 4;
+static const int kBtnW      = 26;    // side button width
+static const int kBtnH      = 16;    // side button height
+static const int kBtnGap    = 1;     // gap between side buttons
+static const int kSideGap   = 3;     // gap between buttons and content border
 static const int kMaxPanelH = 700;
 
 // 3ds Max dark theme colors
@@ -120,6 +123,7 @@ struct GroupHeader {
     std::wstring title;
     int startIdx = 0;
     int count    = 0;
+    Modifier* mod = nullptr;   // non-null = deletable modifier
 };
 
 // ── Globals ─────────────────────────────────────────────────────
@@ -162,28 +166,30 @@ struct BtnDef { const TCHAR* label; int id; };
 
 // EPoly buttons
 static const BtnDef kEPolySubObj[] = {
-    {_T("Vert"),1}, {_T("Edge"),2}, {_T("Bord"),3}, {_T("Face"),4}, {_T("Elem"),5}
+    {_T("V"),1}, {_T("E"),2}, {_T("B"),3}, {_T("F"),4}, {_T("El"),5}
 };
 static const BtnDef kEPolyOps[] = {
-    {_T("Extrude"),epop_extrude}, {_T("Connect"),epop_connect_edges},
-    {_T("Bridge"),epop_bridge_edge}, {_T("Chamfer"),epop_chamfer},
-    {_T("Bevel"),epop_bevel}, {_T("Inset"),epop_inset},
-    {_T("Outline"),epop_outline}, {_T("Remove"),epop_remove}
+    {_T("EXT"),epop_extrude}, {_T("CON"),epop_connect_edges},
+    {_T("BRG"),epop_bridge_edge}, {_T("CHM"),epop_chamfer},
+    {_T("BVL"),epop_bevel}, {_T("INS"),epop_inset},
+    {_T("OTL"),epop_outline}, {_T("REM"),epop_remove}
 };
 
 // Spline buttons
 static const BtnDef kSplineSubObj[] = {
-    {_T("Vert"),SS_VERTEX}, {_T("Seg"),SS_SEGMENT}, {_T("Spline"),SS_SPLINE}
+    {_T("V"),SS_VERTEX}, {_T("S"),SS_SEGMENT}, {_T("Sp"),SS_SPLINE}
 };
 static const BtnDef kSplineOps[] = {
-    {_T("Refine"),ScmRefine}, {_T("Fillet"),ScmFillet},
-    {_T("Chamfer"),ScmChamfer}, {_T("Outline"),ScmOutline},
-    {_T("Connect"),ScmConnect}, {_T("Trim"),ScmTrim},
-    {_T("Extend"),ScmExtend}, {_T("Boolean"),ScmUnion}
+    {_T("REF"),ScmRefine}, {_T("FIL"),ScmFillet},
+    {_T("CHM"),ScmChamfer}, {_T("OTL"),ScmOutline},
+    {_T("CON"),ScmConnect}, {_T("TRM"),ScmTrim},
+    {_T("EXD"),ScmExtend}, {_T("BOL"),ScmUnion}
 };
-static int g_subObjY  = 0;   // Y position of sub-object button row
-static int g_opBtnY   = 0;   // Y position of operation button row 1
-static int g_opBtnY2  = 0;   // Y position of operation button row 2
+static int g_leftX     = 0;   // X of left button column (sub-obj)
+static int g_rightX    = 0;   // X of right button column (ops)
+static int g_sideY     = 0;   // Y start of side buttons
+static int g_innerX    = 0;   // X start of inner content box
+static int g_innerW    = 0;   // width of inner content box
 static int g_contentStartY = 0;  // where scrollable content begins
 
 // Tool tip overlay (shows active EPoly tool name near cursor)
@@ -268,7 +274,8 @@ static bool IsMaterialEditorFocused() {
     return false;
 }
 
-static const UINT WM_PP_SHADER = WM_USER + 104;
+static const UINT WM_PP_SHADER   = WM_USER + 104;
+static const UINT WM_PP_MODSTACK = WM_USER + 105;
 
 // ── Forward declarations ────────────────────────────────────────
 static void TogglePanel();
@@ -298,8 +305,11 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
 
         if (xbutton == XBUTTON2) {
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             bool matEd = IsMaterialEditorFocused();
-            if (shift || matEd) {
+            if (ctrl) {
+                PostMessage(g_panel, WM_PP_MODSTACK, 0, 0);
+            } else if (shift || matEd) {
                 PostMessage(g_panel, WM_PP_SHADER, 0, 0);
             } else {
                 PostMessage(g_panel, WM_PP_TOGGLE, 0, 0);
@@ -480,6 +490,7 @@ static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int&
 
 
 // ── Find EPoly interface on selected node ────────────────────────
+// Returns any EPoly in the stack (for general queries like ExitActiveEPolyTool).
 static EPoly* FindEPoly(INode* node) {
     if (!node) return nullptr;
     Object* obj = node->GetObjectRef();
@@ -491,6 +502,26 @@ static EPoly* FindEPoly(INode* node) {
         }
         obj = d->GetObjRef();
     }
+    if (obj) return (EPoly*)obj->GetInterface(EPOLY_INTERFACE);
+    return nullptr;
+}
+
+// Returns EPoly only if it's the currently active modifier (A_MOD_BEING_EDITED)
+// or the base object. Edit Poly modifiers that aren't selected in the stack
+// won't respond to tool operations.
+static EPoly* FindActiveEPoly(INode* node) {
+    if (!node) return nullptr;
+    Object* obj = node->GetObjectRef();
+    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        IDerivedObject* d = static_cast<IDerivedObject*>(obj);
+        for (int m = 0; m < d->NumModifiers(); m++) {
+            Modifier* mod = d->GetModifier(m);
+            EPoly* ep = (EPoly*)mod->GetInterface(EPOLY_INTERFACE);
+            if (ep && mod->TestAFlag(A_MOD_BEING_EDITED)) return ep;
+        }
+        obj = d->GetObjRef();
+    }
+    // Base object is always "active"
     if (obj) return (EPoly*)obj->GetInterface(EPOLY_INTERFACE);
     return nullptr;
 }
@@ -605,14 +636,39 @@ static void GatherParams() {
     Object* obj = node->GetObjectRef();
     if (!obj) return;
 
-    // ── EPoly detection (robust) ────────────────────────────────
-    // Rules:
-    // - Show last-op params ONLY if nothing changed since the operation
-    // - putCount snapshot is frozen on first detection, never re-snapshotted
-    // - If putCount differs (selection change, any edit) → skip, generic only
-    // - If same op was already handled (putSnap matches last handled) → skip
+    // ── Detect which modifier (if any) is being edited ─────────
+    bool anyModBeingEdited = false;
+    Modifier* activeEditMod = nullptr;
     {
-        EPoly* ep = FindEPoly(node);
+        Object* walk = obj;
+        while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+            IDerivedObject* d = static_cast<IDerivedObject*>(walk);
+            for (int m = 0; m < d->NumModifiers(); m++) {
+                Modifier* mod = d->GetModifier(m);
+                if (mod && mod->TestAFlag(A_MOD_BEING_EDITED)) {
+                    anyModBeingEdited = true;
+                    activeEditMod = mod;
+                    break;
+                }
+            }
+            if (anyModBeingEdited) break;
+            walk = d->GetObjRef();
+        }
+    }
+
+    // ── EPoly detection — only when EPoly is the ACTIVE context ──
+    {
+        EPoly* ep = nullptr;
+        if (activeEditMod) {
+            // A modifier is selected — only show tools if IT is the EPoly
+            ep = (EPoly*)activeEditMod->GetInterface(EPOLY_INTERFACE);
+        } else if (!anyModBeingEdited) {
+            // Base object is active — check if it's EPoly
+            Object* base = obj;
+            while (base && base->SuperClassID() == GEN_DERIVOB_CLASS_ID)
+                base = ((IDerivedObject*)base)->GetObjRef();
+            if (base) ep = (EPoly*)base->GetInterface(EPOLY_INTERFACE);
+        }
         if (ep) {
             g_ctx = CTX_EPOLY;
             g_epolyForButtons = (FPInterface*)ep;
@@ -688,8 +744,8 @@ static void GatherParams() {
         }
     }
 
-    // ── Spline detection + param collection ────────────────────
-    if (g_ctx == CTX_NONE) {
+    // ── Spline detection — only when Spline is the ACTIVE context ──
+    if (g_ctx == CTX_NONE && !anyModBeingEdited) {
         Object* walk = obj;
         while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
             IDerivedObject* d = static_cast<IDerivedObject*>(walk);
@@ -741,6 +797,7 @@ static void GatherParams() {
             const MCHAR* p = cn.data();
             gh.title    = p ? p : L"Modifier";
             gh.startIdx = (int)g_edits.size();
+            gh.mod      = mod;
             int tot = 0;
             for (int b = 0; b < mod->NumParamBlocks(); b++)
                 CollectParams(mod->GetParamBlock(b), gh.title, tot);
@@ -1071,6 +1128,20 @@ static void UpdateToolTip() {
     InvalidateRect(g_toolTip, nullptr, FALSE);
 }
 
+// ── Paint helper: draw a vertical button column ─────────────────
+static void DrawBtnCol(HDC mem, const BtnDef* btns, int count, int x, int y,
+                       int activeID, HFONT font) {
+    SelectObject(mem, font);
+    for (int i = 0; i < count; i++) {
+        int by = y + i * (kBtnH + kBtnGap);
+        RECT br = { x, by, x + kBtnW, by + kBtnH };
+        COLORREF bg = (btns[i].id == activeID) ? kBtnAct : kBtnBg;
+        HBRUSH bb = CreateSolidBrush(bg); FillRect(mem, &br, bb); DeleteObject(bb);
+        SetTextColor(mem, (btns[i].id == activeID) ? RGB(255,255,255) : kLabelClr);
+        DrawText(mem, btns[i].label, -1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
 // ── Paint helper: draw a button row ─────────────────────────────
 static void DrawBtnRow(HDC mem, const BtnDef* btns, int count, int x, int y, int w,
                        int activeID, HFONT font) {
@@ -1103,13 +1174,17 @@ static void PaintPanel(HWND hwnd) {
 
     // Background
     { HBRUSH b = CreateSolidBrush(kBg); FillRect(mem, &rc, b); DeleteObject(b); }
-    // Border
-    Rectangle(mem, 0, 0, rc.right, rc.bottom);
 
     SetBkMode(mem, TRANSPARENT);
-    int x = kPad, rEdge = rc.right - kPad;
 
-    // Header
+    // Inner content box position
+    int ix = g_innerX, iw = g_innerW;
+    int x = ix + kPad, rEdge = ix + iw - kPad;
+
+    // Draw inner content border
+    Rectangle(mem, ix, 0, ix + iw, rc.bottom);
+
+    // Header (inside inner box)
     int y = kPad + 2;
     SetTextColor(mem, kAccent);
     const std::wstring& hdrText = g_nodeName.empty() ? std::wstring(L"PowerParams") : g_nodeName;
@@ -1127,34 +1202,24 @@ static void PaintPanel(HWND hwnd) {
     MoveToEx(mem, x, y, nullptr); LineTo(mem, rEdge, y);
     y += 4;
 
-    // Context-aware buttons
+    // Side buttons — drawn OUTSIDE the inner content box
     if (g_ctx != CTX_NONE) {
         int curLevel = 0;
         Interface* ip = GetCOREInterface();
         if (ip) curLevel = ip->GetSubObjectLevel();
 
+        int sy = g_sideY;
         if (g_ctx == CTX_EPOLY) {
-            DrawBtnRow(mem, kEPolySubObj, 5, x, y, rEdge - x, curLevel, g_font);
-            y += kBtnH + kBtnGap + 2;
-            DrawBtnRow(mem, kEPolyOps, 4, x, y, rEdge - x, -1, g_font);
-            y += kBtnH + kBtnGap;
-            DrawBtnRow(mem, kEPolyOps + 4, 4, x, y, rEdge - x, -1, g_font);
+            DrawBtnCol(mem, kEPolySubObj, 5, g_leftX, sy, curLevel, g_font);
+            DrawBtnCol(mem, kEPolyOps, 8, g_rightX, sy, -1, g_font);
         } else if (g_ctx == CTX_SPLINE) {
-            DrawBtnRow(mem, kSplineSubObj, 3, x, y, rEdge - x, curLevel, g_font);
-            y += kBtnH + kBtnGap + 2;
-            DrawBtnRow(mem, kSplineOps, 4, x, y, rEdge - x, -1, g_font);
-            y += kBtnH + kBtnGap;
-            DrawBtnRow(mem, kSplineOps + 4, 4, x, y, rEdge - x, -1, g_font);
+            DrawBtnCol(mem, kSplineSubObj, 3, g_leftX, sy, curLevel, g_font);
+            DrawBtnCol(mem, kSplineOps, 8, g_rightX, sy, -1, g_font);
         }
-        y += kBtnH + 4;
-
-        // Separator
-        MoveToEx(mem, x, y, nullptr); LineTo(mem, rEdge, y);
-        y += 4;
     }
 
-    // Clip to content area for scrollable groups
-    HRGN clipRgn = CreateRectRgn(0, g_contentStartY, rc.right, rc.bottom - 1);
+    // Clip to inner content area for scrollable groups
+    HRGN clipRgn = CreateRectRgn(g_innerX, g_contentStartY, g_innerX + g_innerW, rc.bottom - 1);
     SelectClipRgn(mem, clipRgn);
 
     // Groups + params (scrolled)
@@ -1170,6 +1235,16 @@ static void PaintPanel(HWND hwnd) {
         std::wstring hdr = (collapsed ? L"\x25B8 " : L"\x25BE ") + gh.title;
         if (isOpGroup) hdr += L"  [\x2713 EXIT]  [\x2717 CANCEL]";
         TextOut(mem, x, y, hdr.c_str(), (int)hdr.length());
+
+        // Draw [×] delete button for modifier groups
+        if (gh.mod) {
+            RECT delR = { rEdge - 16, y + 2, rEdge, y + kLineH - 2 };
+            HBRUSH db = CreateSolidBrush(RGB(80, 50, 50));
+            FillRect(mem, &delR, db); DeleteObject(db);
+            SetTextColor(mem, RGB(200, 100, 100));
+            DrawText(mem, _T("\u00D7"), 1, &delR, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+
         y += kLineH;
 
         if (!collapsed) {
@@ -1265,24 +1340,26 @@ static void BuildLayout() {
     if (hdrSz.cx + 30 > maxTitle) maxTitle = hdrSz.cx + 30;
     ReleaseDC(g_panel, hdc);
 
+    int leftMargin  = (g_ctx != CTX_NONE) ? (kBtnW + kSideGap) : 0;
+    int rightMargin = (g_ctx != CTX_NONE) ? (kBtnW + kSideGap) : 0;
     int contentW = maxLbl + 36 + kEditW;
     if (contentW < maxTitle) contentW = maxTitle;
-    int panelW = contentW + kPad * 2 + 8;
-    if (panelW < kMinW) panelW = kMinW;
-    int editX = panelW - kPad - kEditW;
+    int innerW = contentW + kPad * 2 + 8;
+    if (innerW < kMinW) innerW = kMinW;
+    int panelW = leftMargin + innerW + rightMargin;
+    int innerX = leftMargin;
+    int editX = innerX + innerW - kPad - kEditW;
 
-    g_closeRect = { panelW - kPad - 18, kPad, panelW - kPad, kPad + 18 };
+    g_innerX = innerX;
+    g_innerW = innerW;
+    g_leftX  = 1;
+    g_rightX = panelW - kBtnW - 1;
+    g_closeRect = { innerX + innerW - kPad - 18, kPad, innerX + innerW - kPad, kPad + 18 };
 
     // Fixed header area
     int y = 2 + kPad + kFontHdr + 4 + 1 + 4;
-    if (g_ctx != CTX_NONE) {
-        g_subObjY = y;
-        y += kBtnH + kBtnGap + 2;
-        g_opBtnY = y;
-        y += kBtnH + kBtnGap;
-        g_opBtnY2 = y;
-        y += kBtnH + 4 + 1 + 4;
-    }
+    // Side buttons start at content Y — they don't consume vertical space
+    g_sideY = y;
     g_contentStartY = y;
 
     // Content (logical Y, before scroll)
@@ -1309,6 +1386,12 @@ static void BuildLayout() {
     if (maxH > kMaxPanelH) maxH = kMaxPanelH;
 
     int panelH = g_contentStartY + g_contentH + kPad;
+    // Ensure panel is tall enough for the side buttons
+    if (g_ctx != CTX_NONE) {
+        int maxBtnCount = (g_ctx == CTX_EPOLY) ? 8 : 8;  // ops count (taller side)
+        int sideH = g_sideY + maxBtnCount * (kBtnH + kBtnGap) + kPad;
+        if (panelH < sideH) panelH = sideH;
+    }
     if (panelH > maxH) panelH = maxH;
     if (panelH < 60) panelH = 60;
     g_viewH = panelH - g_contentStartY - kPad;
@@ -1369,6 +1452,16 @@ static int HitBtnRow(const BtnDef* btns, int count, int rowY, int panelW, POINT 
     return -1;
 }
 
+// Hit test for vertical button column on the side
+static int HitBtnCol(const BtnDef* btns, int count, int colX, int colY, POINT pt) {
+    if (pt.x < colX || pt.x >= colX + kBtnW) return -1;
+    for (int i = 0; i < count; i++) {
+        int by = colY + i * (kBtnH + kBtnGap);
+        if (pt.y >= by && pt.y < by + kBtnH) return btns[i].id;
+    }
+    return -1;
+}
+
 // ── Find which param the mouse is over ──────────────────────────
 static int FindParamAtCursor() {
     POINT pt; GetCursorPos(&pt);
@@ -1410,7 +1503,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         ScreenToClient(hwnd, &pt);
         if (PtInRect(&g_closeRect, pt)) return HTCLIENT;
-        if (pt.y < kHeaderH) return HTCAPTION;
+        if (pt.y < kHeaderH && pt.x >= g_innerX && pt.x < g_innerX + g_innerW) return HTCAPTION;
         return HTCLIENT;
     }
 
@@ -1418,27 +1511,21 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         RECT wr; GetWindowRect(hwnd, &wr); int pw = wr.right - wr.left;
 
-        // Context-aware button clicks
+        // Context-aware side button clicks (left = sub-obj, right = ops)
         if (g_ctx == CTX_EPOLY) {
-            int subHit = HitBtnRow(kEPolySubObj, 5, g_subObjY, pw, pt);
+            int subHit = HitBtnCol(kEPolySubObj, 5, g_leftX, g_sideY, pt);
             if (subHit >= 0) {
                 Interface* ip = GetCOREInterface();
                 if (ip) ip->SetSubObjectLevel(ip->GetSubObjectLevel() == subHit ? 0 : subHit);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            int opHit = HitBtnRow(kEPolyOps, 4, g_opBtnY, pw, pt);
-            if (opHit < 0) opHit = HitBtnRow(kEPolyOps + 4, 4, g_opBtnY2, pw, pt);
+            int opHit = HitBtnCol(kEPolyOps, 8, g_rightX, g_sideY, pt);
             if (opHit >= 0 && g_epolyForButtons) {
-                // Accept current preview before running new op
                 EPolyAccept();
-
-                // Execute the operation
                 FPParams prms(1, TYPE_ENUM, opHit);
                 FPValue r;
                 g_epolyForButtons->Invoke(epfn_button_op, r, &prms);
-
-                // Reset detection state so re-gather picks up the new op
                 g_epolyOp = -1;
                 g_epolyFP = nullptr;
                 g_epolyPreview = false;
@@ -1446,23 +1533,20 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_lastKnownOp = -1;
                 g_epolyToolWasLive = true;
                 g_epolyWasCancelled = false;
-
-                // Re-gather + rebuild to show new op params + enter preview
                 GatherParams();
                 BuildLayout();
                 if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
                 return 0;
             }
         } else if (g_ctx == CTX_SPLINE) {
-            int subHit = HitBtnRow(kSplineSubObj, 3, g_subObjY, pw, pt);
+            int subHit = HitBtnCol(kSplineSubObj, 3, g_leftX, g_sideY, pt);
             if (subHit >= 0) {
                 Interface* ip = GetCOREInterface();
                 if (ip) ip->SetSubObjectLevel(ip->GetSubObjectLevel() == subHit ? 0 : subHit);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            int opHit = HitBtnRow(kSplineOps, 4, g_opBtnY, pw, pt);
-            if (opHit < 0) opHit = HitBtnRow(kSplineOps + 4, 4, g_opBtnY2, pw, pt);
+            int opHit = HitBtnCol(kSplineOps, 8, g_rightX, g_sideY, pt);
             if (opHit >= 0 && g_splineForButtons) {
                 g_splineForButtons->StartCommandMode((splineCommandMode)opHit);
                 if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
@@ -1518,19 +1602,45 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Click on group header
         int gIdx = FindGroupAtY(pt.y);
         if (gIdx >= 0) {
+            // [×] delete button for modifier groups (right edge)
+            if (g_groups[gIdx].mod && pt.x >= g_innerX + g_innerW - kPad - 16) {
+                Modifier* mod = g_groups[gIdx].mod;
+                MSTR cn; mod->GetClassName(cn, false);
+                // Use MaxScript for proper undo
+                std::wstring script = L"for m = $.modifiers.count to 1 by -1 do ("
+                    L"if $.modifiers[m] == (getModByRef $" + std::wstring(cn.data()) + L") do ("
+                    L"deleteModifier $ m; exit))";
+                // Simpler: delete by matching modifier reference
+                // Just find the modifier index and delete it
+                Interface* ip2 = GetCOREInterface();
+                if (ip2 && ip2->GetSelNodeCount() > 0) {
+                    INode* nd = ip2->GetSelNode(0);
+                    Object* ob = nd ? nd->GetObjectRef() : nullptr;
+                    while (ob && ob->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+                        IDerivedObject* dv = static_cast<IDerivedObject*>(ob);
+                        for (int mi = 0; mi < dv->NumModifiers(); mi++) {
+                            if (dv->GetModifier(mi) == mod) {
+                                // 1-based index for MaxScript
+                                std::wstring delScript = L"deleteModifier $ " +
+                                    std::to_wstring(mi + 1);
+                                EPolyAccept();
+                                ClosePanel();
+                                ExecuteMAXScriptScript(delScript.c_str(),
+                                    MAXScript::ScriptSource::Dynamic);
+                                if (ip2) ip2->RedrawViews(ip2->GetTime());
+                                return 0;
+                            }
+                        }
+                        ob = dv->GetObjRef();
+                    }
+                }
+                return 0;
+            }
             // EPoly op group — EXIT (left half) or CANCEL (right half)
             if (gIdx == 0 && g_epolyOp >= 0) {
-                // Detect which button: measure "EXIT" text width
-                HDC hdc = GetDC(hwnd);
-                SelectObject(hdc, g_fontBold);
-                std::wstring exitTxt = L"  [\x2713 EXIT]";
-                std::wstring hdrBase = L"\x25BE " + g_groups[0].title;
-                SIZE baseSz, exitSz;
-                GetTextExtentPoint32(hdc, hdrBase.c_str(), (int)hdrBase.length(), &baseSz);
-                GetTextExtentPoint32(hdc, exitTxt.c_str(), (int)exitTxt.length(), &exitSz);
-                ReleaseDC(hwnd, hdc);
-                int exitEnd = kPad + baseSz.cx + exitSz.cx;
-                if (pt.x < exitEnd)
+                // Left half of inner content = EXIT, right half = CANCEL
+                int midX = g_innerX + g_innerW / 2;
+                if (pt.x < midX)
                     EPolyDrop();      // EXIT = accept
                 else
                     EPolyCancelDrop(); // CANCEL = revert
@@ -1618,6 +1728,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_PP_SHADER:
         PowerShader::Toggle(); return 0;
+
+    case WM_PP_MODSTACK:
+        ModStack::Toggle(); return 0;
 
     case WM_PP_ADDPARAM: {
         // Suppress close during detection (HWND_BOTTOM causes WA_INACTIVE)
@@ -1822,11 +1935,13 @@ public:
         g_mouseHook = SetWindowsHookEx(WH_MOUSE, MouseHookProc, nullptr, GetCurrentThreadId());
 
         PowerShader::Init(hInstance);
+        ModStack::Init(hInstance);
 
         return GUPRESULT_KEEP;
     }
 
     void Stop() override {
+        ModStack::Shutdown();
         PowerShader::Shutdown();
         if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
         ClosePanel();
