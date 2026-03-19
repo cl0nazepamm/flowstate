@@ -33,6 +33,36 @@ namespace {
 
 constexpr wchar_t kSmeNodeViewClass[] = L"DragDropWindow";
 
+class PaletteDragSourceDADMgr final : public DADMgr
+{
+public:
+    PaletteDragSourceDADMgr() = default;
+
+    void Init(ReferenceTarget* instance, SClass_ID type, int slotOwner, bool isNew)
+    {
+        instance_ = instance;
+        type_ = type;
+        slotOwner_ = slotOwner;
+        isNew_ = isNew;
+    }
+
+    SClass_ID GetDragType(HWND, POINT) override { return type_; }
+    BOOL IsNew(HWND, POINT, SClass_ID) override { return isNew_ ? TRUE : FALSE; }
+    int SlotOwner() override { return slotOwner_; }
+    ReferenceTarget* GetInstance(HWND, POINT, SClass_ID) override { return instance_; }
+    BOOL OkToDrop(ReferenceTarget*, HWND, HWND, POINT, SClass_ID, BOOL) override
+    {
+        return FALSE;
+    }
+    void Drop(ReferenceTarget*, HWND, POINT, SClass_ID, DADMgr*, BOOL) override {}
+
+private:
+    ReferenceTarget* instance_ = nullptr;
+    SClass_ID type_ = 0;
+    int slotOwner_ = OWNER_BROWSE_NEW;
+    bool isNew_ = false;
+};
+
 bool IsWindowClass(HWND hwnd, const wchar_t* className)
 {
     if (!hwnd || !className) return false;
@@ -54,8 +84,9 @@ HWND FindSmeNodeViewWindowAtPoint(const POINT& screenPos)
     return nullptr;
 }
 
-bool InvokeDadDrop(DADMgr* dadMgr, ReferenceTarget* dropThis, HWND targetHwnd,
-                   const POINT& clientPos, SClass_ID type, bool isNew)
+bool InvokeDadDrop(DADMgr* dadMgr, ReferenceTarget* dropThis, HWND sourceHwnd,
+                   HWND targetHwnd, const POINT& clientPos, SClass_ID type,
+                   bool isNew, DADMgr* srcMgr)
 {
     if (!dadMgr || !dropThis || !targetHwnd) return false;
 
@@ -64,9 +95,9 @@ bool InvokeDadDrop(DADMgr* dadMgr, ReferenceTarget* dropThis, HWND targetHwnd,
     __try
     {
         const BOOL ok = dadMgr->OkToDrop(
-            dropThis, nullptr, targetHwnd, clientPos, type, isNew ? TRUE : FALSE);
+            dropThis, sourceHwnd, targetHwnd, clientPos, type, isNew ? TRUE : FALSE);
         if (!ok) return false;
-        dadMgr->Drop(dropThis, targetHwnd, clientPos, type, nullptr, FALSE);
+        dadMgr->Drop(dropThis, targetHwnd, clientPos, type, srcMgr, FALSE);
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -79,7 +110,7 @@ bool InvokeDadDrop(DADMgr* dadMgr, ReferenceTarget* dropThis, HWND targetHwnd,
 // the exact window under the cursor so ParamDlg::FindSubTexFromHWND() can map
 // the child control back to the correct shader slot.
 bool TryDadDrop(HWND ownerHwnd, HWND targetHwnd, MtlBase* mb,
-                const POINT& screenPos, bool isNew)
+                const POINT& screenPos, bool isNew, HWND sourceHwnd, DADMgr* srcMgr)
 {
     if (!ownerHwnd || !targetHwnd || !mb) return false;
     ReferenceTarget* dropThis = static_cast<ReferenceTarget*>(mb);
@@ -93,7 +124,7 @@ bool TryDadDrop(HWND ownerHwnd, HWND targetHwnd, MtlBase* mb,
         DADMgr* dadMgr = dadWindow->GetDADMgr();
         if (dadMgr) {
             const bool dropped =
-                InvokeDadDrop(dadMgr, dropThis, targetHwnd, clientPos, type, isNew);
+                InvokeDadDrop(dadMgr, dropThis, sourceHwnd, targetHwnd, clientPos, type, isNew, srcMgr);
             ReleaseIDADWindow(dadWindow);
             return dropped;
         }
@@ -110,7 +141,7 @@ bool TryDadDrop(HWND ownerHwnd, HWND targetHwnd, MtlBase* mb,
             DADMgr* dadMgr = btn->GetDADMgr();
             if (dadMgr) {
                 const bool dropped =
-                    InvokeDadDrop(dadMgr, dropThis, targetHwnd, clientPos, type, isNew);
+                    InvokeDadDrop(dadMgr, dropThis, sourceHwnd, targetHwnd, clientPos, type, isNew, srcMgr);
                 ReleaseICustButton(btn);
                 return dropped;
             }
@@ -123,7 +154,8 @@ bool TryDadDrop(HWND ownerHwnd, HWND targetHwnd, MtlBase* mb,
 
 // Try DAD drop at cursor: first the exact window, then walk up parents.
 // Sets outHoveringSme if cursor is over an SME node view.
-bool TryDropAtCursor(MtlBase* mb, bool isNew, bool* outHoveringSme = nullptr)
+bool TryDropAtCursor(MtlBase* mb, bool isNew, HWND sourceHwnd, DADMgr* srcMgr,
+                     bool* outHoveringSme = nullptr)
 {
     if (outHoveringSme) *outHoveringSme = false;
     if (!mb) return false;
@@ -133,7 +165,7 @@ bool TryDropAtCursor(MtlBase* mb, bool isNew, bool* outHoveringSme = nullptr)
 
     // Try the window directly under cursor (compact medit map buttons, etc.)
     HWND hit = WindowFromPoint(screenPos);
-    if (hit && TryDadDrop(hit, hit, mb, screenPos, isNew)) return true;
+    if (hit && TryDadDrop(hit, hit, mb, screenPos, isNew, sourceHwnd, srcMgr)) return true;
 
     // Walk parents to find SME node view or other DAD containers
     HWND walk = hit;
@@ -142,13 +174,14 @@ bool TryDropAtCursor(MtlBase* mb, bool isNew, bool* outHoveringSme = nullptr)
         if (IsWindowClass(walk, kSmeNodeViewClass))
         {
             if (outHoveringSme) *outHoveringSme = true;
-            return TryDadDrop(walk, walk, mb, screenPos, isNew);
+            return TryDadDrop(walk, walk, mb, screenPos, isNew, sourceHwnd, srcMgr);
         }
         HWND parent = GetParent(walk);
         if (!parent || parent == walk) break;
         // Parent may own the DAD manager even when the actionable target is
         // the child directly under the cursor.
-        if (TryDadDrop(parent, hit ? hit : walk, mb, screenPos, isNew)) return true;
+        if (TryDadDrop(parent, hit ? hit : walk, mb, screenPos, isNew, sourceHwnd, srcMgr))
+            return true;
         walk = parent;
     }
     return false;
@@ -1235,8 +1268,9 @@ private:
         Interface* ip = GetCOREInterface();
         if (!ip) { SetStatus(L"No interface."); return; }
 
-        // Drag-drop should feel instant: hide palette before heavy work.
-        const bool hiddenEarly = drag;
+        // Keep the source window alive through the drop so Max's DAD code can
+        // treat this like a real drag source.
+        const bool hiddenEarly = false;
         if (hiddenEarly) Hide();
 
         // ── C++ API: Create or reuse material instance ──────────
@@ -1278,12 +1312,26 @@ private:
         if (drag)
         {
             bool hoveringSme = false;
+            PaletteDragSourceDADMgr dragSource;
+            DADMgr* srcMgr = nullptr;
+            HWND sourceHwnd = wnd_;
+            if (mb->SuperClassID() == TEXMAP_CLASS_ID)
+            {
+                dragSource.Init(static_cast<ReferenceTarget*>(mb),
+                                TEXMAP_CLASS_ID, OWNER_BROWSE_NEW, isNewItem);
+                srcMgr = &dragSource;
+            }
             inDrop_ = true;
-            const bool dropped = TryDropAtCursor(mb, isNewItem, &hoveringSme);
+            const bool dropped = TryDropAtCursor(
+                mb, isNewItem, sourceHwnd, srcMgr, &hoveringSme);
             inDrop_ = false;
             if (!dropped)
             {
-                if (!hoveringSme)
+                if (mb->SuperClassID() == TEXMAP_CLASS_ID)
+                {
+                    activationFailed = true;
+                }
+                else if (!hoveringSme)
                 {
                     ip->PutMtlToMtlEditor(mb, slot);
                     ExecuteMAXScriptScript(kDragScript, MAXScript::ScriptSource::Dynamic);
