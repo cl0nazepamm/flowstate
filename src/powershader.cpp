@@ -33,36 +33,6 @@ namespace {
 
 constexpr wchar_t kSmeNodeViewClass[] = L"DragDropWindow";
 
-class PaletteDragSourceDADMgr final : public DADMgr
-{
-public:
-    PaletteDragSourceDADMgr() = default;
-
-    void Init(ReferenceTarget* instance, SClass_ID type, int slotOwner, bool isNew)
-    {
-        instance_ = instance;
-        type_ = type;
-        slotOwner_ = slotOwner;
-        isNew_ = isNew;
-    }
-
-    SClass_ID GetDragType(HWND, POINT) override { return type_; }
-    BOOL IsNew(HWND, POINT, SClass_ID) override { return isNew_ ? TRUE : FALSE; }
-    int SlotOwner() override { return slotOwner_; }
-    ReferenceTarget* GetInstance(HWND, POINT, SClass_ID) override { return instance_; }
-    BOOL OkToDrop(ReferenceTarget*, HWND, HWND, POINT, SClass_ID, BOOL) override
-    {
-        return FALSE;
-    }
-    void Drop(ReferenceTarget*, HWND, POINT, SClass_ID, DADMgr*, BOOL) override {}
-
-private:
-    ReferenceTarget* instance_ = nullptr;
-    SClass_ID type_ = 0;
-    int slotOwner_ = OWNER_BROWSE_NEW;
-    bool isNew_ = false;
-};
-
 bool IsWindowClass(HWND hwnd, const wchar_t* className)
 {
     if (!hwnd || !className) return false;
@@ -84,108 +54,40 @@ HWND FindSmeNodeViewWindowAtPoint(const POINT& screenPos)
     return nullptr;
 }
 
-bool InvokeDadDrop(DADMgr* dadMgr, ReferenceTarget* dropThis, HWND sourceHwnd,
-                   HWND targetHwnd, const POINT& clientPos, SClass_ID type,
-                   bool isNew, DADMgr* srcMgr)
+// Try DAD drop on SME node view only — the only proven safe DAD target.
+bool TryDropToSme(MtlBase* mb)
 {
-    if (!dadMgr || !dropThis || !targetHwnd) return false;
-
-    // Host DAD managers are not robust against arbitrary external callers.
-    // Keep failures local to the plugin instead of letting Max AV here.
-    __try
-    {
-        const BOOL ok = dadMgr->OkToDrop(
-            dropThis, sourceHwnd, targetHwnd, clientPos, type, isNew ? TRUE : FALSE);
-        if (!ok) return false;
-        dadMgr->Drop(dropThis, targetHwnd, clientPos, type, srcMgr, FALSE);
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return false;
-    }
-}
-
-// Try DAD drop by resolving a DAD manager from ownerHwnd, but always target
-// the exact window under the cursor so ParamDlg::FindSubTexFromHWND() can map
-// the child control back to the correct shader slot.
-bool TryDadDrop(HWND ownerHwnd, HWND targetHwnd, MtlBase* mb,
-                const POINT& screenPos, bool isNew, HWND sourceHwnd, DADMgr* srcMgr)
-{
-    if (!ownerHwnd || !targetHwnd || !mb) return false;
-    ReferenceTarget* dropThis = static_cast<ReferenceTarget*>(mb);
-    const SClass_ID type = mb->SuperClassID();
-    POINT clientPos = screenPos;
-    if (!ScreenToClient(targetHwnd, &clientPos)) return false;
-
-    // Path 1: IDADWindow (SME node view, etc.)
-    IDADWindow* dadWindow = GetIDADWindow(ownerHwnd);
-    if (dadWindow) {
-        DADMgr* dadMgr = dadWindow->GetDADMgr();
-        if (dadMgr) {
-            const bool dropped =
-                InvokeDadDrop(dadMgr, dropThis, sourceHwnd, targetHwnd, clientPos, type, isNew, srcMgr);
-            ReleaseIDADWindow(dadWindow);
-            return dropped;
-        }
-        ReleaseIDADWindow(dadWindow);
-    }
-
-    // Path 2: ICustButton (compact medit map slots)
-    // Only safe to call GetICustButton on actual CustButton windows
-    wchar_t cls[64] = {};
-    GetClassNameW(ownerHwnd, cls, 64);
-    if (_wcsicmp(cls, CUSTBUTTONWINDOWCLASS) == 0) {
-        ICustButton* btn = GetICustButton(ownerHwnd);
-        if (btn) {
-            DADMgr* dadMgr = btn->GetDADMgr();
-            if (dadMgr) {
-                const bool dropped =
-                    InvokeDadDrop(dadMgr, dropThis, sourceHwnd, targetHwnd, clientPos, type, isNew, srcMgr);
-                ReleaseICustButton(btn);
-                return dropped;
-            }
-            ReleaseICustButton(btn);
-        }
-    }
-
-    return false;
-}
-
-// Try DAD drop at cursor: first the exact window, then walk up parents.
-// Sets outHoveringSme if cursor is over an SME node view.
-bool TryDropAtCursor(MtlBase* mb, bool isNew, HWND sourceHwnd, DADMgr* srcMgr,
-                     bool* outHoveringSme = nullptr)
-{
-    if (outHoveringSme) *outHoveringSme = false;
     if (!mb) return false;
-
     POINT screenPos{};
     if (!GetCursorPos(&screenPos)) return false;
 
-    // Try the window directly under cursor (compact medit map buttons, etc.)
-    HWND hit = WindowFromPoint(screenPos);
-    if (hit && TryDadDrop(hit, hit, mb, screenPos, isNew, sourceHwnd, srcMgr)) return true;
+    HWND smeHwnd = FindSmeNodeViewWindowAtPoint(screenPos);
+    if (!smeHwnd) return false;
 
-    // Walk parents to find SME node view or other DAD containers
-    HWND walk = hit;
-    while (walk)
-    {
-        if (IsWindowClass(walk, kSmeNodeViewClass))
-        {
-            if (outHoveringSme) *outHoveringSme = true;
-            return TryDadDrop(walk, walk, mb, screenPos, isNew, sourceHwnd, srcMgr);
-        }
-        HWND parent = GetParent(walk);
-        if (!parent || parent == walk) break;
-        // Parent may own the DAD manager even when the actionable target is
-        // the child directly under the cursor.
-        if (TryDadDrop(parent, hit ? hit : walk, mb, screenPos, isNew, sourceHwnd, srcMgr))
-            return true;
-        walk = parent;
-    }
-    return false;
+    IDADWindow* dadWindow = GetIDADWindow(smeHwnd);
+    if (!dadWindow) return false;
+    DADMgr* dadMgr = dadWindow->GetDADMgr();
+    if (!dadMgr) { ReleaseIDADWindow(dadWindow); return false; }
+
+    POINT clientPos = screenPos;
+    ScreenToClient(smeHwnd, &clientPos);
+
+    ReferenceTarget* dropThis = static_cast<ReferenceTarget*>(mb);
+    const SClass_ID type = mb->SuperClassID();
+    const BOOL ok = dadMgr->OkToDrop(dropThis, nullptr, smeHwnd, clientPos, type, FALSE);
+    if (ok) dadMgr->Drop(dropThis, smeHwnd, clientPos, type, nullptr, FALSE);
+
+    ReleaseIDADWindow(dadWindow);
+    return ok == TRUE;
 }
+
+// Check if cursor is over an SME node view.
+bool IsCursorOverSme()
+{
+    POINT p{}; GetCursorPos(&p);
+    return FindSmeNodeViewWindowAtPoint(p) != nullptr;
+}
+
 
 // ═══════════════════════════════════════════════════════════════
 //  Dark Theme
@@ -395,11 +297,10 @@ static const wchar_t* kSmeAtSpawnScript =
     L")"
     L")";
 
-// Drag: viewport ray-hit first, SME fallback at cursor position.
+// Drag: viewport ray-hit → assign material to closest object under cursor.
 static const wchar_t* kDragScript =
     L"("
     L"local m=meditMaterials[activeMeditSlot];"
-    L"local dropped=false;"
     L"try("
     L"local r=mapScreenToWorldRay mouse.pos;"
     L"local hits=intersectRayScene r;"
@@ -407,7 +308,7 @@ static const wchar_t* kDragScript =
     L"for h in hits do(local d=distance r.pos h[2].pos;"
     L"if d<best do(best=d;nd=h[1]));"
     L"if nd!=undefined and superclassof m==material do"
-    L"(nd.material=m;dropped=true)"
+    L"(nd.material=m)"
     L")catch()"
     L")";
 
@@ -512,8 +413,7 @@ private:
             return 0;
 
         case WM_ACTIVATE:
-            if (LOWORD(w) == WA_INACTIVE && !self->dragging_ && !self->inDrop_)
-                self->Hide();
+            if (LOWORD(w) == WA_INACTIVE && !self->dragging_) self->Hide();
             return 0;
 
         case WM_CLOSE:
@@ -1268,97 +1168,66 @@ private:
         Interface* ip = GetCOREInterface();
         if (!ip) { SetStatus(L"No interface."); return; }
 
-        // Keep the source window alive through the drop so Max's DAD code can
-        // treat this like a real drag source.
-        const bool hiddenEarly = false;
-        if (hiddenEarly) Hide();
-
-        // ── C++ API: Create or reuse material instance ──────────
+        // ── Create or reuse material/map instance ───────────────
         MtlBase* mb = item.live;
         if (!mb && item.classDesc)
             mb = static_cast<MtlBase*>(item.classDesc->Create(FALSE));
         if (!mb) { SetStatus(L"Create failed."); return; }
-        const bool isNewItem = (item.live == nullptr);
+        const bool isNew = (item.live == nullptr);
+        const bool isMat = (mb->SuperClassID() == MATERIAL_CLASS_ID);
+        const bool isMap = (mb->SuperClassID() == TEXMAP_CLASS_ID);
 
-        // ── C++ API: Name new instances ─────────────────────────
-        if (!item.live)
+        // Name new instances
+        if (isNew)
             mb->SetName(MSTR((item.label + L"_" +
                 std::to_wstring((GetTickCount() % 9000) + 1000)).c_str()));
 
-        const bool applyChecked = applyToSel_;
-
-        // ── C++ API: Apply to selected scene nodes ──────────────
-        if (applyChecked && mb->SuperClassID() == MATERIAL_CLASS_ID)
+        // Apply to selection (materials only)
+        if (applyToSel_ && isMat)
         {
             Mtl* mtl = static_cast<Mtl*>(mb);
             for (int i = 0; i < ip->GetSelNodeCount(); ++i)
                 if (INode* n = ip->GetSelNode(i)) n->SetMtl(mtl);
         }
 
-        // ── C++ API: Get active medit slot for optional placement ─
+        // Get medit slot
         int slot = 0;
         if (IMtlEditInterface* me = GetMtlEditInterface())
             slot = std::max(0, me->GetActiveMtlSlot());
 
-        // Compact map-slot DAD handlers are much happier when the texmap
-        // already exists in Medit and is marked as a new instance.
-        if (drag && isNewItem && mb->SuperClassID() == TEXMAP_CLASS_ID)
-            ip->PutMtlToMtlEditor(mb, slot);
-
-        // ── SME / viewport placement ────────────────────────────
-        // Node creation in SME is handled through native DragDropWindow DAD.
-        // Viewport assignment still uses MaxScript ray-hit path.
-        bool activationFailed = false;
         if (drag)
         {
-            bool hoveringSme = false;
-            PaletteDragSourceDADMgr dragSource;
-            DADMgr* srcMgr = nullptr;
-            HWND sourceHwnd = wnd_;
-            if (mb->SuperClassID() == TEXMAP_CLASS_ID)
+            // ── Drag path ───────────────────────────────────────
+            // 1. SME accepts both materials and maps via DAD
+            bool dropped = TryDropToSme(mb);
+
+            if (!dropped && isMat)
             {
-                dragSource.Init(static_cast<ReferenceTarget*>(mb),
-                                TEXMAP_CLASS_ID, OWNER_BROWSE_NEW, isNewItem);
-                srcMgr = &dragSource;
+                // 2. Materials: assign to object under cursor via MaxScript
+                ip->PutMtlToMtlEditor(mb, slot);
+                ExecuteMAXScriptScript(kDragScript, MAXScript::ScriptSource::Dynamic);
+                dropped = true;
             }
-            inDrop_ = true;
-            const bool dropped = TryDropAtCursor(
-                mb, isNewItem, sourceHwnd, srcMgr, &hoveringSme);
-            inDrop_ = false;
+
             if (!dropped)
             {
-                if (mb->SuperClassID() == TEXMAP_CLASS_ID)
-                {
-                    activationFailed = true;
-                }
-                else if (!hoveringSme)
-                {
-                    ip->PutMtlToMtlEditor(mb, slot);
-                    ExecuteMAXScriptScript(kDragScript, MAXScript::ScriptSource::Dynamic);
-                }
-                else
-                {
-                    activationFailed = true;
-                }
+                // 3. Fallback: put in medit palette
+                ip->PutMtlToMtlEditor(mb, slot);
             }
+
+            Hide();
         }
         else
         {
+            // ── Click path: put in medit + spawn in SME ─────────
             ip->PutMtlToMtlEditor(mb, slot);
             ExecuteMAXScriptScript(kSmeAtSpawnScript, MAXScript::ScriptSource::Dynamic);
+            Hide();
         }
 
-        // Scene material list can change after creating/applying a material.
         sceneCacheReady_ = false;
-
-        if (!drag) ip->RedrawViews(ip->GetTime());
-        if (activationFailed)
-        {
-            SetStatus(L"SME drop failed.");
-            return;
-        }
+        ip->RedrawViews(ip->GetTime());
         SetStatus(drag ? L"Dropped." : L"Inserted.");
-        if (!hiddenEarly) Hide();
     }
 
     // ─── Helpers ────────────────────────────────────────────────
@@ -1397,7 +1266,6 @@ private:
     bool forcedAliasRetry_ = false;
     bool sceneCacheReady_ = false;
     bool rebuildPending_ = false;
-    bool inDrop_ = false;
     bool  dragging_  = false;
     int   dragIndex_ = -1;
     POINT dragStart_ = {};
