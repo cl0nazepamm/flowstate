@@ -558,27 +558,7 @@ static void GatherParams() {
     Object* obj = node->GetObjectRef();
     if (!obj) return;
 
-    // ── Detect which modifier (if any) is being edited ─────────
-    bool anyModBeingEdited = false;
-    Modifier* activeEditMod = nullptr;
-    {
-        Object* walk = obj;
-        while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-            IDerivedObject* d = static_cast<IDerivedObject*>(walk);
-            for (int m = 0; m < d->NumModifiers(); m++) {
-                Modifier* mod = d->GetModifier(m);
-                if (mod && mod->TestAFlag(A_MOD_BEING_EDITED)) {
-                    anyModBeingEdited = true;
-                    activeEditMod = mod;
-                    break;
-                }
-            }
-            if (anyModBeingEdited) break;
-            walk = d->GetObjRef();
-        }
-    }
-
-    // ── EPoly detection — find any EPoly (modifier or base) ────────
+    // ── EPoly detection — find any EPoly in the stack ──────────
     {
         EPoly* ep = FindEPoly(node);
         if (ep) {
@@ -656,14 +636,21 @@ static void GatherParams() {
         }
     }
 
-    // ── Spline detection — find SplineShape base object ────────────
+    // ── Spline detection — find SplineShape anywhere ───────────
     if (g_ctx == CTX_NONE) {
         SplineShape* ss = nullptr;
+        // Check base object
         Object* base = obj;
         while (base && base->SuperClassID() == GEN_DERIVOB_CLASS_ID)
             base = ((IDerivedObject*)base)->GetObjRef();
         if (base && base->ClassID() == splineShapeClassID)
             ss = static_cast<SplineShape*>(base);
+        // Any shape base → evaluate pipeline for SplineShape result
+        if (!ss && base && base->SuperClassID() == SHAPE_CLASS_ID) {
+            ObjectState os = node->EvalWorldState(GetCOREInterface()->GetTime());
+            if (os.obj && os.obj->ClassID() == splineShapeClassID)
+                ss = static_cast<SplineShape*>(os.obj);
+        }
         if (ss) {
             g_ctx = CTX_SPLINE;
             g_splineForButtons = ss;
