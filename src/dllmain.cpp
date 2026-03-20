@@ -77,9 +77,9 @@ struct FallbackOpParam { const TCHAR* label; ParamID pid; bool isFloat; };
 
 static const FallbackOpParam kConnectParams[]     = { {_T("Segments"),(ParamID)ep_connect_edge_segments,false}, {_T("Pinch"),(ParamID)ep_connect_edge_pinch,true}, {_T("Slide"),(ParamID)ep_connect_edge_slide,true} };
 static const FallbackOpParam kBridgeParams[]      = { {_T("Segments"),(ParamID)ep_bridge_segments,false}, {_T("Taper"),(ParamID)ep_bridge_taper,true}, {_T("Bias"),(ParamID)ep_bridge_bias,true}, {_T("Twist 1"),(ParamID)ep_bridge_twist_1,true}, {_T("Twist 2"),(ParamID)ep_bridge_twist_2,true} };
-static const FallbackOpParam kExtrudeFaceParams[] = { {_T("Height"),(ParamID)ep_face_extrude_height,true} };
-static const FallbackOpParam kExtrudeEdgeParams[] = { {_T("Height"),(ParamID)ep_edge_extrude_height,true}, {_T("Width"),(ParamID)ep_edge_extrude_width,true} };
-static const FallbackOpParam kExtrudeVertParams[] = { {_T("Width"),(ParamID)ep_vertex_extrude_width,true}, {_T("Height"),(ParamID)ep_vertex_extrude_height,true} };
+static const FallbackOpParam kExtrudeFaceParams[] = { {_T("Height"),(ParamID)ep_face_extrude_height,true}, {_T("Type"),(ParamID)ep_extrusion_type,false} };
+static const FallbackOpParam kExtrudeEdgeParams[] = { {_T("Height"),(ParamID)ep_edge_extrude_height,true}, {_T("Width"),(ParamID)ep_edge_extrude_width,true}, {_T("Type"),(ParamID)ep_extrusion_type,false} };
+static const FallbackOpParam kExtrudeVertParams[] = { {_T("Width"),(ParamID)ep_vertex_extrude_width,true}, {_T("Height"),(ParamID)ep_vertex_extrude_height,true}, {_T("Type"),(ParamID)ep_extrusion_type,false} };
 static const FallbackOpParam kBevelParams[]       = { {_T("Height"),(ParamID)ep_bevel_height,true}, {_T("Outline"),(ParamID)ep_bevel_outline,true}, {_T("Type"),(ParamID)ep_bevel_type,false} };
 static const FallbackOpParam kChamferEdgeParams[] = { {_T("Amount"),(ParamID)ep_edge_chamfer,true}, {_T("Segments"),(ParamID)ep_edge_chamfer_segments,false}, {_T("Depth"),(ParamID)ep_edge_chamfer_depth,true}, {_T("Tension"),(ParamID)ep_edge_chamfer_tension,true} };
 static const FallbackOpParam kChamferVertParams[] = { {_T("Amount"),(ParamID)ep_vertex_chamfer,true}, {_T("Depth"),(ParamID)ep_vertex_chamfer_depth,true} };
@@ -93,9 +93,9 @@ static const FallbackOpParam* LookupFallbackParams(int op, int selLevel, int& co
     case epop_bridge_border: case epop_bridge_polygon: case epop_bridge_edge:
                                 title=L"Bridge";   count=5; return kBridgeParams;
     case epop_extrude:
-        if (selLevel==EP_SL_EDGE)   { title=L"Extrude Edge";   count=2; return kExtrudeEdgeParams; }
-        if (selLevel==EP_SL_VERTEX) { title=L"Extrude Vertex"; count=2; return kExtrudeVertParams; }
-        title=L"Extrude Face"; count=1; return kExtrudeFaceParams;
+        if (selLevel==EP_SL_EDGE)   { title=L"Extrude Edge";   count=3; return kExtrudeEdgeParams; }
+        if (selLevel==EP_SL_VERTEX) { title=L"Extrude Vertex"; count=3; return kExtrudeVertParams; }
+        title=L"Extrude Face"; count=2; return kExtrudeFaceParams;
     case epop_bevel:            title=L"Bevel";    count=3; return kBevelParams;
     case epop_chamfer:
         if (selLevel==EP_SL_VERTEX) { title=L"Chamfer Vertex"; count=2; return kChamferVertParams; }
@@ -154,15 +154,10 @@ static const int kFavMaxParams = 12;
 
 static ULONG        g_nodeHandle       = 0;
 
-// EPoly preview state
+// EPoly takeover state — active tool detected on panel open
 static int          g_epolyOp       = -1;
 static FPInterface* g_epolyFP       = nullptr;
-static int          g_epolySelLevel = -1;
 static bool         g_epolyPreview  = false;
-static int          g_epolyPutSnap  = -1;     // frozen putCount snapshot
-static bool         g_epolyToolWasLive = false; // tool was active when panel opened
-static bool         g_epolyWasCancelled = false; // we cancelled Max's preview — skip undo in EPolyBegin
-static int          g_lastKnownOp  = -1;      // last op we showed — detect changes
 
 
 // Context-aware tool system
@@ -381,11 +376,51 @@ static bool FindParam(INode* node, const std::wstring& key,
     }
     if (obj) {
         MSTR cn; obj->GetClassName(cn, false);
-        if (std::wstring(cn.data()) == wantClass)
+        if (std::wstring(cn.data()) == wantClass) {
             for (int b = 0; b < obj->NumParamBlocks(); b++)
                 if (search(obj->GetParamBlock(b))) return true;
+            // Fallback: scan references for PB2
+            for (int r = 0; r < obj->NumRefs(); r++) {
+                RefTargetHandle ref = obj->GetReference(r);
+                if (ref && ref->SuperClassID() == PARAMETER_BLOCK2_CLASS_ID)
+                    if (search(static_cast<IParamBlock2*>(ref))) return true;
+            }
+        }
     }
     return false;
+}
+
+// Clean up SDK internal names for display: "lightRadius" → "Radius", "edge_chamfer" → "Chamfer"
+static std::wstring PrettyLabel(const std::wstring& raw, const std::wstring& groupTitle) {
+    std::wstring s = raw;
+    // Strip common class-name prefixes (case-insensitive)
+    std::wstring lower = s;
+    for (auto& c : lower) c = towlower(c);
+    std::wstring groupLower = groupTitle;
+    for (auto& c : groupLower) c = towlower(c);
+    // Remove spaces from group name for prefix matching
+    std::wstring gpx;
+    for (auto c : groupLower) if (c != L' ') gpx += c;
+    if (!gpx.empty() && lower.find(gpx) == 0)
+        s = s.substr(gpx.size());
+    // Strip leading underscores
+    while (!s.empty() && s[0] == L'_') s.erase(0, 1);
+    // Replace underscores with spaces
+    for (auto& c : s) if (c == L'_') c = L' ';
+    // Insert spaces at camelCase boundaries: "myRadius" → "my Radius"
+    std::wstring out;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (i > 0 && iswupper(s[i]) && !iswupper(s[i-1]) && s[i-1] != L' ')
+            out += L' ';
+        out += s[i];
+    }
+    // Capitalize first letter
+    if (!out.empty()) out[0] = towupper(out[0]);
+    // Trim leading/trailing spaces
+    while (!out.empty() && out[0] == L' ') out.erase(0, 1);
+    while (!out.empty() && out.back() == L' ') out.pop_back();
+    if (out.empty()) out = raw;
+    return out;
 }
 
 static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int& total) {
@@ -397,13 +432,13 @@ static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int&
         if (d.type & TYPE_TAB) continue;
         if (!IsFloat(d.type) && !IsInt(d.type) && d.type != TYPE_BOOL) continue;
 
-        std::wstring label = d.int_name ? d.int_name : L"?";
-        std::wstring key = groupTitle + L":" + label;
+        std::wstring rawName = d.int_name ? d.int_name : L"?";
+        std::wstring key = groupTitle + L":" + rawName;
 
         if (g_hidden.count(key)) continue;  // skip hidden
 
         EditField ef;
-        ef.label = label;
+        ef.label = PrettyLabel(rawName, groupTitle);
         ef.key   = key;
         ef.keyOrdinal = GetNextKeyOrdinal(key);
         ef.pb    = pb;
@@ -414,6 +449,76 @@ static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int&
     }
 }
 
+
+// Collect params from an object — tries NumParamBlocks first,
+// falls back to scanning references for ParamBlock2,
+// then falls back to IParamBlock (v1) for legacy shapes.
+static void CollectAllParams(ReferenceTarget* obj, const std::wstring& groupTitle, int& tot) {
+    if (!obj) return;
+    int found = 0;
+    // Primary: PB2 via NumParamBlocks API
+    for (int b = 0; b < obj->NumParamBlocks(); b++) {
+        IParamBlock2* pb = obj->GetParamBlock(b);
+        if (pb) { CollectParams(pb, groupTitle, tot); found++; }
+    }
+    // Fallback 1: scan refs for PB2
+    if (found == 0) {
+        for (int r = 0; r < obj->NumRefs(); r++) {
+            RefTargetHandle ref = obj->GetReference(r);
+            if (ref && ref->SuperClassID() == PARAMETER_BLOCK2_CLASS_ID) {
+                CollectParams(static_cast<IParamBlock2*>(ref), groupTitle, tot);
+                found++;
+            }
+        }
+    }
+    // Fallback 2: legacy objects (PB1 shapes etc.) — use MaxScript property enumeration
+    if (found == 0 && tot < kMaxParams) {
+        // Build a MaxScript that returns "propName|type|value\n" for each numeric property
+        std::wstring script =
+            L"(local s=\"\"; local o=$.baseObject; "
+            L"for p in (getPropNames o) do ("
+            L"try(local v=getProperty o p; local c=classof v; "
+            L"if c==Float or c==Integer or c==BooleanClass do ("
+            L"s+=p as string+\"|\"+(if c==Float then \"f\" else if c==Integer then \"i\" else \"b\")"
+            L"+\"|\"+(v as string)+\"\\n\"))catch()); s)";
+        FPValue result;
+        BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic,
+            TRUE, &result);
+        if (ok && result.type == TYPE_STRING && result.s) {
+            std::wstring data(result.s);
+            size_t pos = 0;
+            while (pos < data.size() && tot < kMaxParams) {
+                size_t nl = data.find(L'\n', pos);
+                if (nl == std::wstring::npos) nl = data.size();
+                std::wstring line = data.substr(pos, nl - pos);
+                pos = nl + 1;
+                // Parse "propName|type|value"
+                size_t sep1 = line.find(L'|');
+                size_t sep2 = line.find(L'|', sep1 + 1);
+                if (sep1 == std::wstring::npos || sep2 == std::wstring::npos) continue;
+                std::wstring propName = line.substr(0, sep1);
+                wchar_t typeChar = line[sep1 + 1];
+                // Skip internal/duplicate meta params
+                if (propName.find(L"typeIn") == 0 || propName.find(L"typein") == 0) continue;
+
+                std::wstring key = groupTitle + L":" + propName;
+                if (g_hidden.count(key)) continue;
+
+                EditField ef;
+                ef.label = PrettyLabel(propName, groupTitle);
+                ef.key   = key;
+                ef.keyOrdinal = GetNextKeyOrdinal(key);
+                ef.pb    = nullptr;  // MaxScript-based access
+                ef.id    = (ParamID)0;
+                ef.type  = (typeChar == L'f') ? (ParamType2)TYPE_FLOAT
+                         : (typeChar == L'b') ? (ParamType2)TYPE_BOOL
+                         : (ParamType2)TYPE_INT;
+                g_edits.push_back(ef);
+                tot++;
+            }
+        }
+    }
+}
 
 // ── Find EPoly interface on selected node ────────────────────────
 // Returns any EPoly in the stack (for general queries like ExitActiveEPolyTool).
@@ -429,6 +534,28 @@ static EPoly* FindEPoly(INode* node) {
         obj = d->GetObjRef();
     }
     if (obj) return (EPoly*)obj->GetInterface(EPOLY_INTERFACE);
+    return nullptr;
+}
+
+// Find SplineShape — base object or pipeline result (for Edit Spline on primitives)
+static SplineShape* FindSplineShape(INode* node) {
+    if (!node) return nullptr;
+    Object* obj = node->GetObjectRef();
+    // Walk to base
+    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID)
+        obj = ((IDerivedObject*)obj)->GetObjRef();
+    // Direct SplineShape base (Editable Spline)
+    if (obj && obj->ClassID() == splineShapeClassID)
+        return static_cast<SplineShape*>(obj);
+    // Shape primitive + Edit Spline → evaluate pipeline
+    if (obj && obj->SuperClassID() == SHAPE_CLASS_ID) {
+        Interface* ip = GetCOREInterface();
+        if (ip) {
+            ObjectState os = node->EvalWorldState(ip->GetTime());
+            if (os.obj && os.obj->ClassID() == splineShapeClassID)
+                return static_cast<SplineShape*>(os.obj);
+        }
+    }
     return nullptr;
 }
 
@@ -453,33 +580,7 @@ static EPoly* FindActiveEPoly(INode* node) {
 }
 
 // ── EPoly preview helpers ───────────────────────────────────────
-static void EPolyBegin() {
-    if (g_epolyOp < 0 || !g_epolyFP || g_epolyPreview) return;
-    if (g_epolyPutSnap < 0) return;  // no snapshot = no preview
-
-    // Frozen snapshot check — if undo stack changed, bail
-    int now = theHold.GetGlobalPutCount();
-    if (now != g_epolyPutSnap) {
-        g_epolyPutSnap = -1;  // kill it, won't match again
-        return;
-    }
-
-    // If we cancelled Max's own preview, mesh is already clean — no undo needed.
-    // If the operation was committed normally, undo to revert before re-previewing.
-    if (!g_epolyWasCancelled)
-        ExecuteMAXScriptScript(_T("max undo"), MAXScript::ScriptSource::NotSpecified, TRUE);
-    g_epolyWasCancelled = false;
-
-    FPParams prms(1, TYPE_ENUM, g_epolyOp);
-    FPValue r;
-    g_epolyFP->Invoke(epfn_preview_begin, r, &prms);
-    g_epolyPreview = true;
-    FPValue d;
-    g_epolyFP->Invoke(epfn_preview_invalidate, d);
-    if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
-    InvalidateRect(g_panel, nullptr, FALSE);
-}
-
+// Refresh live preview after param change
 static void EPolyRefresh() {
     if (!g_epolyPreview || !g_epolyFP) return;
     FPValue d;
@@ -487,28 +588,26 @@ static void EPolyRefresh() {
     if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
 }
 
+// Accept the active preview (commit the operation)
 static void EPolyAccept() {
     if (!g_epolyPreview || !g_epolyFP) return;
     FPValue d;
     g_epolyFP->Invoke(epfn_preview_accept, d);
     g_epolyPreview = false;
-    g_epolyPutSnap = -1;  // allow fresh snapshot for next operation
 }
 
+// Cancel the active preview (revert)
 static void EPolyCancel() {
     if (!g_epolyPreview || !g_epolyFP) return;
     FPValue d;
     g_epolyFP->Invoke(epfn_preview_cancel, d);
     g_epolyPreview = false;
-    g_epolyPutSnap = -1;
 }
 
 // Remove the op group from panel
 static void RemoveOpGroup() {
     g_epolyOp = -1;
     g_epolyFP = nullptr;
-    g_epolySelLevel = -1;
-    g_epolyPutSnap = -1;
     if (!g_groups.empty()) {
         int cnt = g_groups[0].count;
         int start = g_groups[0].startIdx;
@@ -540,14 +639,11 @@ static void GatherParams() {
     g_nodeHandle = 0;
     g_epolyOp = -1;
     g_epolyFP = nullptr;
-    g_epolySelLevel = -1;
     g_epolyPreview = false;
     g_ctx = CTX_NONE;
     g_epolyForButtons = nullptr;
     g_splineForButtons = nullptr;
-    // g_epolyToolWasLive is set by ExitActiveEPolyTool before GatherParams runs
     g_scrollY = 0;
-    g_epolyPutSnap = -1;
 
     Interface* ip = GetCOREInterface();
     if (!ip || ip->GetSelNodeCount() == 0) return;
@@ -560,7 +656,7 @@ static void GatherParams() {
     Object* obj = node->GetObjectRef();
     if (!obj) return;
 
-    // ── EPoly detection — find any EPoly in the stack ──────────
+    // ── EPoly detection ────────────────────────────────────────
     {
         EPoly* ep = FindEPoly(node);
         if (ep) {
@@ -569,34 +665,32 @@ static void GatherParams() {
             IParamBlock2* pb = ep->getParamBlock();
             FPInterface* fp = (FPInterface*)ep;
 
+            // Takeover: is a tool active? (GetCommandMode >= 0)
             if (pb && fp) {
-                FPValue opVal, slVal;
-                fp->Invoke(epfn_get_last_operation, opVal);
-                fp->Invoke(epfn_get_epoly_sel_level, slVal);
-                int lastOp = opVal.i, selLv = slVal.i;
+                FPValue modeVal;
+                fp->Invoke(epfn_get_command_mode, modeVal);
 
-                // Decide if we should show operation params
-                bool showOp = false;
-                int curPut = theHold.GetGlobalPutCount();
-
-                if (g_epolyPutSnap < 0) {
-                    // First detection — show if:
-                    // 1. Tool was LIVE (caddy open, command mode active), OR
-                    // 2. Operation CHANGED since last time (new op, even if tool exited)
-                    bool fresh = g_epolyToolWasLive || (lastOp != g_lastKnownOp);
-                    if (fresh) {
-                        g_epolyPutSnap = curPut;
-                        showOp = true;
-                    }
-                } else if (curPut == g_epolyPutSnap) {
-                    // Re-open, nothing changed — show
-                    showOp = true;
+                // Map command mode → operation code (don't rely on GetLastOperation)
+                int opFromMode = -1;
+                switch (modeVal.i) {
+                case epmode_chamfer_edge: case epmode_chamfer_vertex:
+                    opFromMode = epop_chamfer; break;
+                case epmode_extrude_face: case epmode_extrude_edge: case epmode_extrude_vertex:
+                    opFromMode = epop_extrude; break;
+                case epmode_bevel:
+                    opFromMode = epop_bevel; break;
+                case epmode_inset_face:
+                    opFromMode = epop_inset; break;
+                case epmode_outline:
+                    opFromMode = epop_outline; break;
                 }
-                // else: putCount differs — selection/topology changed, skip
 
-                if (showOp && lastOp >= 0) {
+                if (opFromMode >= 0) {
+                    FPValue slVal;
+                    fp->Invoke(epfn_get_epoly_sel_level, slVal);
+
                     int cnt = 0; std::wstring title;
-                    const FallbackOpParam* fb = LookupFallbackParams(lastOp, selLv, cnt, title);
+                    const FallbackOpParam* fb = LookupFallbackParams(opFromMode, slVal.i, cnt, title);
                     if (fb && cnt > 0) {
                         MSTR cn; ((Animatable*)ep)->GetClassName(cn, false);
                         std::wstring cls = cn.data() ? cn.data() : L"EPoly";
@@ -618,18 +712,20 @@ static void GatherParams() {
                         }
                         gh.count = (int)g_edits.size() - gh.startIdx;
                         if (gh.count > 0) {
-                            g_epolyOp = lastOp;
+                            g_epolyOp = opFromMode;
                             g_epolyFP = fp;
-                            g_lastKnownOp = lastOp;
-                            g_epolySelLevel = selLv;
-                            // Enter preview immediately — live feedback from the start
-                            FPValue pv;
-                            fp->Invoke(epfn_preview_on, pv);
-                            if (pv.i != 0) {
-                                g_epolyPreview = true;
-                            } else {
-                                EPolyBegin();  // undo + preview_begin
-                            }
+
+                            // Kill interactive mouse, take over with our preview
+                            FPValue d;
+                            fp->Invoke(epfn_exit_command_modes, d);
+                            fp->Invoke(epfn_close_popup_dialog, d);
+                            FPParams beginPrms(1, TYPE_ENUM, opFromMode);
+                            fp->Invoke(epfn_preview_begin, d, &beginPrms);
+                            FPParams dragPrms(1, TYPE_BOOL, TRUE);
+                            fp->Invoke(epfn_preview_set_dragging, d, &dragPrms);
+                            fp->Invoke(epfn_preview_invalidate, d);
+                            g_epolyPreview = true;
+
                             g_groups.push_back(gh);
                         }
                     }
@@ -691,8 +787,7 @@ static void GatherParams() {
             gh.startIdx = (int)g_edits.size();
             gh.mod      = mod;
             int tot = 0;
-            for (int b = 0; b < mod->NumParamBlocks(); b++)
-                CollectParams(mod->GetParamBlock(b), gh.title, tot);
+            CollectAllParams(mod, gh.title, tot);
             gh.count = (int)g_edits.size() - gh.startIdx;
             if (gh.count > 0) g_groups.push_back(gh);
         }
@@ -707,17 +802,18 @@ static void GatherParams() {
         gh.title    = p ? p : L"Object";
         gh.startIdx = (int)g_edits.size();
         int tot = 0;
-        for (int b = 0; b < walkObj->NumParamBlocks(); b++)
-            CollectParams(walkObj->GetParamBlock(b), gh.title, tot);
+        CollectAllParams(walkObj, gh.title, tot);
         // Also collect EPoly-specific param block if present
         EPoly* ep = (EPoly*)walkObj->GetInterface(EPOLY_INTERFACE);
         if (ep) {
             IParamBlock2* epPB = ep->getParamBlock();
-            bool alreadyCollected = false;
-            for (int b = 0; b < walkObj->NumParamBlocks(); b++) {
-                if (walkObj->GetParamBlock(b) == epPB) { alreadyCollected = true; break; }
+            if (epPB) {
+                // Check if already collected
+                bool found = false;
+                for (auto& ef : g_edits)
+                    if (ef.pb == epPB) { found = true; break; }
+                if (!found) CollectParams(epPB, gh.title, tot);
             }
-            if (!alreadyCollected) CollectParams(epPB, gh.title, tot);
         }
         gh.count = (int)g_edits.size() - gh.startIdx;
         if (gh.count > 0) g_groups.push_back(gh);
@@ -726,19 +822,33 @@ static void GatherParams() {
 }
 
 
+// Extract property name from key "ClassName:propName"
+static std::wstring PropFromKey(const EditField& ef) {
+    size_t sep = ef.key.find(L':');
+    return (sep != std::wstring::npos) ? ef.key.substr(sep + 1) : ef.key;
+}
+
 static void FormatValue(const EditField& ef, TimeValue t, TCHAR* buf, int len) {
     // Spline op values — read from local storage
-    if (!ef.pb && g_ctx == CTX_SPLINE) {
-        int idx = (int)ef.id;
-        if (idx >= 0 && idx < kSpCount)
-            swprintf(buf, len, _T("%.4g"), g_splineVals[idx]);
+    if (!ef.pb && g_ctx == CTX_SPLINE && (int)ef.id >= 0 && (int)ef.id < kSpCount) {
+        swprintf(buf, len, _T("%.4g"), g_splineVals[(int)ef.id]);
+        return;
+    }
+    // MaxScript-based params (legacy PB1 objects)
+    if (!ef.pb) {
+        std::wstring prop = PropFromKey(ef);
+        std::wstring script = L"try((getProperty $.baseObject #" + prop + L") as string)catch(\"--\")";
+        FPValue result;
+        BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic,
+            TRUE, &result);
+        if (ok && result.type == TYPE_STRING && result.s)
+            swprintf(buf, len, _T("%s"), result.s);
         else
             swprintf(buf, len, _T("--"));
         return;
     }
-    if (!ef.pb) { swprintf(buf, len, _T("--")); return; }
     if (IsFloat(ef.type))      swprintf(buf, len, _T("%.4g"), ef.pb->GetFloat(ef.id, t));
-    else if (ef.type==TYPE_BOOL) swprintf(buf, len, _T("%s"), ef.pb->GetInt(ef.id, t)?_T("On"):_T("Off"));
+    else if (ef.type==TYPE_BOOL) swprintf(buf, len, _T("%d"), ef.pb->GetInt(ef.id, t));
     else                       swprintf(buf, len, _T("%d"), ef.pb->GetInt(ef.id, t));
 }
 
@@ -898,8 +1008,13 @@ static int HitBtnCol(const BtnDef* btns, int count, POINT pt) {
 static int BtnStripH(int count) { return 8 + count * (kBtnH + kBtnGap) - kBtnGap; }
 
 // Position button strips relative to the panel
+static bool IsModifyMode() {
+    Interface* ip = GetCOREInterface();
+    return ip && ip->GetCommandPanelTaskMode() == TASK_MODE_MODIFY;
+}
+
 static void PositionBtnStrips() {
-    if (!g_panel || !g_open || g_ctx == CTX_NONE || !g_showBtns) {
+    if (!g_panel || !g_open || g_ctx == CTX_NONE || !g_showBtns || !IsModifyMode()) {
         if (g_btnLeft)  ShowWindow(g_btnLeft, SW_HIDE);
         if (g_btnRight) ShowWindow(g_btnRight, SW_HIDE);
         return;
@@ -991,14 +1106,26 @@ static void PaintPanel(HWND hwnd) {
         bool isOpGroup = (gi == 0 && g_epolyOp >= 0);
         SetTextColor(mem, isOpGroup ? kAccent : kGroupClr);
         std::wstring hdr = (collapsed ? L"\x25B8 " : L"\x25BE ") + gh.title;
-        if (isOpGroup) hdr += L"  [\x2713 EXIT]  [\x2717 CANCEL]";
+        if (isOpGroup) hdr += L"  [\x2717 CANCEL]";
         TextOut(mem, x, y, hdr.c_str(), (int)hdr.length());
 
-        // Draw [×] delete button for modifier groups
+        // Draw [▲][▼][×] buttons for modifier groups
         if (gh.mod) {
-            RECT delR = { rEdge - 16, y + 2, rEdge, y + kLineH - 2 };
-            HBRUSH db = CreateSolidBrush(RGB(80, 50, 50));
-            FillRect(mem, &delR, db); DeleteObject(db);
+            int bw = 16, bh = kLineH - 4;
+            int bx = rEdge - bw * 3 - 2;
+            RECT upR   = { bx,          y + 2, bx + bw,      y + 2 + bh };
+            RECT dnR   = { bx + bw + 1, y + 2, bx + bw*2+1,  y + 2 + bh };
+            RECT delR  = { bx + bw*2+2, y + 2, bx + bw*3+2,  y + 2 + bh };
+
+            HBRUSH bbg = CreateSolidBrush(kBtnBg);
+            FillRect(mem, &upR, bbg); FillRect(mem, &dnR, bbg);
+            DeleteObject(bbg);
+            HBRUSH dbg = CreateSolidBrush(RGB(80, 50, 50));
+            FillRect(mem, &delR, dbg); DeleteObject(dbg);
+
+            SetTextColor(mem, kLabelClr);
+            DrawText(mem, _T("\u25B2"), 1, &upR, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawText(mem, _T("\u25BC"), 1, &dnR, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             SetTextColor(mem, RGB(200, 100, 100));
             DrawText(mem, _T("\u00D7"), 1, &delR, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
@@ -1083,14 +1210,8 @@ static void KillActiveEdit(bool apply) {
                 g_splineVals[idx] = (float)_wtof(txt);
                 // Apply fillet/chamfer/outline
                 Interface* ip = GetCOREInterface();
-                if (ip && g_splineVals[idx] != 0.0f) {
-                    SplineShape* ss = nullptr;
-                    INode* nd = ip->GetSelNode(0);
-                    Object* walk = nd ? nd->GetObjectRef() : nullptr;
-                    while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID)
-                        walk = ((IDerivedObject*)walk)->GetObjRef();
-                    if (walk && walk->ClassID() == splineShapeClassID)
-                        ss = static_cast<SplineShape*>(walk);
+                if (ip && ip->GetSelNodeCount() > 0 && g_splineVals[idx] != 0.0f) {
+                    SplineShape* ss = FindSplineShape(ip->GetSelNode(0));
                     if (ss) {
                         TimeValue t = ip->GetTime();
                         if (idx == kSpFillet || idx == kSpChamfer) ss->SetFCLimit();
@@ -1110,11 +1231,18 @@ static void KillActiveEdit(bool apply) {
             TimeValue t = ip ? ip->GetTime() : 0;
             theHold.Suspend();
             if (IsFloat(ef.type))       ef.pb->SetValue(ef.id, t, (float)_wtof(txt));
-            else if (ef.type==TYPE_BOOL) ef.pb->SetValue(ef.id, t, (_wcsicmp(txt,_T("On"))==0||_wtoi(txt)!=0)?1:0);
+            else if (ef.type==TYPE_BOOL) ef.pb->SetValue(ef.id, t, _wtoi(txt) ? 1 : 0);
             else                        ef.pb->SetValue(ef.id, t, _wtoi(txt));
             theHold.Resume();
             if (g_epolyPreview) EPolyRefresh();
             else                NotifyParamChanged();
+        } else {
+            // MaxScript-based params (legacy PB1 objects)
+            std::wstring prop = PropFromKey(ef);
+            std::wstring val(txt);
+            std::wstring script = L"try(setProperty $.baseObject #" + prop + L" " + val + L")catch()";
+            ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
+            NotifyParamChanged();
         }
     }
     DestroyWindow(g_editHwnd);
@@ -1135,7 +1263,6 @@ static void SpawnEditAt(int paramIdx) {
     if (screenY + kEditH <= g_contentStartY || screenY >= g_contentStartY + g_viewH) return;
 
     DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_CENTER;
-    if (ef.type == TYPE_BOOL) style |= ES_READONLY;
     g_editHwnd = CreateWindowEx(0, _T("EDIT"), _T(""),
         style, editX, screenY + 1, kEditW, kEditH,
         g_panel, nullptr, hInstance, nullptr);
@@ -1177,7 +1304,7 @@ static void BuildLayout() {
     SelectObject(hdc, g_fontBold);
     int maxTitle = 0;
     for (auto& gh : g_groups) {
-        std::wstring hdr = L"\u25BE " + gh.title + L"  [\x2713 EXIT]  [\x2717 CANCEL]";
+        std::wstring hdr = L"\u25BE " + gh.title;
         SIZE sz; GetTextExtentPoint32(hdc, hdr.c_str(), (int)hdr.length(), &sz);
         if (sz.cx > maxTitle) maxTitle = sz.cx;
     }
@@ -1315,7 +1442,7 @@ static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             int hit = -1;
             if (g_ctx == CTX_EPOLY)  hit = HitBtnCol(kEPolySubObj, 5, pt);
             if (g_ctx == CTX_SPLINE) hit = HitBtnCol(kSplineSubObj, 3, pt);
-            if (hit >= 0) {
+            if (hit >= 0 && IsModifyMode()) {
                 Interface* ip = GetCOREInterface();
                 if (ip) ip->SetSubObjectLevel(ip->GetSubObjectLevel() == hit ? 0 : hit);
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -1327,32 +1454,23 @@ static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             if (g_ctx == CTX_SPLINE) hit = HitBtnCol(kSplineOps, 8, pt);
             if (hit >= 0) {
                 if (g_ctx == CTX_EPOLY && g_epolyForButtons) {
+                    // Only run ops if in modify mode and sub-object level > 0
+                    Interface* ip2 = GetCOREInterface();
+                    if (!ip2 || !IsModifyMode() || ip2->GetSubObjectLevel() == 0) return 0;
                     EPolyAccept();
                     FPParams prms(1, TYPE_ENUM, hit);
                     FPValue r;
                     g_epolyForButtons->Invoke(epfn_button_op, r, &prms);
-                    g_epolyOp = -1; g_epolyFP = nullptr;
-                    g_epolyPreview = false; g_epolyPutSnap = -1;
-                    g_lastKnownOp = -1; g_epolyToolWasLive = true;
-                    g_epolyWasCancelled = false;
-                    GatherParams(); BuildLayout();
-                    if (auto* ip2 = GetCOREInterface()) ip2->RedrawViews(ip2->GetTime());
+                    ip2->RedrawViews(ip2->GetTime());
                 } else if (g_ctx == CTX_SPLINE) {
                     Interface* ip2 = GetCOREInterface();
                     if (!ip2) return 0;
                     if (ip2->GetSubObjectLevel() == 0)
                         ip2->SetSubObjectLevel(1);
 
-                    // Re-acquire SplineShape fresh (cached ptr may be stale)
-                    SplineShape* ss = nullptr;
-                    if (ip2->GetSelNodeCount() > 0) {
-                        INode* nd = ip2->GetSelNode(0);
-                        Object* walk = nd ? nd->GetObjectRef() : nullptr;
-                        while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID)
-                            walk = ((IDerivedObject*)walk)->GetObjRef();
-                        if (walk && walk->ClassID() == splineShapeClassID)
-                            ss = static_cast<SplineShape*>(walk);
-                    }
+                    // Re-acquire SplineShape fresh
+                    SplineShape* ss = (ip2->GetSelNodeCount() > 0)
+                        ? FindSplineShape(ip2->GetSelNode(0)) : nullptr;
                     if (!ss) return 0;
 
                     // Buttons always start interactive tool mode
@@ -1430,8 +1548,7 @@ static void BuildFavorites() {
         auto& ef = g_favEdits[i];
         int y = 4 + i * kFavRowH + kFavLabelH;
         DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_CENTER;
-        if (ef.type == TYPE_BOOL) style |= ES_READONLY;
-        ef.hwnd = CreateWindowEx(0, _T("EDIT"), _T(""),
+            ef.hwnd = CreateWindowEx(0, _T("EDIT"), _T(""),
             style, 4, y, kEditW, kEditH, g_favWnd, nullptr, hInstance, nullptr);
         SendMessage(ef.hwnd, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
         if (!g_origEdit) g_origEdit = (WNDPROC)GetWindowLongPtr(ef.hwnd, GWLP_WNDPROC);
@@ -1569,26 +1686,16 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         if (PtInRect(&g_closeRect, pt)) { ClosePanel(); return 0; }
 
+        // Click anywhere kills active edit (SpawnEditAt will reopen if on a value)
+        if (g_editHwnd) { KillActiveEdit(true); InvalidateRect(hwnd, nullptr, FALSE); }
+
         // Click on value area → spawn edit or toggle bool
         {
             int idx = FindParamAtY(pt.y);
             RECT rc2; GetClientRect(hwnd, &rc2);
             int editX = rc2.right - kPad - kEditW;
             if (idx >= 0 && pt.x >= editX && pt.y >= g_contentStartY) {
-                auto& ef = g_edits[idx];
-                if (ef.type == TYPE_BOOL && ef.pb) {
-                    Interface* ip = GetCOREInterface();
-                    TimeValue t = ip ? ip->GetTime() : 0;
-                    if (g_epolyOp >= 0 && !g_epolyPreview) EPolyBegin();
-                    theHold.Suspend();
-                    ef.pb->SetValue(ef.id, t, ef.pb->GetInt(ef.id, t) ? 0 : 1);
-                    theHold.Resume();
-                    if (g_epolyPreview) EPolyRefresh();
-                    else                NotifyParamChanged();
-                    InvalidateRect(hwnd, nullptr, FALSE);
-                } else {
-                    SpawnEditAt(idx);
-                }
+                SpawnEditAt(idx);
                 return 0;
             }
         }
@@ -1640,48 +1747,83 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Click on group header
         int gIdx = FindGroupAtY(pt.y);
         if (gIdx >= 0) {
-            // [×] delete button for modifier groups (right edge)
-            if (g_groups[gIdx].mod && pt.x >= pw - kPad - 16) {
-                Modifier* mod = g_groups[gIdx].mod;
-                MSTR cn; mod->GetClassName(cn, false);
-                // Use MaxScript for proper undo
-                std::wstring script = L"for m = $.modifiers.count to 1 by -1 do ("
-                    L"if $.modifiers[m] == (getModByRef $" + std::wstring(cn.data()) + L") do ("
-                    L"deleteModifier $ m; exit))";
-                // Simpler: delete by matching modifier reference
-                // Just find the modifier index and delete it
-                Interface* ip2 = GetCOREInterface();
-                if (ip2 && ip2->GetSelNodeCount() > 0) {
+            // [▲][▼][×] buttons for modifier groups
+            if (g_groups[gIdx].mod) {
+                int rEdge2 = pw - kPad;
+                int bw = 16;
+                int bx = rEdge2 - bw * 3 - 2;
+                // Find this modifier's 1-based stack index
+                auto findModIdx = [&](Modifier* mod) -> int {
+                    Interface* ip2 = GetCOREInterface();
+                    if (!ip2 || ip2->GetSelNodeCount() == 0) return -1;
                     INode* nd = ip2->GetSelNode(0);
                     Object* ob = nd ? nd->GetObjectRef() : nullptr;
                     while (ob && ob->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
                         IDerivedObject* dv = static_cast<IDerivedObject*>(ob);
-                        for (int mi = 0; mi < dv->NumModifiers(); mi++) {
-                            if (dv->GetModifier(mi) == mod) {
-                                // 1-based index for MaxScript
-                                std::wstring delScript = L"deleteModifier $ " +
-                                    std::to_wstring(mi + 1);
-                                EPolyAccept();
-                                ClosePanel();
-                                ExecuteMAXScriptScript(delScript.c_str(),
-                                    MAXScript::ScriptSource::Dynamic);
-                                if (ip2) ip2->RedrawViews(ip2->GetTime());
-                                return 0;
-                            }
-                        }
+                        for (int mi = 0; mi < dv->NumModifiers(); mi++)
+                            if (dv->GetModifier(mi) == mod) return mi + 1;
                         ob = dv->GetObjRef();
                     }
+                    return -1;
+                };
+
+                if (pt.x >= bx && pt.x < bx + bw) {
+                    // ▲ Move up (towards top of stack = lower index)
+                    int mi = findModIdx(g_groups[gIdx].mod);
+                    if (mi > 1) {
+                        std::wstring s = L"undo \"Move Up\" on (local m=$.modifiers[" +
+                            std::to_wstring(mi) + L"];deleteModifier $ " +
+                            std::to_wstring(mi) + L";addModifier $ m before:" +
+                            std::to_wstring(mi - 1) + L")";
+                        EPolyAccept();
+                        ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
+                        GatherParams(); BuildLayout();
+                        if (auto* ip2 = GetCOREInterface()) ip2->RedrawViews(ip2->GetTime());
+                    }
+                    return 0;
                 }
-                return 0;
+                if (pt.x >= bx + bw + 1 && pt.x < bx + bw*2 + 1) {
+                    // ▼ Move down
+                    int mi = findModIdx(g_groups[gIdx].mod);
+                    Interface* ip2 = GetCOREInterface();
+                    int total = 0;
+                    if (ip2 && ip2->GetSelNodeCount() > 0) {
+                        INode* nd = ip2->GetSelNode(0);
+                        Object* ob = nd ? nd->GetObjectRef() : nullptr;
+                        while (ob && ob->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+                            IDerivedObject* dv = static_cast<IDerivedObject*>(ob);
+                            total += dv->NumModifiers();
+                            ob = dv->GetObjRef();
+                        }
+                    }
+                    if (mi > 0 && mi < total) {
+                        std::wstring s = L"undo \"Move Down\" on (local m=$.modifiers[" +
+                            std::to_wstring(mi) + L"];deleteModifier $ " +
+                            std::to_wstring(mi) + L";addModifier $ m before:" +
+                            std::to_wstring(mi + 1) + L")";
+                        EPolyAccept();
+                        ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
+                        GatherParams(); BuildLayout();
+                        if (ip2) ip2->RedrawViews(ip2->GetTime());
+                    }
+                    return 0;
+                }
+                if (pt.x >= bx + bw*2 + 2) {
+                    // × Delete
+                    int mi = findModIdx(g_groups[gIdx].mod);
+                    if (mi > 0) {
+                        std::wstring s = L"deleteModifier $ " + std::to_wstring(mi);
+                        EPolyAccept();
+                        ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
+                        GatherParams(); BuildLayout();
+                        if (auto* ip2 = GetCOREInterface()) ip2->RedrawViews(ip2->GetTime());
+                    }
+                    return 0;
+                }
             }
-            // EPoly op group — EXIT (left half) or CANCEL (right half)
+            // EPoly op group — click CANCEL text to revert
             if (gIdx == 0 && g_epolyOp >= 0) {
-                // Left half of inner content = EXIT, right half = CANCEL
-                int midX = pw / 2;
-                if (pt.x < midX)
-                    EPolyDrop();      // EXIT = accept
-                else
-                    EPolyCancelDrop(); // CANCEL = revert
+                EPolyCancelDrop();
                 return 0;
             }
             // Normal collapse toggle
@@ -1695,8 +1837,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
 
-    case WM_MBUTTONDOWN: {
-        // Middle-click = toggle side button strips
+    case WM_MBUTTONDOWN:
+    case WM_NCMBUTTONDOWN: {
+        // Middle-click anywhere on panel = toggle side button strips
         g_showBtns = !g_showBtns;
         PositionBtnStrips();
         return 0;
@@ -1797,6 +1940,27 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 theHold.Resume();
                 if (g_epolyPreview) EPolyRefresh();
                 else                NotifyParamChanged();
+            } else if (!ef.pb) {
+                // MaxScript-based params (legacy PB1 objects)
+                std::wstring prop = PropFromKey(ef);
+                if (IsFloat(ef.type)) {
+                    std::wstring script = L"try(local v=getProperty $.baseObject #" + prop +
+                        L"; setProperty $.baseObject #" + prop + L" (v+" +
+                        std::to_wstring(step) + L"*" +
+                        L"(if (abs v)>100 then 10 else if (abs v)>10 then 1 else if (abs v)>1 then 0.1 else 0.01)" +
+                        (shift ? L"*10" : L"") + (ctrl ? L"*0.1" : L"") +
+                        L"))catch()";
+                    ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
+                } else {
+                    int s = (int)step;
+                    if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
+                    if (s == 0) s = step>0?1:-1;
+                    std::wstring script = L"try(local v=getProperty $.baseObject #" + prop +
+                        L"; setProperty $.baseObject #" + prop + L" (v+" +
+                        std::to_wstring(s) + L"))catch()";
+                    ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
+                }
+                NotifyParamChanged();
             }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -1826,6 +1990,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::wstring cur = nn ? nn : L"";
             if (h != g_nodeHandle || cur != g_nodeName) { ClosePanel(); return 0; }
         }
+        // Update button visibility based on modify mode
+        PositionBtnStrips();
         // Values are painted — just repaint to show updated values
         InvalidateRect(hwnd, nullptr, FALSE);
         RefreshFavEdits();
@@ -1850,57 +2016,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ── Open / Close ────────────────────────────────────────────────
-// Exit any active EPoly tool (Chamfer caddy, Extrude, etc.)
-static void ExitActiveEPolyTool() {
-    Interface* ip = GetCOREInterface();
-    if (!ip || ip->GetSelNodeCount() == 0) return;
-
-    EPoly* ep = FindEPoly(ip->GetSelNode(0));
-    if (!ep) return;
-
-    FPInterface* fp = (FPInterface*)ep;
-    g_epolyWasCancelled = false;
-
-    // Check if a tool/preview is active BEFORE we exit it
-    FPValue modeVal, prevVal;
-    fp->Invoke(epfn_get_command_mode, modeVal);
-    fp->Invoke(epfn_preview_on, prevVal);
-    g_epolyToolWasLive = (modeVal.i >= 0 || prevVal.i != 0);
-
-    if (modeVal.i < 0 && prevVal.i == 0) return;  // nothing active
-
-    FPValue d;
-    if (prevVal.i != 0) {
-        // Save sub-object selection before cancel
-        ExecuteMAXScriptScript(
-            _T("global __ppSel = #{}\n")
-            _T("global __ppLvl = subObjectLevel\n")
-            _T("try(if __ppLvl==1 do __ppSel=polyOp.getVertSelection $)catch()\n")
-            _T("try(if __ppLvl==2 do __ppSel=polyOp.getEdgeSelection $)catch()\n")
-            _T("try(if __ppLvl==4 or __ppLvl==5 do __ppSel=polyOp.getFaceSelection $)catch()\n"),
-            MAXScript::ScriptSource::NotSpecified, TRUE);
-
-        // Cancel preview — reverts mesh, param values stay in PB
-        fp->Invoke(epfn_preview_cancel, d);
-        g_epolyWasCancelled = true;
-
-        // Restore selection after cancel
-        ExecuteMAXScriptScript(
-            _T("try(\n")
-            _T("  subObjectLevel = __ppLvl\n")
-            _T("  if __ppLvl==1 do polyOp.setVertSelection $ __ppSel\n")
-            _T("  if __ppLvl==2 do polyOp.setEdgeSelection $ __ppSel\n")
-            _T("  if __ppLvl==4 or __ppLvl==5 do polyOp.setFaceSelection $ __ppSel\n")
-            _T(")catch()\n"),
-            MAXScript::ScriptSource::NotSpecified, TRUE);
-    }
-    // Exit command mode + close caddy
-    fp->Invoke(epfn_exit_command_modes, d);
-    fp->Invoke(epfn_close_popup_dialog, d);
-}
-
 static void OpenPanel() {
-    ExitActiveEPolyTool();
     GatherParams();
 
     // Auto-collapse groups with 10+ params on first encounter
@@ -1930,7 +2046,8 @@ static void OpenPanel() {
     PositionBtnStrips();
     SetTimer(g_panel, 1, kRefreshMs, nullptr);
 
-    SetFocus(g_panel);
+    // No SetFocus — EPoly auto-commits on focus loss.
+    // Hover+wheel works without focus. Click spawns EDIT.
 
     // Build and show favorites strip
     BuildFavorites();
@@ -1941,12 +2058,9 @@ static void OpenPanel() {
 
 static void ClosePanel() {
     if (!g_open) return;
-    EPolyAccept();  // commit preview if active
-    // Don't reset g_epolyPutSnap here — keeps the frozen snapshot
-    // so next open can check if anything changed
+    EPolyAccept();  // commit the takeover preview
     g_epolyOp = -1;
     g_epolyFP = nullptr;
-    g_epolySelLevel = -1;
     g_epolyPreview = false;
 
     KillTimer(g_panel, 1);
