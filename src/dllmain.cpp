@@ -165,6 +165,11 @@ static ObjContext g_ctx = CTX_NONE;
 static FPInterface* g_epolyForButtons = nullptr;
 static SplineShape* g_splineForButtons = nullptr;
 
+// Spline operation values (local storage — ISplineOps is empty stubs)
+static float g_splineVals[] = { 0.1f, 0.0f, 0.0f, 0.0f }; // Weld, Fillet, Chamfer, Outline
+enum { kSpWeld=0, kSpFillet=1, kSpChamfer=2, kSpOutline=3, kSpCount=4 };
+static const TCHAR* kSpLabels[] = { _T("Weld"), _T("Fillet"), _T("Chamfer"), _T("Outline") };
+
 struct BtnDef { const TCHAR* label; int id; };
 
 // EPoly buttons
@@ -753,33 +758,23 @@ static void GatherParams() {
         }
         if (walk && walk->ClassID() == splineShapeClassID) {
             g_ctx = CTX_SPLINE;
-            SplineShape* ss = static_cast<SplineShape*>(walk);
-            g_splineForButtons = ss;
+            g_splineForButtons = static_cast<SplineShape*>(walk);
 
-            // Spline operation params — read live spinner values
-            struct SpinDef { const TCHAR* label; int idx; };
-            static const SpinDef kSpinDefs[] = {
-                {_T("Weld"), 0}, {_T("CrossInsert"), 1},
-                {_T("Fillet"), 2}, {_T("Chamfer"), 3}, {_T("Outline"), 4},
-            };
-
+            // Spline op values — stored locally, applied via Begin/Move/End
             GroupHeader gh;
             gh.title = L"Spline Ops";
             gh.startIdx = (int)g_edits.size();
-
-            for (auto& sd : kSpinDefs) {
-                std::wstring key = L"SplineShape:" + std::wstring(sd.label);
+            for (int si = 0; si < kSpCount; si++) {
+                std::wstring key = L"SplineShape:" + std::wstring(kSpLabels[si]);
                 if (g_hidden.count(key)) continue;
-
                 EditField ef;
-                ef.label = sd.label;
+                ef.label = kSpLabels[si];
                 ef.key   = key;
                 ef.pb    = nullptr;
-                ef.id    = (ParamID)sd.idx;
+                ef.id    = (ParamID)si;
                 ef.type  = (ParamType2)TYPE_FLOAT;
                 g_edits.push_back(ef);
             }
-
             gh.count = (int)g_edits.size() - gh.startIdx;
             if (gh.count > 0) g_groups.push_back(gh);
         }
@@ -870,33 +865,14 @@ static void GatherParams() {
 }
 
 
-// ── Value formatting ────────────────────────────────────────────
-// Spline params: use ISplineOps::GetUIParam
-// The splineUIParam enum is empty in the header but the implementation
-// may respond. We use indices based on the order in the UI.
-static bool FormatSplineValue(const EditField& ef, TCHAR* buf, int len) {
-    if (!g_splineForButtons) { swprintf(buf, len, _T("--")); return true; }
-    ISplineOps* ops = (ISplineOps*)g_splineForButtons->GetInterface(I_SPLINEOPS);
-    if (!ops) { swprintf(buf, len, _T("--")); return true; }
-    float val = 0.0f;
-    ops->GetUIParam((splineUIParam)(int)ef.id, val);
-    swprintf(buf, len, _T("%.4g"), val);
-    return true;
-}
-
-static bool ApplySplineValue(const EditField& ef, float val) {
-    if (!g_splineForButtons) return false;
-    ISplineOps* ops = (ISplineOps*)g_splineForButtons->GetInterface(I_SPLINEOPS);
-    if (!ops) return false;
-    ops->SetUIParam((splineUIParam)(int)ef.id, val);
-    return true;
-}
-
 static void FormatValue(const EditField& ef, TimeValue t, TCHAR* buf, int len) {
-    // Spline virtual params (no param block)
+    // Spline op values — read from local storage
     if (!ef.pb && g_ctx == CTX_SPLINE) {
-        if (FormatSplineValue(ef, buf, len)) return;
-        swprintf(buf, len, _T("--"));
+        int idx = (int)ef.id;
+        if (idx >= 0 && idx < kSpCount)
+            swprintf(buf, len, _T("%.4g"), g_splineVals[idx]);
+        else
+            swprintf(buf, len, _T("--"));
         return;
     }
     if (!ef.pb) { swprintf(buf, len, _T("--")); return; }
@@ -955,13 +931,49 @@ static void ApplyEdit(HWND h) {
         TCHAR txt[256];
         GetWindowText(h, txt, 256);
 
-        // Spline virtual params
+        // Spline op values — write to local storage + apply
         if (!ef.pb && g_ctx == CTX_SPLINE) {
-            ApplySplineValue(ef, (float)_wtof(txt));
-            NotifyParamChanged();
+            int idx = (int)ef.id;
+            if (idx >= 0 && idx < kSpCount) {
+                g_splineVals[idx] = (float)_wtof(txt);
+                // Punch-in: apply the value via Begin/Move/End
+                if (g_splineVals[idx] != 0.0f) {
+                    // Re-acquire SplineShape fresh
+                    SplineShape* ss = nullptr;
+                    INode* nd = ip->GetSelNode(0);
+                    Object* walk = nd ? nd->GetObjectRef() : nullptr;
+                    while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID)
+                        walk = ((IDerivedObject*)walk)->GetObjRef();
+                    if (walk && walk->ClassID() == splineShapeClassID)
+                        ss = static_cast<SplineShape*>(walk);
+                    if (ss) {
+                        // Fillet/Chamfer need FCLimit computed from selection
+                        if (idx == kSpFillet || idx == kSpChamfer)
+                            ss->SetFCLimit();
+                        theHold.Begin();
+                        if (idx == kSpFillet) {
+                            ss->BeginFilletMove(t);
+                            ss->FilletMove(t, g_splineVals[idx]);
+                            ss->EndFilletMove(t, TRUE);
+                        } else if (idx == kSpChamfer) {
+                            ss->BeginChamferMove(t);
+                            ss->ChamferMove(t, g_splineVals[idx]);
+                            ss->EndChamferMove(t, TRUE);
+                        } else if (idx == kSpOutline) {
+                            ss->BeginOutlineMove(t);
+                            ss->OutlineMove(t, g_splineVals[idx]);
+                            ss->EndOutlineMove(t, TRUE);
+                        } else if (idx == kSpWeld) {
+                            ss->SetEndPointAutoWeldThreshold(g_splineVals[idx]);
+                        }
+                        theHold.Accept(_T("Spline Op"));
+                        ss->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
+                        ip->RedrawViews(t);
+                    }
+                }
+            }
             break;
         }
-
         if (!ef.pb) return;
         theHold.Suspend();
         if (IsFloat(ef.type))       ef.pb->SetValue(ef.id, t, (float)_wtof(txt));
@@ -992,20 +1004,18 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         RECT er; GetWindowRect(h, &er);
         if (!PtInRect(&er, mp)) return SendMessage(g_panel, msg, wp, lp);
         if (!ef) break;
-        // Spline virtual params — wheel adjusts via ISplineOps
+        // Spline op values — wheel adjusts local storage
         if (!ef->pb && g_ctx == CTX_SPLINE) {
-            ISplineOps* ops = g_splineForButtons ? (ISplineOps*)g_splineForButtons->GetInterface(I_SPLINEOPS) : nullptr;
-            if (ops) {
+            int idx = (int)ef->id;
+            if (idx >= 0 && idx < kSpCount) {
                 float step = (float)GET_WHEEL_DELTA_WPARAM(wp) / 120.0f;
                 bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
                 bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-                float cur = 0; ops->GetUIParam((splineUIParam)(int)ef->id, cur);
-                float a = cur<0?-cur:cur;
+                float a = g_splineVals[idx] < 0 ? -g_splineVals[idx] : g_splineVals[idx];
                 float sc = a>100.f?10.f:a>10.f?1.f:a>1.f?0.1f:0.01f;
                 if (shift) sc *= 10.0f;
                 if (ctrl)  sc *= 0.1f;
-                ops->SetUIParam((splineUIParam)(int)ef->id, cur + step * sc);
-                NotifyParamChanged();
+                g_splineVals[idx] += step * sc;
                 RefreshEdits(true);
             }
             return 0;
@@ -1554,9 +1564,28 @@ static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                     g_epolyWasCancelled = false;
                     GatherParams(); BuildLayout();
                     if (auto* ip2 = GetCOREInterface()) ip2->RedrawViews(ip2->GetTime());
-                } else if (g_ctx == CTX_SPLINE && g_splineForButtons) {
-                    g_splineForButtons->StartCommandMode((splineCommandMode)hit);
-                    if (auto* ip2 = GetCOREInterface()) ip2->RedrawViews(ip2->GetTime());
+                } else if (g_ctx == CTX_SPLINE) {
+                    Interface* ip2 = GetCOREInterface();
+                    if (!ip2) return 0;
+                    if (ip2->GetSubObjectLevel() == 0)
+                        ip2->SetSubObjectLevel(1);
+
+                    // Re-acquire SplineShape fresh (cached ptr may be stale)
+                    SplineShape* ss = nullptr;
+                    if (ip2->GetSelNodeCount() > 0) {
+                        INode* nd = ip2->GetSelNode(0);
+                        Object* walk = nd ? nd->GetObjectRef() : nullptr;
+                        while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID)
+                            walk = ((IDerivedObject*)walk)->GetObjRef();
+                        if (walk && walk->ClassID() == splineShapeClassID)
+                            ss = static_cast<SplineShape*>(walk);
+                    }
+                    if (!ss) return 0;
+
+                    // Buttons always start interactive tool mode
+                    ss->StartCommandMode((splineCommandMode)hit);
+
+                    InvalidateRect(g_btnLeft, nullptr, FALSE);
                 }
                 return 0;
             }
