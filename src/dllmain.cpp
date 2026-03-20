@@ -59,7 +59,6 @@ static const COLORREF kValueClr  = RGB(230, 230, 230);
 static const COLORREF kEditBg    = RGB(42, 42, 42);
 static const COLORREF kEditFocus = RGB(48, 58, 65);
 static const COLORREF kCloseHov  = RGB(200, 60, 60);
-static const COLORREF kPinClr    = RGB(255, 200, 60);
 static const COLORREF kBtnBg     = RGB(68, 68, 68);
 static const COLORREF kBtnHov    = RGB(80, 80, 80);
 static const COLORREF kBtnAct    = RGB(38, 148, 168);   // active = teal
@@ -142,8 +141,13 @@ static bool     g_hoverClose = false;
 static RECT     g_closeRect  = {};
 
 static const UINT WM_PP_TOGGLE   = WM_USER + 100;
-static const UINT WM_PP_PIN      = WM_USER + 102;
-static const UINT WM_PP_ADDPARAM = WM_USER + 103;
+
+// Favorites strip
+static HWND     g_favWnd     = nullptr;
+static const TCHAR* kFavClass = _T("PPFavStrip");
+static std::set<std::wstring> g_favorites;
+static std::vector<EditField> g_favEdits;
+static const int kFavMaxParams = 12;
 
 static ULONG        g_nodeHandle       = 0;
 
@@ -157,7 +161,6 @@ static bool         g_epolyToolWasLive = false; // tool was active when panel op
 static bool         g_epolyWasCancelled = false; // we cancelled Max's preview — skip undo in EPolyBegin
 static int          g_lastKnownOp  = -1;      // last op we showed — detect changes
 
-static bool     g_suppressClose = false;
 
 // Context-aware tool system
 enum ObjContext { CTX_NONE, CTX_EPOLY, CTX_SPLINE };
@@ -194,6 +197,7 @@ static const BtnDef kSplineOps[] = {
     {_T("EXD"),ScmExtend}, {_T("BOL"),ScmUnion}
 };
 static int g_hoverBtn  = -1;  // hovered button ID for strip windows
+static bool g_showBtns = true; // toggle for side button strips
 static int g_contentStartY = 0;  // where scrollable content begins
 
 // Tool tip overlay (shows active EPoly tool name near cursor)
@@ -214,7 +218,6 @@ static bool                     g_freshOpen = false; // true during OpenPanel, p
 
 // ── Persistent settings ─────────────────────────────────────────
 static std::set<std::wstring> g_collapsed;
-static std::set<std::wstring> g_pinned;
 static std::set<std::wstring> g_hidden;
 
 static std::wstring GetCfgPath() {
@@ -232,13 +235,13 @@ static void SaveSettings() {
     FILE* f = _wfopen(path.c_str(), L"w");
     if (!f) return;
     for (auto& s : g_collapsed) fwprintf(f, L"C:%s\n", s.c_str());
-    for (auto& s : g_pinned)    fwprintf(f, L"P:%s\n", s.c_str());
     for (auto& s : g_hidden)    fwprintf(f, L"H:%s\n", s.c_str());
+    for (auto& s : g_favorites) fwprintf(f, L"F:%s\n", s.c_str());
     fclose(f);
 }
 
 static void LoadSettings() {
-    g_collapsed.clear(); g_pinned.clear(); g_hidden.clear();
+    g_collapsed.clear(); g_hidden.clear(); g_favorites.clear();
     std::wstring path = GetCfgPath();
     if (path.empty()) return;
     FILE* f = _wfopen(path.c_str(), L"r");
@@ -251,7 +254,8 @@ static void LoadSettings() {
         std::wstring val(line + 2);
         switch (line[0]) {
         case L'C': g_collapsed.insert(val); break;
-        case L'P': g_pinned.insert(val);    break;
+        case L'P': break; // legacy
+        case L'F': g_favorites.insert(val); break;
         case L'H': g_hidden.insert(val);    break;
         }
     }
@@ -297,10 +301,11 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     MOUSEHOOKSTRUCT* ms = (MOUSEHOOKSTRUCT*)lp;
 
     // Click outside panel = instant close
-    if (g_open && !g_suppressClose && !g_epolyPreview &&
+    if (g_open && !g_epolyPreview &&
         (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN)) {
-        if (ms->hwnd != g_panel && !IsChild(g_panel, ms->hwnd) && 
-            ms->hwnd != g_btnLeft && ms->hwnd != g_btnRight) {
+        if (ms->hwnd != g_panel && !IsChild(g_panel, ms->hwnd) &&
+            ms->hwnd != g_btnLeft && ms->hwnd != g_btnRight &&
+            ms->hwnd != g_favWnd && !IsChild(g_favWnd, ms->hwnd)) {
             PostMessage(g_panel, WM_USER + 101, 0, 0);
         }
     }
@@ -321,10 +326,6 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             }
             return 1;
         }
-        if (xbutton == XBUTTON1 && g_open) {
-            PostMessage(g_panel, WM_PP_ADDPARAM, 0, 0);
-            return 1;
-        }
     }
 
     return CallNextHookEx(g_mouseHook, nCode, wp, lp);
@@ -334,96 +335,33 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
 static bool IsFloat(ParamType2 t) { return t==TYPE_FLOAT||t==TYPE_ANGLE||t==TYPE_PCNT_FRAC||t==TYPE_WORLD||t==TYPE_COLOR_CHANNEL; }
 static bool IsInt(ParamType2 t)   { return t==TYPE_INT||t==TYPE_TIMEVALUE||t==TYPE_RADIOBTN_INDEX||t==TYPE_INDEX; }
 
-// ── Detect spinner under cursor → return its persistent key ─────
-static std::wstring DetectSpinnerKey() {
-    POINT pt; GetCursorPos(&pt);
-    HWND hwnd = WindowFromPoint(pt);
-    if (!hwnd) return L"";
 
-    // Must be a Max spinner or edit control
-    TCHAR cls[64]; GetClassName(hwnd, cls, 64);
-    if (_tcscmp(cls, SPINNERWINDOWCLASS) != 0 && _tcscmp(cls, CUSTEDITWINDOWCLASS) != 0)
-        return L"";
-
-    int ctrlID = GetDlgCtrlID(hwnd);
-    if (ctrlID <= 0) return L"";
-
-    Interface* ip = GetCOREInterface();
-    if (!ip || ip->GetSelNodeCount() == 0) return L"";
-    INode* node = ip->GetSelNode(0);
-    if (!node) return L"";
-
-    // Match ctrl ID against all param blocks — no param map dependency
-    auto tryPB = [&](IParamBlock2* pb, const MCHAR* className) -> std::wstring {
-        if (!pb) return L"";
-        for (int i = 0; i < pb->NumParams(); i++) {
-            ParamID pid = pb->IndextoID(i);
-            const ParamDef& def = pb->GetParamDef(pid);
-            if (!def.int_name) continue;
-            for (int c = 0; c < def.ctrl_count; c++) {
-                if (def.ctrl_IDs[c] == ctrlID) {
-                    return std::wstring(className) + L":" + def.int_name;
-                }
-            }
-        }
-        return L"";
-    };
-
-    Object* obj = node->GetObjectRef();
-    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-        IDerivedObject* d = static_cast<IDerivedObject*>(obj);
-        for (int m = 0; m < d->NumModifiers(); m++) {
-            Modifier* mod = d->GetModifier(m);
-            if (!mod) continue;
-            MSTR cn; mod->GetClassName(cn, false);
-            for (int b = 0; b < mod->NumParamBlocks(); b++) {
-                std::wstring key = tryPB(mod->GetParamBlock(b), cn.data());
-                if (!key.empty()) return key;
-            }
-        }
-        obj = d->GetObjRef();
-    }
-    if (obj) {
-        MSTR cn; obj->GetClassName(cn, false);
-        for (int b = 0; b < obj->NumParamBlocks(); b++) {
-            std::wstring key = tryPB(obj->GetParamBlock(b), cn.data());
-            if (!key.empty()) return key;
-        }
-        EPoly* ep = (EPoly*)obj->GetInterface(EPOLY_INTERFACE);
-        if (ep) {
-            std::wstring key = tryPB(ep->getParamBlock(), cn.data());
-            if (!key.empty()) return key;
-        }
-    }
-    return L"";
+static int GetNextKeyOrdinal(const std::wstring& key) {
+    int ord = 0;
+    for (const auto& ef : g_edits)
+        if (ef.key == key) ++ord;
+    return ord;
 }
 
-// ── Find a param by persistent key on current selection ─────────
-static bool FindParamByKey(INode* node, const std::wstring& key,
-                           IParamBlock2*& outPB, ParamID& outID, ParamType2& outType,
-                           int keyOrdinal = 0) {
+// Find a param on the current node by its persistent key (ClassName:ParamName)
+static bool FindParam(INode* node, const std::wstring& key,
+                      IParamBlock2*& outPB, ParamID& outID, ParamType2& outType) {
     size_t sep = key.find(L':');
     if (sep == std::wstring::npos) return false;
     std::wstring wantClass = key.substr(0, sep);
     std::wstring wantParam = key.substr(sep + 1);
-    int seen = 0;
-
-    auto searchPB = [&](IParamBlock2* pb) -> bool {
+    auto search = [&](IParamBlock2* pb) -> bool {
         if (!pb) return false;
         for (int i = 0; i < pb->NumParams(); i++) {
             ParamID pid = pb->IndextoID(i);
-            const ParamDef& def = pb->GetParamDef(pid);
-            if (def.int_name && std::wstring(def.int_name) == wantParam) {
-                if (seen == keyOrdinal) {
-                    outPB = pb; outID = pid; outType = def.type;
-                    return true;
-                }
-                ++seen;
+            const ParamDef& d = pb->GetParamDef(pid);
+            if (d.int_name && std::wstring(d.int_name) == wantParam) {
+                outPB = pb; outID = pid; outType = d.type;
+                return true;
             }
         }
         return false;
     };
-
     Object* obj = node->GetObjectRef();
     while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
         IDerivedObject* d = static_cast<IDerivedObject*>(obj);
@@ -433,38 +371,17 @@ static bool FindParamByKey(INode* node, const std::wstring& key,
             MSTR cn; mod->GetClassName(cn, false);
             if (std::wstring(cn.data()) != wantClass) continue;
             for (int b = 0; b < mod->NumParamBlocks(); b++)
-                if (searchPB(mod->GetParamBlock(b))) return true;
+                if (search(mod->GetParamBlock(b))) return true;
         }
         obj = d->GetObjRef();
     }
     if (obj) {
         MSTR cn; obj->GetClassName(cn, false);
-        if (std::wstring(cn.data()) == wantClass) {
+        if (std::wstring(cn.data()) == wantClass)
             for (int b = 0; b < obj->NumParamBlocks(); b++)
-                if (searchPB(obj->GetParamBlock(b))) return true;
-            EPoly* ep = (EPoly*)obj->GetInterface(EPOLY_INTERFACE);
-            if (ep && searchPB(ep->getParamBlock())) return true;
-        }
+                if (search(obj->GetParamBlock(b))) return true;
     }
     return false;
-}
-
-static bool ResolveEditBinding(INode* node, EditField& ef) {
-    IParamBlock2* pb = nullptr;
-    ParamID pid = 0;
-    ParamType2 ptype = (ParamType2)0;
-    if (!FindParamByKey(node, ef.key, pb, pid, ptype, ef.keyOrdinal)) return false;
-    ef.pb = pb;
-    ef.id = pid;
-    ef.type = ptype;
-    return true;
-}
-
-static int GetNextKeyOrdinal(const std::wstring& key) {
-    int ord = 0;
-    for (const auto& ef : g_edits)
-        if (ef.key == key) ++ord;
-    return ord;
 }
 
 static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int& total) {
@@ -661,19 +578,9 @@ static void GatherParams() {
         }
     }
 
-    // ── EPoly detection — only when EPoly is the ACTIVE context ──
+    // ── EPoly detection — find any EPoly (modifier or base) ────────
     {
-        EPoly* ep = nullptr;
-        if (activeEditMod) {
-            // A modifier is selected — only show tools if IT is the EPoly
-            ep = (EPoly*)activeEditMod->GetInterface(EPOLY_INTERFACE);
-        } else if (!anyModBeingEdited) {
-            // Base object is active — check if it's EPoly
-            Object* base = obj;
-            while (base && base->SuperClassID() == GEN_DERIVOB_CLASS_ID)
-                base = ((IDerivedObject*)base)->GetObjRef();
-            if (base) ep = (EPoly*)base->GetInterface(EPOLY_INTERFACE);
-        }
+        EPoly* ep = FindEPoly(node);
         if (ep) {
             g_ctx = CTX_EPOLY;
             g_epolyForButtons = (FPInterface*)ep;
@@ -749,16 +656,17 @@ static void GatherParams() {
         }
     }
 
-    // ── Spline detection — only when Spline is the ACTIVE context ──
-    if (g_ctx == CTX_NONE && !anyModBeingEdited) {
-        Object* walk = obj;
-        while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-            IDerivedObject* d = static_cast<IDerivedObject*>(walk);
-            walk = d->GetObjRef();
-        }
-        if (walk && walk->ClassID() == splineShapeClassID) {
+    // ── Spline detection — find SplineShape base object ────────────
+    if (g_ctx == CTX_NONE) {
+        SplineShape* ss = nullptr;
+        Object* base = obj;
+        while (base && base->SuperClassID() == GEN_DERIVOB_CLASS_ID)
+            base = ((IDerivedObject*)base)->GetObjRef();
+        if (base && base->ClassID() == splineShapeClassID)
+            ss = static_cast<SplineShape*>(base);
+        if (ss) {
             g_ctx = CTX_SPLINE;
-            g_splineForButtons = static_cast<SplineShape*>(walk);
+            g_splineForButtons = ss;
 
             // Spline op values — stored locally, applied via Begin/Move/End
             GroupHeader gh;
@@ -826,42 +734,6 @@ static void GatherParams() {
         if (gh.count > 0) g_groups.push_back(gh);
     }
 
-    // ── Collect pinned params not already in panel ──────────────
-    if (!g_pinned.empty() && node) {
-        // Build set of keys already collected
-        std::set<std::wstring> existing;
-        for (auto& ef : g_edits) existing.insert(ef.key);
-
-        GroupHeader pgh;
-        pgh.title    = L"\u2605 Pinned";
-        pgh.startIdx = (int)g_edits.size();
-
-        for (auto& key : g_pinned) {
-            if (existing.count(key)) continue;  // already shown
-            if (g_hidden.count(key)) continue;
-
-            IParamBlock2* pb = nullptr;
-            ParamID pid = 0;
-            ParamType2 ptype = (ParamType2)0;
-            if (FindParamByKey(node, key, pb, pid, ptype)) {
-                if (ptype & TYPE_TAB) continue;
-                if (!IsFloat(ptype) && !IsInt(ptype) && ptype != TYPE_BOOL) continue;
-
-                size_t sep = key.find(L':');
-                EditField ef;
-                ef.label = (sep != std::wstring::npos) ? key.substr(sep + 1) : key;
-                ef.key   = key;
-                ef.keyOrdinal = GetNextKeyOrdinal(key);
-                ef.pb    = pb;
-                ef.id    = pid;
-                ef.type  = ptype;
-                g_edits.push_back(ef);
-            }
-        }
-
-        pgh.count = (int)g_edits.size() - pgh.startIdx;
-        if (pgh.count > 0) g_groups.push_back(pgh);
-    }
 }
 
 
@@ -965,6 +837,7 @@ static void ApplyEdit(HWND h) {
                             ss->EndOutlineMove(t, TRUE);
                         } else if (idx == kSpWeld) {
                             ss->SetEndPointAutoWeldThreshold(g_splineVals[idx]);
+                            ss->DoVertWeld();
                         }
                         theHold.Accept(_T("Spline Op"));
                         ss->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
@@ -1002,7 +875,7 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         // If mouse is not over this edit, forward to panel for scrolling
         POINT mp; GetCursorPos(&mp);
         RECT er; GetWindowRect(h, &er);
-        if (!PtInRect(&er, mp)) return SendMessage(g_panel, msg, wp, lp);
+        if (!PtInRect(&er, mp)) { PostMessage(g_panel, msg, wp, lp); return 0; }
         if (!ef) break;
         // Spline op values — wheel adjusts local storage
         if (!ef->pb && g_ctx == CTX_SPLINE) {
@@ -1181,25 +1054,24 @@ static int BtnStripH(int count) { return 8 + count * (kBtnH + kBtnGap) - kBtnGap
 
 // Position button strips relative to the panel
 static void PositionBtnStrips() {
-    if (!g_panel || g_ctx == CTX_NONE || !g_open) {
+    if (!g_panel || !g_open || g_ctx == CTX_NONE || !g_showBtns) {
         if (g_btnLeft)  ShowWindow(g_btnLeft, SW_HIDE);
         if (g_btnRight) ShowWindow(g_btnRight, SW_HIDE);
         return;
     }
     RECT pr; GetWindowRect(g_panel, &pr);
-    int py = pr.top + 2 + kPad + kFontHdr + 4 + 1 + 4;  // align with content start
+    int py = pr.top + 2 + kPad + kFontHdr + 4 + 1 + 4;
+
+    int leftCount  = (g_ctx == CTX_EPOLY) ? 5 : 3;
+    int rightCount = 8;
+    int lh = BtnStripH(leftCount), rh = BtnStripH(rightCount);
 
     HDWP hdwp = BeginDeferWindowPos(2);
-    if (g_ctx == CTX_EPOLY) {
-        int lh = BtnStripH(5), rh = BtnStripH(8);
-        hdwp = DeferWindowPos(hdwp, g_btnLeft,  HWND_TOPMOST, pr.left - kBtnW - kSideGap, py, kBtnW, lh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        hdwp = DeferWindowPos(hdwp, g_btnRight, HWND_TOPMOST, pr.right + kSideGap, py, kBtnW, rh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    } else if (g_ctx == CTX_SPLINE) {
-        int lh = BtnStripH(3), rh = BtnStripH(8);
-        hdwp = DeferWindowPos(hdwp, g_btnLeft,  HWND_TOPMOST, pr.left - kBtnW - kSideGap, py, kBtnW, lh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        hdwp = DeferWindowPos(hdwp, g_btnRight, HWND_TOPMOST, pr.right + kSideGap, py, kBtnW, rh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    }
+    hdwp = DeferWindowPos(hdwp, g_btnLeft,  HWND_TOPMOST, pr.left - kBtnW - kSideGap, py, kBtnW, lh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    hdwp = DeferWindowPos(hdwp, g_btnRight, HWND_TOPMOST, pr.right + kSideGap, py, kBtnW, rh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     EndDeferWindowPos(hdwp);
+    InvalidateRect(g_btnLeft, nullptr, FALSE);
+    InvalidateRect(g_btnRight, nullptr, FALSE);
 }
 
 // ── Paint helper: draw a button row ─────────────────────────────
@@ -1292,10 +1164,10 @@ static void PaintPanel(HWND hwnd) {
             SelectObject(mem, g_font);
             for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++) {
                 auto& ef = g_edits[fi];
-                bool isPinned = g_pinned.count(ef.key) > 0;
-                if (isPinned) { SetTextColor(mem, kPinClr); TextOut(mem, x, y + 3, _T("\u2605"), 1); }
+                bool isFav = g_favorites.count(ef.key) > 0;
+                if (isFav) { SetTextColor(mem, kAccent); TextOut(mem, x, y + 3, _T("\u2605"), 1); }
                 SetTextColor(mem, kLabelClr);
-                TextOut(mem, x + (isPinned ? 16 : 8), y + 3, ef.label.c_str(), (int)ef.label.length());
+                TextOut(mem, x + (isFav ? 14 : 8), y + 3, ef.label.c_str(), (int)ef.label.length());
 
                 if (ef.hwnd) {
                     RECT er; GetWindowRect(ef.hwnd, &er);
@@ -1347,16 +1219,27 @@ static void DestroyEdits() {
 
 // ── Apply scroll offset to all edit controls ────────────────────
 static void ApplyScroll(int panelW) {
-    SendMessage(g_panel, WM_SETREDRAW, FALSE, 0);
     int editX = panelW - kPad - kEditW;
+    int count = 0;
+    for (auto& ef : g_edits) if (ef.hwnd) count++;
+    if (count == 0) return;
+
+    HDWP hdwp = BeginDeferWindowPos(count);
+    if (!hdwp) return;
     for (auto& ef : g_edits) {
         if (!ef.hwnd) continue;
         int screenY = ef.logY - g_scrollY;
         bool vis = (screenY + kEditH > g_contentStartY && screenY < g_contentStartY + g_viewH);
-        SetWindowPos(ef.hwnd, nullptr, editX, screenY + 1, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
-        ShowWindow(ef.hwnd, vis ? SW_SHOW : SW_HIDE);
+        if (vis) {
+            hdwp = DeferWindowPos(hdwp, ef.hwnd, nullptr, editX, screenY + 1, 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        } else {
+            hdwp = DeferWindowPos(hdwp, ef.hwnd, nullptr, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+        }
+        if (!hdwp) break;
     }
-    SendMessage(g_panel, WM_SETREDRAW, TRUE, 0);
+    if (hdwp) EndDeferWindowPos(hdwp);
 }
 
 static void BuildLayout() {
@@ -1385,6 +1268,7 @@ static void BuildLayout() {
     if (contentW < maxTitle) contentW = maxTitle;
     int panelW = contentW + kPad * 2 + 8;
     if (panelW < kMinW) panelW = kMinW;
+    if (panelW > 500) panelW = 500;  // cap to prevent layout breakage
     int editX = panelW - kPad - kEditW;
 
     g_closeRect = { panelW - kPad - 18, kPad, panelW - kPad, kPad + 18 };
@@ -1614,6 +1498,160 @@ static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
+// ── Favorites strip ─────────────────────────────────────────────
+static void DestroyFavEdits() {
+    for (auto& ef : g_favEdits)
+        if (ef.hwnd) { DestroyWindow(ef.hwnd); ef.hwnd = nullptr; }
+    g_favEdits.clear();
+}
+
+static const int kFavLabelH = 11;  // tiny label height
+static const int kFavRowH  = kFavLabelH + kEditH + 2;  // label + edit + gap
+
+static void BuildFavorites() {
+    DestroyFavEdits();
+    if (g_favorites.empty() || !g_favWnd) return;
+
+    Interface* ip = GetCOREInterface();
+    if (!ip || ip->GetSelNodeCount() == 0) return;
+    INode* node = ip->GetSelNode(0);
+    if (!node) return;
+
+    // First pass: collect valid favorites into the vector (no HWND yet)
+    for (auto& key : g_favorites) {
+        if ((int)g_favEdits.size() >= kFavMaxParams) break;
+        IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 ptype = (ParamType2)0;
+        if (!FindParam(node, key, pb, pid, ptype)) continue;
+        if (ptype & TYPE_TAB) continue;
+        if (!IsFloat(ptype) && !IsInt(ptype) && ptype != TYPE_BOOL) continue;
+
+        size_t sep = key.find(L':');
+        EditField ef;
+        ef.label = (sep != std::wstring::npos) ? key.substr(sep + 1) : key;
+        ef.key = key;
+        ef.pb = pb;
+        ef.id = pid;
+        ef.type = ptype;
+        ef.hwnd = nullptr;
+        g_favEdits.push_back(std::move(ef));
+    }
+
+    // Second pass: create edit controls (vector is stable now)
+    for (int i = 0; i < (int)g_favEdits.size(); i++) {
+        auto& ef = g_favEdits[i];
+        int y = 4 + i * kFavRowH + kFavLabelH;
+        DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_CENTER;
+        if (ef.type == TYPE_BOOL) style |= ES_READONLY;
+        ef.hwnd = CreateWindowEx(0, _T("EDIT"), _T(""),
+            style, 4, y, kEditW, kEditH, g_favWnd, nullptr, hInstance, nullptr);
+        SendMessage(ef.hwnd, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
+        if (!g_origEdit) g_origEdit = (WNDPROC)GetWindowLongPtr(ef.hwnd, GWLP_WNDPROC);
+        SetWindowLongPtr(ef.hwnd, GWLP_WNDPROC, (LONG_PTR)EditProc);
+        SetProp(ef.hwnd, _T("WF"), (HANDLE)&ef);
+    }
+
+    // Refresh values
+    TimeValue t = ip->GetTime();
+    for (auto& ef : g_favEdits) {
+        if (!ef.hwnd || !ef.pb) continue;
+        TCHAR buf[64]; FormatValue(ef, t, buf, 64);
+        SetWindowText(ef.hwnd, buf);
+    }
+}
+
+static void RefreshFavEdits() {
+    Interface* ip = GetCOREInterface();
+    if (!ip) return;
+    TimeValue t = ip->GetTime();
+    HWND focused = GetFocus();
+    for (auto& ef : g_favEdits) {
+        if (!ef.hwnd || !ef.pb) continue;
+        if (ef.hwnd == focused) continue;
+        TCHAR buf[64]; FormatValue(ef, t, buf, 64);
+        TCHAR old[64]; GetWindowText(ef.hwnd, old, 64);
+        if (_tcscmp(old, buf) != 0) SetWindowText(ef.hwnd, buf);
+    }
+}
+
+static void PositionFavStrip() {
+    if (!g_favWnd || g_favEdits.empty()) {
+        if (g_favWnd) ShowWindow(g_favWnd, SW_HIDE);
+        return;
+    }
+    if (!g_open) { ShowWindow(g_favWnd, SW_HIDE); return; }
+
+    RECT pr; GetWindowRect(g_panel, &pr);
+    int h = 8 + (int)g_favEdits.size() * kFavRowH;
+    int w = kEditW + 8;
+    SetWindowPos(g_favWnd, HWND_TOPMOST,
+        pr.left + (pr.right - pr.left) / 2 - w / 2, pr.bottom + kSideGap,
+        w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+static HFONT g_fontTiny = nullptr;
+
+static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+
+        HDC mem = CreateCompatibleDC(hdc);
+        HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
+
+        // Background
+        HBRUSH b = CreateSolidBrush(kBg); FillRect(mem, &rc, b); DeleteObject(b);
+        HPEN p = CreatePen(PS_SOLID, 1, kBorder);
+        HPEN op2 = (HPEN)SelectObject(mem, p);
+        SelectObject(mem, GetStockObject(NULL_BRUSH));
+        RoundRect(mem, 0, 0, rc.right, rc.bottom, 6, 6);
+        SelectObject(mem, op2); DeleteObject(p);
+
+        // Tiny labels
+        if (!g_fontTiny)
+            g_fontTiny = CreateFont(-9, 0,0,0, FW_NORMAL, 0,0,0, DEFAULT_CHARSET,
+                0,0, CLEARTYPE_QUALITY, 0, _T("Segoe UI"));
+        SetBkMode(mem, TRANSPARENT);
+        SelectObject(mem, g_fontTiny);
+        SetTextColor(mem, kAccent);
+        for (int i = 0; i < (int)g_favEdits.size(); i++) {
+            int y = 4 + i * kFavRowH;
+            RECT lr = { 5, y, rc.right - 2, y + kFavLabelH };
+            DrawText(mem, g_favEdits[i].label.c_str(), -1, &lr,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, oldBmp); DeleteObject(bmp); DeleteDC(mem);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND: return 1;
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wp;
+        HWND eh = (HWND)lp;
+        SetTextColor(hdc, kValueClr);
+        if (GetFocus() == eh) { SetBkColor(hdc, kEditFocus); return (LRESULT)g_brEditFoc; }
+        SetBkColor(hdc, kEditBg);
+        return (LRESULT)g_brEdit;
+    }
+    case WM_COMMAND:
+        if (HIWORD(wp) == EN_SETFOCUS) DisableAccelerators();
+        if (HIWORD(wp) == EN_KILLFOCUS) {
+            if (g_open) ApplyEdit((HWND)lp);
+            EnableAccelerators();
+        }
+        break;
+    case WM_TIMER:
+        RefreshFavEdits();
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
 // ── Window proc ─────────────────────────────────────────────────
 static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -1625,8 +1663,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_WINDOWPOSCHANGED: {
-        if (g_open) PositionBtnStrips();
-        break; // Let DefWindowProc handle the rest
+        if (g_open) { PositionBtnStrips(); PositionFavStrip(); }
+        break;
     }
 
     case WM_NCHITTEST: {
@@ -1642,6 +1680,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT wr; GetWindowRect(hwnd, &wr); int pw = wr.right - wr.left;
 
         if (PtInRect(&g_closeRect, pt)) { ClosePanel(); return 0; }
+
+        // Middle area of header = toggle side buttons
+        // (We catch this in LBUTTONDOWN with Shift held)
 
         // Ctrl+click on param = hide it
         if (GetKeyState(VK_CONTROL) & 0x8000) {
@@ -1745,13 +1786,24 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
 
+    case WM_MBUTTONDOWN: {
+        // Middle-click = toggle side button strips
+        g_showBtns = !g_showBtns;
+        PositionBtnStrips();
+        return 0;
+    }
+
     case WM_RBUTTONDOWN: {
-        // Right-click = clear ALL hidden params, re-gather everything
-        if (!g_hidden.empty()) {
-            g_hidden.clear();
+        // Right-click on param → toggle favorite
+        int idx = FindParamAtCursor();
+        if (idx >= 0 && idx < (int)g_edits.size()) {
+            const std::wstring& key = g_edits[idx].key;
+            if (g_favorites.count(key)) g_favorites.erase(key);
+            else g_favorites.insert(key);
             SaveSettings();
-            GatherParams();
-            BuildLayout();
+            BuildFavorites();
+            PositionFavStrip();
+            InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
     }
@@ -1801,7 +1853,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_scrollY > maxScroll) g_scrollY = maxScroll;
         RECT wr; GetWindowRect(hwnd, &wr);
         ApplyScroll(wr.right - wr.left);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        // Synchronous repaint — background and edits update in one frame
+        RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
         return 0;
     }
 
@@ -1820,22 +1873,6 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PP_MODSTACK:
         ModStack::Toggle(); return 0;
 
-    case WM_PP_ADDPARAM: {
-        // Suppress close during detection (HWND_BOTTOM causes WA_INACTIVE)
-        g_suppressClose = true;
-        SetWindowPos(g_panel, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-        std::wstring key = DetectSpinnerKey();
-        SetWindowPos(g_panel, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-        g_suppressClose = false;
-
-        if (!key.empty() && !g_pinned.count(key)) {
-            g_pinned.insert(key);
-            SaveSettings();
-            GatherParams();
-            BuildLayout();
-        }
-        return 0;
-    }
     }
     return DefWindowProc(hwnd, msg, wp, lp);
 }
@@ -1914,14 +1951,21 @@ static void OpenPanel() {
     // Don't clamp bottom here — BuildLayout handles max height + scroll
     g_panelPos = { ox, oy };
     g_freshOpen = true;
+    g_open = true;
 
     BuildLayout();
     ShowWindow(g_panel, SW_SHOWNA);
+    PositionBtnStrips();
     SetTimer(g_panel, 1, kRefreshMs, nullptr);
 
     // Focus first visible edit
     for (auto& ef : g_edits) { if (ef.hwnd) { SetFocus(ef.hwnd); break; } }
-    g_open = true;
+
+    // Build and show favorites strip
+    BuildFavorites();
+    PositionFavStrip();
+    if (g_favWnd && !g_favEdits.empty())
+        SetTimer(g_favWnd, 1, kRefreshMs, nullptr);
 }
 
 static void ClosePanel() {
@@ -1941,6 +1985,7 @@ static void ClosePanel() {
     ShowWindow(g_panel, SW_HIDE);
     if (g_btnLeft)  ShowWindow(g_btnLeft, SW_HIDE);
     if (g_btnRight) ShowWindow(g_btnRight, SW_HIDE);
+    if (g_favWnd)   { KillTimer(g_favWnd, 1); DestroyFavEdits(); ShowWindow(g_favWnd, SW_HIDE); }
     if (g_toolTip) ShowWindow(g_toolTip, SW_HIDE);
     g_open = false;
     g_hoverClose = false;
@@ -2022,6 +2067,17 @@ public:
         g_btnRight = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
             kBtnStripClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
 
+        // Favorites strip window
+        WNDCLASSEX wcF = {};
+        wcF.cbSize = sizeof(wcF);
+        wcF.lpfnWndProc = FavStripProc;
+        wcF.hInstance = hInstance;
+        wcF.lpszClassName = kFavClass;
+        wcF.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        RegisterClassEx(&wcF);
+        g_favWnd = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
+            kFavClass, nullptr, WS_POPUP | WS_CLIPCHILDREN, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
+
         // Tool name tooltip window
         WNDCLASSEX wc2 = {};
         wc2.cbSize = sizeof(wc2);
@@ -2050,6 +2106,7 @@ public:
         ClosePanel();
         if (g_btnLeft)  { DestroyWindow(g_btnLeft);  g_btnLeft = nullptr; }
         if (g_btnRight) { DestroyWindow(g_btnRight); g_btnRight = nullptr; }
+        if (g_favWnd)   { DestroyFavEdits(); DestroyWindow(g_favWnd); g_favWnd = nullptr; }
         if (g_toolTip)  { DestroyWindow(g_toolTip); g_toolTip = nullptr; }
         if (g_panel)    { DestroyWindow(g_panel);  g_panel = nullptr; }
         if (g_font)     { DeleteObject(g_font);     g_font = nullptr; }
