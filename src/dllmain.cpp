@@ -712,21 +712,29 @@ static void GatherParams() {
                         }
                         gh.count = (int)g_edits.size() - gh.startIdx;
                         if (gh.count > 0) {
-                            g_epolyOp = opFromMode;
-                            g_epolyFP = fp;
-
-                            // Kill interactive mouse, take over with our preview
+                            // Kill interactive mouse
                             FPValue d;
+                            int putBefore = theHold.GetGlobalPutCount();
                             fp->Invoke(epfn_exit_command_modes, d);
                             fp->Invoke(epfn_close_popup_dialog, d);
-                            FPParams beginPrms(1, TYPE_ENUM, opFromMode);
-                            fp->Invoke(epfn_preview_begin, d, &beginPrms);
-                            FPParams dragPrms(1, TYPE_BOOL, TRUE);
-                            fp->Invoke(epfn_preview_set_dragging, d, &dragPrms);
-                            fp->Invoke(epfn_preview_invalidate, d);
-                            g_epolyPreview = true;
+                            int putAfter = theHold.GetGlobalPutCount();
 
-                            g_groups.push_back(gh);
+                            // Chamfer doesn't change putCount during interactive mode
+                            bool isChamfer = (modeVal.i == epmode_chamfer_edge ||
+                                              modeVal.i == epmode_chamfer_vertex);
+                            bool hadPendingOp = (putBefore != putAfter) || isChamfer;
+
+                            if (hadPendingOp) {
+                                g_epolyOp = opFromMode;
+                                g_epolyFP = fp;
+                                FPParams beginPrms(1, TYPE_ENUM, opFromMode);
+                                fp->Invoke(epfn_preview_begin, d, &beginPrms);
+                                FPParams dragPrms(1, TYPE_BOOL, TRUE);
+                                fp->Invoke(epfn_preview_set_dragging, d, &dragPrms);
+                                fp->Invoke(epfn_preview_invalidate, d);
+                                g_epolyPreview = true;
+                                g_groups.push_back(gh);
+                            }
                         }
                     }
                 }
@@ -2059,6 +2067,12 @@ static void OpenPanel() {
 static void ClosePanel() {
     if (!g_open) return;
     EPolyAccept();  // commit the takeover preview
+    // Exit command mode so tool doesn't stay idle (prevents duplication on reopen)
+    if (g_epolyFP) {
+        FPValue d;
+        g_epolyFP->Invoke(epfn_exit_command_modes, d);
+        g_epolyFP->Invoke(epfn_close_popup_dialog, d);
+    }
     g_epolyOp = -1;
     g_epolyFP = nullptr;
     g_epolyPreview = false;
