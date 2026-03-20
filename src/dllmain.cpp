@@ -108,7 +108,7 @@ static const FallbackOpParam* LookupFallbackParams(int op, int selLevel, int& co
 
 // ── Data ────────────────────────────────────────────────────────
 struct EditField {
-    HWND         hwnd = nullptr;
+    HWND         hwnd = nullptr;   // only used by favorites strip
     std::wstring label;
     std::wstring key;
     int          keyOrdinal = 0;
@@ -135,6 +135,9 @@ static HFONT    g_fontBold   = nullptr;
 static HBRUSH   g_brEdit     = nullptr;
 static HBRUSH   g_brEditFoc  = nullptr;
 static WNDPROC  g_origEdit   = nullptr;
+static int      g_hoverParam = -1;    // param index under cursor
+static int      g_editParam  = -1;    // param being edited (-1 = none)
+static HWND     g_editHwnd   = nullptr; // single active edit control
 static HHOOK    g_mouseHook  = nullptr;
 static bool     g_open       = false;
 static bool     g_hoverClose = false;
@@ -288,8 +291,9 @@ static const UINT WM_PP_MODSTACK = WM_USER + 105;
 // ── Forward declarations ────────────────────────────────────────
 static void TogglePanel();
 static void ClosePanel();
-static void RefreshEdits(bool forceAll = false);
-static void ApplyEdit(HWND h);
+static void KillActiveEdit(bool apply);
+static void SpawnEditAt(int paramIdx);
+static int  FindParamAtY(int clickY);
 static void BuildLayout();
 
 // ── Mouse hook — XButton2=panel, XButton1=pin ───────────────────
@@ -508,9 +512,7 @@ static void RemoveOpGroup() {
     if (!g_groups.empty()) {
         int cnt = g_groups[0].count;
         int start = g_groups[0].startIdx;
-        for (int i = start; i < start + cnt; i++) {
-            if (g_edits[i].hwnd) { RemoveProp(g_edits[i].hwnd, _T("WF")); DestroyWindow(g_edits[i].hwnd); }
-        }
+        KillActiveEdit(false);
         g_edits.erase(g_edits.begin() + start, g_edits.begin() + start + cnt);
         g_groups.erase(g_groups.begin());
         for (auto& gh : g_groups) gh.startIdx -= cnt;
@@ -740,33 +742,6 @@ static void FormatValue(const EditField& ef, TimeValue t, TCHAR* buf, int len) {
     else                       swprintf(buf, len, _T("%d"), ef.pb->GetInt(ef.id, t));
 }
 
-static void RefreshEdits(bool forceAll) {
-    Interface* ip = GetCOREInterface();
-    if (!ip) return;
-    if (ip->GetSelNodeCount() == 0) { ClosePanel(); return; }
-    INode* node = ip->GetSelNode(0);
-    if (!node) { ClosePanel(); return; }
-    const MCHAR* nn = node ? node->GetName() : nullptr;
-    std::wstring cur = nn ? nn : L"";
-    ULONG handle = node->GetHandle();
-
-    // Hard-close when context changes.
-    if (handle != g_nodeHandle || cur != g_nodeName) { ClosePanel(); return; }
-
-    TimeValue t = ip->GetTime();
-    HWND focused = GetFocus();
-    for (auto& ef : g_edits) {
-        if (!ef.hwnd) continue;
-        if (!ef.pb && g_ctx != CTX_SPLINE) continue;
-        if (!forceAll && ef.hwnd == focused) continue;
-        TCHAR buf[64];
-        FormatValue(ef, t, buf, 64);
-        TCHAR old[64];
-        GetWindowText(ef.hwnd, old, 64);
-        if (_tcscmp(old, buf) != 0)
-            SetWindowText(ef.hwnd, buf);
-    }
-}
 
 static void NotifyParamChanged() {
     Interface* ip = GetCOREInterface();
@@ -778,154 +753,37 @@ static void NotifyParamChanged() {
     ip->RedrawViews(ip->GetTime());
 }
 
-static void ApplyEdit(HWND h) {
-    Interface* ip = GetCOREInterface();
-    if (!ip) return;
-    if (ip->GetSelNodeCount() == 0) return;
-    INode* node = ip->GetSelNode(0);
-    if (!node) return;
-    TimeValue t = ip->GetTime();
-    for (auto& ef : g_edits) {
-        if (ef.hwnd != h) continue;
-        TCHAR txt[256];
-        GetWindowText(h, txt, 256);
-
-        // Spline op values — write to local storage + apply
-        if (!ef.pb && g_ctx == CTX_SPLINE) {
-            int idx = (int)ef.id;
-            if (idx >= 0 && idx < kSpCount) {
-                g_splineVals[idx] = (float)_wtof(txt);
-                // Punch-in: apply the value via Begin/Move/End
-                if (g_splineVals[idx] != 0.0f) {
-                    // Re-acquire SplineShape fresh
-                    SplineShape* ss = nullptr;
-                    INode* nd = ip->GetSelNode(0);
-                    Object* walk = nd ? nd->GetObjectRef() : nullptr;
-                    while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID)
-                        walk = ((IDerivedObject*)walk)->GetObjRef();
-                    if (walk && walk->ClassID() == splineShapeClassID)
-                        ss = static_cast<SplineShape*>(walk);
-                    if (ss) {
-                        // Fillet/Chamfer need FCLimit computed from selection
-                        if (idx == kSpFillet || idx == kSpChamfer)
-                            ss->SetFCLimit();
-                        theHold.Begin();
-                        if (idx == kSpFillet) {
-                            ss->BeginFilletMove(t);
-                            ss->FilletMove(t, g_splineVals[idx]);
-                            ss->EndFilletMove(t, TRUE);
-                        } else if (idx == kSpChamfer) {
-                            ss->BeginChamferMove(t);
-                            ss->ChamferMove(t, g_splineVals[idx]);
-                            ss->EndChamferMove(t, TRUE);
-                        } else if (idx == kSpOutline) {
-                            ss->BeginOutlineMove(t);
-                            ss->OutlineMove(t, g_splineVals[idx]);
-                            ss->EndOutlineMove(t, TRUE);
-                        } else if (idx == kSpWeld) {
-                            ss->SetEndPointAutoWeldThreshold(g_splineVals[idx]);
-                            ss->DoVertWeld();
-                        }
-                        theHold.Accept(_T("Spline Op"));
-                        ss->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
-                        ip->RedrawViews(t);
-                    }
-                }
-            }
-            break;
-        }
-        if (!ef.pb) return;
-        theHold.Suspend();
-        if (IsFloat(ef.type))       ef.pb->SetValue(ef.id, t, (float)_wtof(txt));
-        else if (ef.type==TYPE_BOOL) ef.pb->SetValue(ef.id, t, (_wcsicmp(txt,_T("On"))==0||_wtoi(txt)!=0)?1:0);
-        else                        ef.pb->SetValue(ef.id, t, _wtoi(txt));
-        theHold.Resume();
-        if (g_epolyPreview) EPolyRefresh();
-        else                NotifyParamChanged();
-        break;
-    }
-}
-
-// ── Edit subclass ───────────────────────────────────────────────
+// ── Edit subclass (for the single active edit) ──────────────────
 static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    EditField* ef = (EditField*)GetProp(h, _T("WF"));
     switch (msg) {
     case WM_KEYDOWN:
-        if (wp == VK_RETURN)  { ApplyEdit(h); RefreshEdits(true); return 0; }
-        if (wp == VK_ESCAPE)  { EPolyCancel(); ClosePanel(); return 0; }
-        if (wp == VK_TAB)     { SetFocus(GetNextDlgTabItem(g_panel, h, GetKeyState(VK_SHIFT)<0)); return 0; }
+        if (wp == VK_RETURN) {
+            KillActiveEdit(true);  // apply + destroy
+            InvalidateRect(g_panel, nullptr, FALSE);
+            return 0;
+        }
+        if (wp == VK_ESCAPE) {
+            KillActiveEdit(false); // discard
+            InvalidateRect(g_panel, nullptr, FALSE);
+            return 0;
+        }
+        if (wp == VK_TAB) {
+            // Move to next/prev param
+            int dir = (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1;
+            int next = g_editParam + dir;
+            if (next >= 0 && next < (int)g_edits.size()) {
+                KillActiveEdit(true);
+                SpawnEditAt(next);
+            }
+            return 0;
+        }
         break;
     case WM_CHAR:
         if (wp == VK_RETURN || wp == VK_ESCAPE) return 0;
         break;
-    case WM_MOUSEWHEEL: {
-        // If mouse is not over this edit, forward to panel for scrolling
-        POINT mp; GetCursorPos(&mp);
-        RECT er; GetWindowRect(h, &er);
-        if (!PtInRect(&er, mp)) { PostMessage(g_panel, msg, wp, lp); return 0; }
-        if (!ef) break;
-        // Spline op values — wheel adjusts local storage
-        if (!ef->pb && g_ctx == CTX_SPLINE) {
-            int idx = (int)ef->id;
-            if (idx >= 0 && idx < kSpCount) {
-                float step = (float)GET_WHEEL_DELTA_WPARAM(wp) / 120.0f;
-                bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-                bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-                float a = g_splineVals[idx] < 0 ? -g_splineVals[idx] : g_splineVals[idx];
-                float sc = a>100.f?10.f:a>10.f?1.f:a>1.f?0.1f:0.01f;
-                if (shift) sc *= 10.0f;
-                if (ctrl)  sc *= 0.1f;
-                g_splineVals[idx] += step * sc;
-                RefreshEdits(true);
-            }
-            return 0;
-        }
-        if (!ef->pb) break;
-        Interface* ip = GetCOREInterface();
-        if (!ip) break;
-        TimeValue t = ip->GetTime();
-        float step = (float)GET_WHEEL_DELTA_WPARAM(wp) / 120.0f;
-        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-        bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        theHold.Suspend();
-        if (IsFloat(ef->type)) {
-            float cur = ef->pb->GetFloat(ef->id, t);
-            float a = cur<0?-cur:cur;
-            float sc = a>100.f?10.f:a>10.f?1.f:a>1.f?0.1f:0.01f;
-            if (shift) sc *= 10.0f;
-            if (ctrl)  sc *= 0.1f;
-            ef->pb->SetValue(ef->id, t, cur + step * sc);
-        } else if (ef->type == TYPE_BOOL) {
-            ef->pb->SetValue(ef->id, t, ef->pb->GetInt(ef->id, t) ? 0 : 1);
-        } else {
-            int cur = ef->pb->GetInt(ef->id, t);
-            int s = (int)step;
-            if (shift) s *= 10;
-            if (ctrl && s != 0) s = s>0?1:-1;
-            if (s == 0) s = step>0?1:-1;
-            ef->pb->SetValue(ef->id, t, cur + s);
-        }
-        theHold.Resume();
-        if (g_epolyPreview) EPolyRefresh();
-        else                NotifyParamChanged();
-        RefreshEdits(true);
+    case WM_MOUSEWHEEL:
+        PostMessage(g_panel, msg, wp, lp);
         return 0;
-    }
-    case WM_LBUTTONDOWN:
-        if (ef && ef->type == TYPE_BOOL && ef->pb) {
-            Interface* ip = GetCOREInterface();
-            if (!ip) break;
-            TimeValue t = ip->GetTime();
-            if (g_epolyOp >= 0 && !g_epolyPreview) EPolyBegin();
-            theHold.Suspend();
-            ef->pb->SetValue(ef->id, t, ef->pb->GetInt(ef->id, t) ? 0 : 1);
-            theHold.Resume();
-            if (g_epolyPreview) EPolyRefresh();
-            else                NotifyParamChanged();
-            RefreshEdits(true);
-            return 0;
-        }
-        break;
     }
     return CallWindowProc(g_origEdit, h, msg, wp, lp);
 }
@@ -1148,20 +1006,34 @@ static void PaintPanel(HWND hwnd) {
         y += kLineH;
 
         if (!collapsed) {
-            SelectObject(mem, g_font);
+            Interface* ipv = GetCOREInterface();
+            TimeValue tv = ipv ? ipv->GetTime() : 0;
+            int editX = rEdge - kEditW;
             for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++) {
                 auto& ef = g_edits[fi];
                 bool isFav = g_favorites.count(ef.key) > 0;
+                bool isHover = (fi == g_hoverParam);
+                bool isEditing = (fi == g_editParam && g_editHwnd);
+
+                // Label
+                SelectObject(mem, g_font);
                 if (isFav) { SetTextColor(mem, kAccent); TextOut(mem, x, y + 3, _T("\u2605"), 1); }
                 SetTextColor(mem, kLabelClr);
                 TextOut(mem, x + (isFav ? 14 : 8), y + 3, ef.label.c_str(), (int)ef.label.length());
 
-                if (ef.hwnd) {
-                    RECT er; GetWindowRect(ef.hwnd, &er);
-                    MapWindowPoints(HWND_DESKTOP, hwnd, (LPPOINT)&er, 2);
-                    InflateRect(&er, 1, 1);
-                    SelectObject(mem, (focused == ef.hwnd) ? penAccent : penBorder);
-                    Rectangle(mem, er.left, er.top, er.right, er.bottom);
+                // Value box (painted, not a child window)
+                RECT vr = { editX, y + 1, rEdge, y + kEditH + 1 };
+                COLORREF vbg = isEditing ? kEditFocus : isHover ? kEditFocus : kEditBg;
+                HBRUSH vb = CreateSolidBrush(vbg); FillRect(mem, &vr, vb); DeleteObject(vb);
+                SelectObject(mem, isHover || isEditing ? penAccent : penBorder);
+                Rectangle(mem, vr.left - 1, vr.top - 1, vr.right + 1, vr.bottom + 1);
+
+                // Draw value text (skip if active edit control is on top)
+                if (!isEditing) {
+                    TCHAR buf[64]; FormatValue(ef, tv, buf, 64);
+                    SelectObject(mem, g_fontBold);
+                    SetTextColor(mem, kValueClr);
+                    DrawText(mem, buf, -1, &vr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 }
                 y += kLineH;
             }
@@ -1198,40 +1070,102 @@ static void PaintPanel(HWND hwnd) {
 }
 
 // ── Build / Rebuild layout ──────────────────────────────────────
-static void DestroyEdits() {
-    for (auto& ef : g_edits) {
-        if (ef.hwnd) { RemoveProp(ef.hwnd, _T("WF")); DestroyWindow(ef.hwnd); ef.hwnd = nullptr; }
+// ── Single active edit control ───────────────────────────────────
+static void KillActiveEdit(bool apply) {
+    if (!g_editHwnd) return;
+    if (apply && g_editParam >= 0 && g_editParam < (int)g_edits.size()) {
+        TCHAR txt[256]; GetWindowText(g_editHwnd, txt, 256);
+        auto& ef = g_edits[g_editParam];
+        // Spline op values
+        if (!ef.pb && g_ctx == CTX_SPLINE) {
+            int idx = (int)ef.id;
+            if (idx >= 0 && idx < kSpCount) {
+                g_splineVals[idx] = (float)_wtof(txt);
+                // Apply fillet/chamfer/outline
+                Interface* ip = GetCOREInterface();
+                if (ip && g_splineVals[idx] != 0.0f) {
+                    SplineShape* ss = nullptr;
+                    INode* nd = ip->GetSelNode(0);
+                    Object* walk = nd ? nd->GetObjectRef() : nullptr;
+                    while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID)
+                        walk = ((IDerivedObject*)walk)->GetObjRef();
+                    if (walk && walk->ClassID() == splineShapeClassID)
+                        ss = static_cast<SplineShape*>(walk);
+                    if (ss) {
+                        TimeValue t = ip->GetTime();
+                        if (idx == kSpFillet || idx == kSpChamfer) ss->SetFCLimit();
+                        theHold.Begin();
+                        if (idx == kSpFillet)       { ss->BeginFilletMove(t); ss->FilletMove(t, g_splineVals[idx]); ss->EndFilletMove(t, TRUE); }
+                        else if (idx == kSpChamfer) { ss->BeginChamferMove(t); ss->ChamferMove(t, g_splineVals[idx]); ss->EndChamferMove(t, TRUE); }
+                        else if (idx == kSpOutline) { ss->BeginOutlineMove(t); ss->OutlineMove(t, g_splineVals[idx]); ss->EndOutlineMove(t, TRUE); }
+                        else if (idx == kSpWeld)    { ss->SetEndPointAutoWeldThreshold(g_splineVals[idx]); ss->DoVertWeld(); }
+                        theHold.Accept(_T("Spline Op"));
+                        ss->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
+                        ip->RedrawViews(t);
+                    }
+                }
+            }
+        } else if (ef.pb) {
+            Interface* ip = GetCOREInterface();
+            TimeValue t = ip ? ip->GetTime() : 0;
+            theHold.Suspend();
+            if (IsFloat(ef.type))       ef.pb->SetValue(ef.id, t, (float)_wtof(txt));
+            else if (ef.type==TYPE_BOOL) ef.pb->SetValue(ef.id, t, (_wcsicmp(txt,_T("On"))==0||_wtoi(txt)!=0)?1:0);
+            else                        ef.pb->SetValue(ef.id, t, _wtoi(txt));
+            theHold.Resume();
+            if (g_epolyPreview) EPolyRefresh();
+            else                NotifyParamChanged();
+        }
     }
+    DestroyWindow(g_editHwnd);
+    g_editHwnd = nullptr;
+    g_editParam = -1;
+    EnableAccelerators();
 }
 
-// ── Apply scroll offset to all edit controls ────────────────────
-static void ApplyScroll(int panelW) {
-    int editX = panelW - kPad - kEditW;
-    int count = 0;
-    for (auto& ef : g_edits) if (ef.hwnd) count++;
-    if (count == 0) return;
+static void SpawnEditAt(int paramIdx) {
+    KillActiveEdit(true);
+    if (paramIdx < 0 || paramIdx >= (int)g_edits.size()) return;
+    auto& ef = g_edits[paramIdx];
 
-    HDWP hdwp = BeginDeferWindowPos(count);
-    if (!hdwp) return;
-    for (auto& ef : g_edits) {
-        if (!ef.hwnd) continue;
-        int screenY = ef.logY - g_scrollY;
-        bool vis = (screenY + kEditH > g_contentStartY && screenY < g_contentStartY + g_viewH);
-        if (vis) {
-            hdwp = DeferWindowPos(hdwp, ef.hwnd, nullptr, editX, screenY + 1, 0, 0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        } else {
-            hdwp = DeferWindowPos(hdwp, ef.hwnd, nullptr, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW);
-        }
-        if (!hdwp) break;
+    RECT wr; GetWindowRect(g_panel, &wr);
+    int panelW = wr.right - wr.left;
+    int editX = panelW - kPad - kEditW;
+    int screenY = ef.logY - g_scrollY;
+    if (screenY + kEditH <= g_contentStartY || screenY >= g_contentStartY + g_viewH) return;
+
+    DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_CENTER;
+    if (ef.type == TYPE_BOOL) style |= ES_READONLY;
+    g_editHwnd = CreateWindowEx(0, _T("EDIT"), _T(""),
+        style, editX, screenY + 1, kEditW, kEditH,
+        g_panel, nullptr, hInstance, nullptr);
+    SendMessage(g_editHwnd, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
+    if (!g_origEdit) g_origEdit = (WNDPROC)GetWindowLongPtr(g_editHwnd, GWLP_WNDPROC);
+    SetWindowLongPtr(g_editHwnd, GWLP_WNDPROC, (LONG_PTR)EditProc);
+    SetProp(g_editHwnd, _T("WF"), (HANDLE)&ef);
+    g_editParam = paramIdx;
+
+    // Fill with current value
+    Interface* ip = GetCOREInterface();
+    TimeValue t = ip ? ip->GetTime() : 0;
+    TCHAR buf[64]; FormatValue(ef, t, buf, 64);
+    SetWindowText(g_editHwnd, buf);
+    SetFocus(g_editHwnd);
+    SendMessage(g_editHwnd, EM_SETSEL, 0, -1);
+    DisableAccelerators();
+}
+
+// Find which param index is at a screen Y coordinate
+static int FindParamAtY(int clickY) {
+    for (size_t i = 0; i < g_edits.size(); i++) {
+        int screenY = g_edits[i].logY - g_scrollY;
+        if (clickY >= screenY && clickY < screenY + kLineH) return (int)i;
     }
-    if (hdwp) EndDeferWindowPos(hdwp);
+    return -1;
 }
 
 static void BuildLayout() {
     SendMessage(g_panel, WM_SETREDRAW, FALSE, 0);
-    DestroyEdits();
 
     HDC hdc = GetDC(g_panel);
     SelectObject(hdc, g_font);
@@ -1298,29 +1232,10 @@ static void BuildLayout() {
     if (g_scrollY > maxScroll) g_scrollY = maxScroll;
     if (g_scrollY < 0) g_scrollY = 0;
 
-    // Create edit controls at scrolled positions
-    for (size_t gi = 0; gi < g_groups.size(); gi++) {
-        auto& gh = g_groups[gi];
-        bool collapsed = g_collapsed.count(gh.title) > 0;
-        if (collapsed) continue;
-        for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++) {
-            auto& ef = g_edits[fi];
-            int screenY = ef.logY - g_scrollY;
-            bool vis = (screenY + kEditH > g_contentStartY && screenY < g_contentStartY + g_viewH);
-
-            DWORD style = WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL | ES_CENTER;
-            if (vis) style |= WS_VISIBLE;
-            if (ef.type == TYPE_BOOL) style |= ES_READONLY;
-
-            ef.hwnd = CreateWindowEx(0, _T("EDIT"), _T(""),
-                style, editX, screenY + 1, kEditW, kEditH,
-                g_panel, nullptr, hInstance, nullptr);
-            SendMessage(ef.hwnd, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
-            if (!g_origEdit) g_origEdit = (WNDPROC)GetWindowLongPtr(ef.hwnd, GWLP_WNDPROC);
-            SetWindowLongPtr(ef.hwnd, GWLP_WNDPROC, (LONG_PTR)EditProc);
-            SetProp(ef.hwnd, _T("WF"), (HANDLE)&ef);
-        }
-    }
+    // No child EDIT windows — values are painted in PaintPanel.
+    // A single EDIT spawns on click via SpawnEditAt().
+    KillActiveEdit(false);
+    g_hoverParam = -1;
 
     // Keep current position if panel was dragged (but not on fresh open)
     if (!g_freshOpen) {
@@ -1329,10 +1244,9 @@ static void BuildLayout() {
     }
     g_freshOpen = false;
 
-    RefreshEdits(true);
     SetWindowPos(g_panel, HWND_TOPMOST, g_panelPos.x, g_panelPos.y, panelW, panelH, SWP_NOACTIVATE);
     SendMessage(g_panel, WM_SETREDRAW, TRUE, 0);
-    RedrawWindow(g_panel, nullptr, nullptr, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN);
+    InvalidateRect(g_panel, nullptr, FALSE);
     PositionBtnStrips();
 }
 
@@ -1350,18 +1264,6 @@ static int HitBtnRow(const BtnDef* btns, int count, int rowY, int panelW, POINT 
 
 
 // ── Find which param the mouse is over ──────────────────────────
-static int FindParamAtCursor() {
-    POINT pt; GetCursorPos(&pt);
-    ScreenToClient(g_panel, &pt);
-    for (size_t i = 0; i < g_edits.size(); i++) {
-        if (!g_edits[i].hwnd) continue;
-        RECT er; GetWindowRect(g_edits[i].hwnd, &er);
-        MapWindowPoints(HWND_DESKTOP, g_panel, (LPPOINT)&er, 2);
-        er.left = kPad; // extend hit area to full row
-        if (pt.y >= er.top - 2 && pt.y <= er.bottom + 2) return (int)i;
-    }
-    return -1;
-}
 
 // ── Find which group header the click is on ─────────────────────
 static int FindGroupAtY(int clickY) {
@@ -1628,7 +1530,6 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     case WM_COMMAND:
         if (HIWORD(wp) == EN_SETFOCUS) DisableAccelerators();
         if (HIWORD(wp) == EN_KILLFOCUS) {
-            if (g_open) ApplyEdit((HWND)lp);
             EnableAccelerators();
         }
         break;
@@ -1668,12 +1569,33 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         if (PtInRect(&g_closeRect, pt)) { ClosePanel(); return 0; }
 
-        // Middle area of header = toggle side buttons
-        // (We catch this in LBUTTONDOWN with Shift held)
+        // Click on value area → spawn edit or toggle bool
+        {
+            int idx = FindParamAtY(pt.y);
+            RECT rc2; GetClientRect(hwnd, &rc2);
+            int editX = rc2.right - kPad - kEditW;
+            if (idx >= 0 && pt.x >= editX && pt.y >= g_contentStartY) {
+                auto& ef = g_edits[idx];
+                if (ef.type == TYPE_BOOL && ef.pb) {
+                    Interface* ip = GetCOREInterface();
+                    TimeValue t = ip ? ip->GetTime() : 0;
+                    if (g_epolyOp >= 0 && !g_epolyPreview) EPolyBegin();
+                    theHold.Suspend();
+                    ef.pb->SetValue(ef.id, t, ef.pb->GetInt(ef.id, t) ? 0 : 1);
+                    theHold.Resume();
+                    if (g_epolyPreview) EPolyRefresh();
+                    else                NotifyParamChanged();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                } else {
+                    SpawnEditAt(idx);
+                }
+                return 0;
+            }
+        }
 
         // Ctrl+click on param = hide it
         if (GetKeyState(VK_CONTROL) & 0x8000) {
-            int idx = FindParamAtCursor();
+            int idx = FindParamAtY(pt.y);
             if (idx >= 0) {
                 g_hidden.insert(g_edits[idx].key);
                 SaveSettings();
@@ -1782,7 +1704,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_RBUTTONDOWN: {
         // Right-click on param → toggle favorite
-        int idx = FindParamAtCursor();
+        POINT rpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int idx = FindParamAtY(rpt.y);
         if (idx >= 0 && idx < (int)g_edits.size()) {
             const std::wstring& key = g_edits[idx].key;
             if (g_favorites.count(key)) g_favorites.erase(key);
@@ -1801,10 +1724,17 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         bool over = PtInRect(&g_closeRect, pt) != 0;
         if (over != g_hoverClose) { g_hoverClose = over; InvalidateRect(hwnd, &g_closeRect, FALSE); }
+        // Track hovered param for highlight + wheel
+        RECT rc2; GetClientRect(hwnd, &rc2);
+        int newHover = -1;
+        if (pt.x >= (int)(rc2.right - kPad - kEditW) && pt.y >= g_contentStartY)
+            newHover = FindParamAtY(pt.y);
+        if (newHover != g_hoverParam) { g_hoverParam = newHover; InvalidateRect(hwnd, nullptr, FALSE); }
         return 0;
     }
     case WM_MOUSELEAVE:
         if (g_hoverClose) { g_hoverClose = false; InvalidateRect(hwnd, &g_closeRect, FALSE); }
+        if (g_hoverParam >= 0) { g_hoverParam = -1; InvalidateRect(hwnd, nullptr, FALSE); }
         return 0;
 
     case WM_CTLCOLOREDIT:
@@ -1818,34 +1748,89 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_COMMAND:
-        if (HIWORD(wp) == EN_SETFOCUS || HIWORD(wp) == EN_KILLFOCUS) {
-            if (HIWORD(wp) == EN_SETFOCUS) DisableAccelerators();
-            else { if (g_open) ApplyEdit((HWND)lp); EnableAccelerators(); }
-            // Only invalidate the border area around the affected edit
-            HWND eh = (HWND)lp;
-            RECT er; GetWindowRect(eh, &er);
-            MapWindowPoints(HWND_DESKTOP, hwnd, (LPPOINT)&er, 2);
-            InflateRect(&er, 2, 2);
-            InvalidateRect(hwnd, &er, FALSE);
+        if (HIWORD(wp) == EN_KILLFOCUS && (HWND)lp == g_editHwnd) {
+            KillActiveEdit(true);
+            InvalidateRect(hwnd, nullptr, FALSE);
         }
         break;
 
     case WM_MOUSEWHEEL: {
-        // Panel-level scroll (forwarded from edits when mouse not over them)
+        POINT mp; GetCursorPos(&mp); ScreenToClient(hwnd, &mp);
+        RECT rcw; GetClientRect(hwnd, &rcw);
+        int hoverIdx = FindParamAtY(mp.y);
+
+        // Hover over a value → wheel adjusts the value
+        if (hoverIdx >= 0 && mp.x >= (int)(rcw.right - kPad - kEditW) && !g_editHwnd) {
+            auto& ef = g_edits[hoverIdx];
+            float step = (float)GET_WHEEL_DELTA_WPARAM(wp) / 120.0f;
+            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            Interface* ip = GetCOREInterface();
+            TimeValue t = ip ? ip->GetTime() : 0;
+
+            // Spline op values
+            if (!ef.pb && g_ctx == CTX_SPLINE) {
+                int idx = (int)ef.id;
+                if (idx >= 0 && idx < kSpCount) {
+                    float a = g_splineVals[idx] < 0 ? -g_splineVals[idx] : g_splineVals[idx];
+                    float sc = a>100.f?10.f:a>10.f?1.f:a>1.f?0.1f:0.01f;
+                    if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
+                    g_splineVals[idx] += step * sc;
+                }
+            } else if (ef.pb && ip) {
+                theHold.Suspend();
+                if (IsFloat(ef.type)) {
+                    float cur = ef.pb->GetFloat(ef.id, t);
+                    float a = cur<0?-cur:cur;
+                    float sc = a>100.f?10.f:a>10.f?1.f:a>1.f?0.1f:0.01f;
+                    if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
+                    ef.pb->SetValue(ef.id, t, cur + step * sc);
+                } else if (ef.type == TYPE_BOOL) {
+                    ef.pb->SetValue(ef.id, t, ef.pb->GetInt(ef.id, t) ? 0 : 1);
+                } else {
+                    int cur = ef.pb->GetInt(ef.id, t);
+                    int s = (int)step;
+                    if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
+                    if (s == 0) s = step>0?1:-1;
+                    ef.pb->SetValue(ef.id, t, cur + s);
+                }
+                theHold.Resume();
+                if (g_epolyPreview) EPolyRefresh();
+                else                NotifyParamChanged();
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        // Otherwise scroll the panel
         int delta = GET_WHEEL_DELTA_WPARAM(wp);
         g_scrollY -= delta / 120 * kLineH;
         int maxScroll = g_contentH - g_viewH;
         if (maxScroll < 0) maxScroll = 0;
         if (g_scrollY < 0) g_scrollY = 0;
         if (g_scrollY > maxScroll) g_scrollY = maxScroll;
-        RECT wr; GetWindowRect(hwnd, &wr);
-        ApplyScroll(wr.right - wr.left);
-        // Synchronous repaint — background and edits update in one frame
-        RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+        KillActiveEdit(true);  // kill edit on scroll
+        InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
 
-    case WM_TIMER: RefreshEdits(); return 0;
+    case WM_TIMER: {
+        // Check if node changed
+        Interface* ipt = GetCOREInterface();
+        if (ipt) {
+            if (ipt->GetSelNodeCount() == 0) { ClosePanel(); return 0; }
+            INode* nd = ipt->GetSelNode(0);
+            if (!nd) { ClosePanel(); return 0; }
+            ULONG h = nd->GetHandle();
+            const MCHAR* nn = nd->GetName();
+            std::wstring cur = nn ? nn : L"";
+            if (h != g_nodeHandle || cur != g_nodeName) { ClosePanel(); return 0; }
+        }
+        // Values are painted — just repaint to show updated values
+        InvalidateRect(hwnd, nullptr, FALSE);
+        RefreshFavEdits();
+        return 0;
+    }
 
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) { ClosePanel(); return 0; }
@@ -1945,8 +1930,7 @@ static void OpenPanel() {
     PositionBtnStrips();
     SetTimer(g_panel, 1, kRefreshMs, nullptr);
 
-    // Focus first visible edit
-    for (auto& ef : g_edits) { if (ef.hwnd) { SetFocus(ef.hwnd); break; } }
+    SetFocus(g_panel);
 
     // Build and show favorites strip
     BuildFavorites();
@@ -1966,7 +1950,8 @@ static void ClosePanel() {
     g_epolyPreview = false;
 
     KillTimer(g_panel, 1);
-    DestroyEdits();
+    KillActiveEdit(false);
+    g_hoverParam = -1;
     g_edits.clear();
     g_groups.clear();
     ShowWindow(g_panel, SW_HIDE);
@@ -2039,7 +2024,7 @@ public:
         g_brEditFoc = CreateSolidBrush(kEditFocus);
 
         g_panel = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,
-            kWndClass, nullptr, WS_POPUP | WS_CLIPCHILDREN, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
+            kWndClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
 
         // Button strip windows (separate floating windows for side buttons)
         WNDCLASSEX wcB = {};
