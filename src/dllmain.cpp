@@ -118,11 +118,20 @@ struct EditField {
     int          logY = 0;   // logical Y before scroll
 };
 
+struct ActionBtn {
+    std::wstring label;
+    FPInterface* iface = nullptr;
+    FunctionID   fnId  = 0;
+    int          logY  = 0;
+};
+
 struct GroupHeader {
     std::wstring title;
     int startIdx = 0;
     int count    = 0;
-    Modifier* mod = nullptr;   // non-null = deletable modifier
+    int actionStart = 0;
+    int actionCount = 0;
+    Modifier* mod = nullptr;
 };
 
 // ── Globals ─────────────────────────────────────────────────────
@@ -209,6 +218,7 @@ static int g_viewH     = 0;  // visible content area height
 
 
 static std::vector<EditField>   g_edits;
+static std::vector<ActionBtn>   g_actions;
 static std::vector<GroupHeader> g_groups;
 static std::wstring             g_nodeName;
 static POINT                    g_panelPos = {0,0};
@@ -450,6 +460,7 @@ static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int&
 }
 
 
+
 // Collect params from an object — tries NumParamBlocks first,
 // falls back to scanning references for ParamBlock2,
 // then falls back to IParamBlock (v1) for legacy shapes.
@@ -472,7 +483,20 @@ static void CollectAllParams(ReferenceTarget* obj, const std::wstring& groupTitl
         }
     }
     // Fallback 2: legacy objects (PB1 shapes etc.) — use MaxScript property enumeration
+    // Only works for base objects (not modifiers) — check by walking the node's stack
     if (found == 0 && tot < kMaxParams) {
+        // Verify this is the actual base object, not a modifier
+        Interface* ipChk = GetCOREInterface();
+        bool isBase = false;
+        if (ipChk && ipChk->GetSelNodeCount() > 0) {
+            INode* nd = ipChk->GetSelNode(0);
+            Object* walk = nd ? nd->GetObjectRef() : nullptr;
+            while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID)
+                walk = ((IDerivedObject*)walk)->GetObjRef();
+            isBase = (walk == obj);
+        }
+        if (!isBase) return;  // skip PB1 fallback for modifiers
+
         // Build a MaxScript that returns "propName|type|value\n" for each numeric property
         std::wstring script =
             L"(local s=\"\"; local o=$.baseObject; "
@@ -520,42 +544,28 @@ static void CollectAllParams(ReferenceTarget* obj, const std::wstring& groupTitl
     }
 }
 
-// ── Find EPoly interface on selected node ────────────────────────
-// Returns any EPoly in the stack (for general queries like ExitActiveEPolyTool).
+// ── Find EPoly on BASE OBJECT only (not modifiers) ──────────────
+// Edit Poly modifier is a different SDK class that bugs out.
+// Only Editable Poly base object works cleanly with our tools.
 static EPoly* FindEPoly(INode* node) {
     if (!node) return nullptr;
     Object* obj = node->GetObjectRef();
-    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-        IDerivedObject* d = static_cast<IDerivedObject*>(obj);
-        for (int m = 0; m < d->NumModifiers(); m++) {
-            EPoly* ep = (EPoly*)d->GetModifier(m)->GetInterface(EPOLY_INTERFACE);
-            if (ep) return ep;
-        }
-        obj = d->GetObjRef();
-    }
+    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID)
+        obj = ((IDerivedObject*)obj)->GetObjRef();
     if (obj) return (EPoly*)obj->GetInterface(EPOLY_INTERFACE);
     return nullptr;
 }
 
-// Find SplineShape — base object or pipeline result (for Edit Spline on primitives)
+// Find SplineShape on BASE OBJECT only (not Edit Spline modifier).
+// Edit Spline modifier is a different SDK class that bugs out.
+// Only Editable Spline base object works cleanly with our tools.
 static SplineShape* FindSplineShape(INode* node) {
     if (!node) return nullptr;
     Object* obj = node->GetObjectRef();
-    // Walk to base
     while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID)
         obj = ((IDerivedObject*)obj)->GetObjRef();
-    // Direct SplineShape base (Editable Spline)
     if (obj && obj->ClassID() == splineShapeClassID)
         return static_cast<SplineShape*>(obj);
-    // Shape primitive + Edit Spline → evaluate pipeline
-    if (obj && obj->SuperClassID() == SHAPE_CLASS_ID) {
-        Interface* ip = GetCOREInterface();
-        if (ip) {
-            ObjectState os = node->EvalWorldState(ip->GetTime());
-            if (os.obj && os.obj->ClassID() == splineShapeClassID)
-                return static_cast<SplineShape*>(os.obj);
-        }
-    }
     return nullptr;
 }
 
@@ -635,6 +645,7 @@ static void EPolyCancelDrop() {
 static void GatherParams() {
     g_groups.clear();
     g_edits.clear();
+    g_actions.clear();
     g_nodeName.clear();
     g_nodeHandle = 0;
     g_epolyOp = -1;
@@ -742,21 +753,9 @@ static void GatherParams() {
         }
     }
 
-    // ── Spline detection — find SplineShape anywhere ───────────
+    // ── Spline detection — base Editable Spline only ───────────
     if (g_ctx == CTX_NONE) {
-        SplineShape* ss = nullptr;
-        // Check base object
-        Object* base = obj;
-        while (base && base->SuperClassID() == GEN_DERIVOB_CLASS_ID)
-            base = ((IDerivedObject*)base)->GetObjRef();
-        if (base && base->ClassID() == splineShapeClassID)
-            ss = static_cast<SplineShape*>(base);
-        // Any shape base → evaluate pipeline for SplineShape result
-        if (!ss && base && base->SuperClassID() == SHAPE_CLASS_ID) {
-            ObjectState os = node->EvalWorldState(GetCOREInterface()->GetTime());
-            if (os.obj && os.obj->ClassID() == splineShapeClassID)
-                ss = static_cast<SplineShape*>(os.obj);
-        }
+        SplineShape* ss = FindSplineShape(node);
         if (ss) {
             g_ctx = CTX_SPLINE;
             g_splineForButtons = ss;
@@ -797,7 +796,7 @@ static void GatherParams() {
             int tot = 0;
             CollectAllParams(mod, gh.title, tot);
             gh.count = (int)g_edits.size() - gh.startIdx;
-            if (gh.count > 0) g_groups.push_back(gh);
+            g_groups.push_back(gh);
         }
         walkObj = d->GetObjRef();
     }
@@ -851,15 +850,15 @@ static void FormatValue(const EditField& ef, TimeValue t, TCHAR* buf, int len) {
             TRUE, &result);
         if (ok && result.type == TYPE_STRING && result.s) {
             // Convert "true"/"false" to 1/0
-            if (_wcsicmp(result.s, L"true") == 0) swprintf(buf, len, _T("1"));
-            else if (_wcsicmp(result.s, L"false") == 0) swprintf(buf, len, _T("0"));
+            if (_wcsicmp(result.s, L"true") == 0) swprintf(buf, len, _T("On"));
+            else if (_wcsicmp(result.s, L"false") == 0) swprintf(buf, len, _T("Off"));
             else swprintf(buf, len, _T("%s"), result.s);
         } else
             swprintf(buf, len, _T("--"));
         return;
     }
     if (IsFloat(ef.type))      swprintf(buf, len, _T("%.4g"), ef.pb->GetFloat(ef.id, t));
-    else if (ef.type==TYPE_BOOL) swprintf(buf, len, _T("%d"), ef.pb->GetInt(ef.id, t));
+    else if (ef.type==TYPE_BOOL) swprintf(buf, len, _T("%s"), ef.pb->GetInt(ef.id, t)?_T("On"):_T("Off"));
     else                       swprintf(buf, len, _T("%d"), ef.pb->GetInt(ef.id, t));
 }
 
@@ -1115,25 +1114,39 @@ static void PaintPanel(HWND hwnd) {
 
         SelectObject(mem, g_fontBold);
         bool isOpGroup = (gi == 0 && g_epolyOp >= 0);
-        SetTextColor(mem, isOpGroup ? kAccent : kGroupClr);
+        bool modEnabled = gh.mod ? gh.mod->IsEnabled() : true;
+        bool modActive = false;
+        if (gh.mod) modActive = gh.mod->TestAFlag(A_MOD_BEING_EDITED);
+
+        // Title — dim if disabled, accent if active
+        COLORREF titleClr = isOpGroup ? kAccent
+                          : !modEnabled ? RGB(100, 100, 100)
+                          : modActive ? kAccent
+                          : kGroupClr;
+        SetTextColor(mem, titleClr);
         std::wstring hdr = (collapsed ? L"\x25B8 " : L"\x25BE ") + gh.title;
         if (isOpGroup) hdr += L"  [\x2717 CANCEL]";
+        if (!modEnabled) hdr += L"  [OFF]";
         TextOut(mem, x, y, hdr.c_str(), (int)hdr.length());
 
-        // Draw [▲][▼][×] buttons for modifier groups
+        // Draw [●][▲][▼][×] buttons for modifier groups
         if (gh.mod) {
             int bw = 16, bh = kLineH - 4;
-            int bx = rEdge - bw * 3 - 2;
-            RECT upR   = { bx,          y + 2, bx + bw,      y + 2 + bh };
-            RECT dnR   = { bx + bw + 1, y + 2, bx + bw*2+1,  y + 2 + bh };
-            RECT delR  = { bx + bw*2+2, y + 2, bx + bw*3+2,  y + 2 + bh };
+            int bx = rEdge - bw * 4 - 3;
+            RECT enR   = { bx,            y + 2, bx + bw,       y + 2 + bh };
+            RECT upR   = { bx + bw + 1,   y + 2, bx + bw*2+1,  y + 2 + bh };
+            RECT dnR   = { bx + bw*2 + 2, y + 2, bx + bw*3+2,  y + 2 + bh };
+            RECT delR  = { bx + bw*3 + 3, y + 2, bx + bw*4+3,  y + 2 + bh };
 
             HBRUSH bbg = CreateSolidBrush(kBtnBg);
-            FillRect(mem, &upR, bbg); FillRect(mem, &dnR, bbg);
+            FillRect(mem, &enR, bbg); FillRect(mem, &upR, bbg); FillRect(mem, &dnR, bbg);
             DeleteObject(bbg);
             HBRUSH dbg = CreateSolidBrush(RGB(80, 50, 50));
             FillRect(mem, &delR, dbg); DeleteObject(dbg);
 
+            // Enable toggle — filled = on, empty = off
+            SetTextColor(mem, modEnabled ? kAccent : RGB(100, 100, 100));
+            DrawText(mem, modEnabled ? _T("\u25CF") : _T("\u25CB"), 1, &enR, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             SetTextColor(mem, kLabelClr);
             DrawText(mem, _T("\u25B2"), 1, &upR, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             DrawText(mem, _T("\u25BC"), 1, &dnR, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -1242,7 +1255,7 @@ static void KillActiveEdit(bool apply) {
             TimeValue t = ip ? ip->GetTime() : 0;
             theHold.Suspend();
             if (IsFloat(ef.type))       ef.pb->SetValue(ef.id, t, (float)_wtof(txt));
-            else if (ef.type==TYPE_BOOL) ef.pb->SetValue(ef.id, t, _wtoi(txt) ? 1 : 0);
+            else if (ef.type==TYPE_BOOL) ef.pb->SetValue(ef.id, t, (_wcsicmp(txt,_T("On"))==0||_wcsicmp(txt,_T("1"))==0||_wcsicmp(txt,_T("true"))==0)?1:0);
             else                        ef.pb->SetValue(ef.id, t, _wtoi(txt));
             theHold.Resume();
             if (g_epolyPreview) EPolyRefresh();
@@ -1252,7 +1265,7 @@ static void KillActiveEdit(bool apply) {
             std::wstring prop = PropFromKey(ef);
             std::wstring val(txt);
             // Convert 0/1 to false/true for MaxScript bools
-            if (ef.type == (ParamType2)TYPE_BOOL) val = (_wtoi(txt) ? L"true" : L"false");
+            if (ef.type == (ParamType2)TYPE_BOOL) val = (_wcsicmp(txt,L"On")==0||_wcsicmp(txt,L"1")==0||_wcsicmp(txt,L"true")==0) ? L"true" : L"false";
             std::wstring script = L"try(setProperty $.baseObject #" + prop + L" " + val + L")catch()";
             ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
             NotifyParamChanged();
@@ -1362,6 +1375,10 @@ static void BuildLayout() {
     if (maxH > kMaxPanelH) maxH = kMaxPanelH;
 
     int panelH = g_contentStartY + g_contentH + kPad;
+    // Clamp to screen — account for panel Y position
+    int availH = mi.rcWork.bottom - g_panelPos.y;
+    if (availH < 120) availH = 120;
+    if (maxH > availH) maxH = availH;
     if (panelH > maxH) panelH = maxH;
     if (panelH < 60) panelH = 60;
     g_viewH = panelH - g_contentStartY - kPad;
@@ -1738,33 +1755,32 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
 
-        // Shift+click on group header = unhide all params for that group
+        // Shift+click = unhide hidden params for that group (or all)
         if (GetKeyState(VK_SHIFT) & 0x8000) {
             int gIdx = FindGroupAtY(pt.y);
             if (gIdx >= 0) {
                 const auto& title = g_groups[gIdx].title;
                 std::wstring prefix = title + L":";
-                // Remove all hidden entries starting with this group
-                for (auto it = g_hidden.begin(); it != g_hidden.end(); ) {
+                for (auto it = g_hidden.begin(); it != g_hidden.end(); )
                     if (it->compare(0, prefix.size(), prefix) == 0) it = g_hidden.erase(it);
                     else ++it;
-                }
-                SaveSettings();
-                // Re-gather and rebuild to get the params back
-                GatherParams();
-                BuildLayout();
-                return 0;
+            } else {
+                g_hidden.clear();
             }
+            SaveSettings();
+            GatherParams();
+            BuildLayout();
+            return 0;
         }
 
         // Click on group header
         int gIdx = FindGroupAtY(pt.y);
         if (gIdx >= 0) {
-            // [▲][▼][×] buttons for modifier groups
+            // [●][▲][▼][×] buttons for modifier groups
             if (g_groups[gIdx].mod) {
                 int rEdge2 = pw - kPad;
                 int bw = 16;
-                int bx = rEdge2 - bw * 3 - 2;
+                int bx = rEdge2 - bw * 4 - 3;
                 // Find this modifier's 1-based stack index
                 auto findModIdx = [&](Modifier* mod) -> int {
                     Interface* ip2 = GetCOREInterface();
@@ -1781,13 +1797,31 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 };
 
                 if (pt.x >= bx && pt.x < bx + bw) {
-                    // ▲ Move up (towards top of stack = lower index)
+                    // ● Enable/disable toggle
+                    Modifier* mod = g_groups[gIdx].mod;
+                    if (mod->IsEnabled()) mod->DisableMod(); else mod->EnableMod();
+                    Interface* ip3 = GetCOREInterface();
+                    if (ip3 && ip3->GetSelNodeCount() > 0) {
+                        INode* nd = ip3->GetSelNode(0);
+                        if (nd) nd->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
+                        ip3->RedrawViews(ip3->GetTime());
+                    }
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (pt.x >= bx + bw + 1 && pt.x < bx + bw*2 + 1) {
+                    // ▲ Move up
                     int mi = findModIdx(g_groups[gIdx].mod);
                     if (mi > 1) {
-                        std::wstring s = L"undo \"Move Up\" on (local m=$.modifiers[" +
-                            std::to_wstring(mi) + L"];deleteModifier $ " +
-                            std::to_wstring(mi) + L";addModifier $ m before:" +
-                            std::to_wstring(mi - 1) + L")";
+                        // after delete, remaining = cnt-1. target = mi-1 from top.
+                        // before: = remaining - target + 1. If target=1, no before (top).
+                        std::wstring s;
+                        if (mi == 2)
+                            s = L"undo \"Move Up\" on (local m=$.modifiers[2];deleteModifier $ 2;addModifier $ m)";
+                        else
+                            s = L"undo \"Move Up\" on (local m=$.modifiers[" + std::to_wstring(mi) +
+                                L"];deleteModifier $ " + std::to_wstring(mi) +
+                                L";addModifier $ m before:($.modifiers.count-" + std::to_wstring(mi - 2) + L"))";
                         EPolyAccept();
                         ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
                         GatherParams(); BuildLayout();
@@ -1795,7 +1829,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                     return 0;
                 }
-                if (pt.x >= bx + bw + 1 && pt.x < bx + bw*2 + 1) {
+                if (pt.x >= bx + bw*2 + 2 && pt.x < bx + bw*3 + 2) {
                     // ▼ Move down
                     int mi = findModIdx(g_groups[gIdx].mod);
                     Interface* ip2 = GetCOREInterface();
@@ -1810,10 +1844,11 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         }
                     }
                     if (mi > 0 && mi < total) {
+                        // after delete, add before:remaining_count to go to bottom-relative position
                         std::wstring s = L"undo \"Move Down\" on (local m=$.modifiers[" +
                             std::to_wstring(mi) + L"];deleteModifier $ " +
-                            std::to_wstring(mi) + L";addModifier $ m before:" +
-                            std::to_wstring(mi + 1) + L")";
+                            std::to_wstring(mi) + L";addModifier $ m before:($.modifiers.count-" +
+                            std::to_wstring(mi - 1) + L"))";
                         EPolyAccept();
                         ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
                         GatherParams(); BuildLayout();
@@ -1821,7 +1856,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                     return 0;
                 }
-                if (pt.x >= bx + bw*2 + 2) {
+                if (pt.x >= bx + bw*3 + 3) {
                     // × Delete
                     int mi = findModIdx(g_groups[gIdx].mod);
                     if (mi > 0) {
@@ -1839,6 +1874,19 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 EPolyCancelDrop();
                 return 0;
             }
+            // Shift+click on modifier header = toggle enable/disable
+            if ((GetKeyState(VK_SHIFT) & 0x8000) && g_groups[gIdx].mod) {
+                Modifier* mod = g_groups[gIdx].mod;
+                if (mod->IsEnabled()) mod->DisableMod(); else mod->EnableMod();
+                Interface* ip3 = GetCOREInterface();
+                if (ip3) {
+                    INode* nd = ip3->GetSelNode(0);
+                    if (nd) nd->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
+                    ip3->RedrawViews(ip3->GetTime());
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             // Normal collapse toggle
             const auto& title = g_groups[gIdx].title;
             if (g_collapsed.count(title)) g_collapsed.erase(title);
@@ -1850,9 +1898,44 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
 
-    case WM_MBUTTONDOWN:
+    case WM_MBUTTONDOWN: {
+        POINT mpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int gIdx = FindGroupAtY(mpt.y);
+        if (gIdx >= 0 && g_groups[gIdx].mod) {
+            // Middle-click on modifier header = set as active modifier
+            Modifier* mod = g_groups[gIdx].mod;
+            Interface* ip2 = GetCOREInterface();
+            if (ip2 && ip2->GetSelNodeCount() > 0) {
+                // Find modifier index
+                INode* nd = ip2->GetSelNode(0);
+                Object* ob = nd ? nd->GetObjectRef() : nullptr;
+                while (ob && ob->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+                    IDerivedObject* dv = static_cast<IDerivedObject*>(ob);
+                    for (int mi = 0; mi < dv->NumModifiers(); mi++) {
+                        if (dv->GetModifier(mi) == mod) {
+                            std::wstring s = L"modPanel.setCurrentObject $.modifiers[" +
+                                std::to_wstring(mi + 1) + L"]";
+                            ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                            break;
+                        }
+                    }
+                    ob = dv->GetObjRef();
+                }
+            }
+        } else if (gIdx >= 0 && !g_groups[gIdx].mod) {
+            // Middle-click on base object header = set base as active
+            ExecuteMAXScriptScript(_T("modPanel.setCurrentObject $.baseObject"),
+                MAXScript::ScriptSource::Dynamic);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        } else {
+            // Middle-click on empty area = toggle side buttons
+            g_showBtns = !g_showBtns;
+            PositionBtnStrips();
+        }
+        return 0;
+    }
     case WM_NCMBUTTONDOWN: {
-        // Middle-click anywhere on panel = toggle side button strips
         g_showBtns = !g_showBtns;
         PositionBtnStrips();
         return 0;
@@ -2063,8 +2146,9 @@ static void OpenPanel() {
     PositionBtnStrips();
     SetTimer(g_panel, 1, kRefreshMs, nullptr);
 
-    // No SetFocus — EPoly auto-commits on focus loss.
-    // Hover+wheel works without focus. Click spawns EDIT.
+    // Only take focus if no EPoly tool is being taken over
+    // (EPoly auto-commits on focus loss during interactive mode)
+    if (g_epolyOp < 0) SetFocus(g_panel);
 
     // Build and show favorites strip
     BuildFavorites();
