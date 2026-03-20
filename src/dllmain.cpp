@@ -849,9 +849,12 @@ static void FormatValue(const EditField& ef, TimeValue t, TCHAR* buf, int len) {
         FPValue result;
         BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic,
             TRUE, &result);
-        if (ok && result.type == TYPE_STRING && result.s)
-            swprintf(buf, len, _T("%s"), result.s);
-        else
+        if (ok && result.type == TYPE_STRING && result.s) {
+            // Convert "true"/"false" to 1/0
+            if (_wcsicmp(result.s, L"true") == 0) swprintf(buf, len, _T("1"));
+            else if (_wcsicmp(result.s, L"false") == 0) swprintf(buf, len, _T("0"));
+            else swprintf(buf, len, _T("%s"), result.s);
+        } else
             swprintf(buf, len, _T("--"));
         return;
     }
@@ -1248,6 +1251,8 @@ static void KillActiveEdit(bool apply) {
             // MaxScript-based params (legacy PB1 objects)
             std::wstring prop = PropFromKey(ef);
             std::wstring val(txt);
+            // Convert 0/1 to false/true for MaxScript bools
+            if (ef.type == (ParamType2)TYPE_BOOL) val = (_wtoi(txt) ? L"true" : L"false");
             std::wstring script = L"try(setProperty $.baseObject #" + prop + L" " + val + L")catch()";
             ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
             NotifyParamChanged();
@@ -1951,7 +1956,11 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (!ef.pb) {
                 // MaxScript-based params (legacy PB1 objects)
                 std::wstring prop = PropFromKey(ef);
-                if (IsFloat(ef.type)) {
+                if (ef.type == (ParamType2)TYPE_BOOL) {
+                    std::wstring script = L"try(setProperty $.baseObject #" + prop +
+                        L" (not (getProperty $.baseObject #" + prop + L")))catch()";
+                    ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
+                } else if (IsFloat(ef.type)) {
                     std::wstring script = L"try(local v=getProperty $.baseObject #" + prop +
                         L"; setProperty $.baseObject #" + prop + L" (v+" +
                         std::to_wstring(step) + L"*" +
