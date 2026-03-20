@@ -887,12 +887,7 @@ private:
     void OnCommand(int id, int code)
     {
         if (id == kSearchId && code == EN_CHANGE) { ScheduleRebuild(); return; }
-        if (id == kApplyId)
-        {
-            applyToSel_ = !applyToSel_;
-            InvalidateRect(apply_, nullptr, FALSE);
-            return;
-        }
+        if (id == kApplyId) return;  // disabled — always off
         if (id == kSceneId)
         {
             sceneOnly_ = !sceneOnly_;
