@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cwchar>
 #include <cwctype>
 #include <iterator>
 #include <set>
@@ -169,6 +171,7 @@ struct Item
     std::wstring normLabel;   // pre-normalized for scoring
     std::wstring search;
     std::wstring key;
+    std::wstring favoriteKey;
     std::wstring scriptName;
     std::wstring scriptKey;
     std::wstring category;
@@ -270,6 +273,25 @@ const wchar_t* TagForKind(ItemKind kind)
     }
 }
 
+std::wstring GetFavoritesCfgPath()
+{
+    Interface* ip = GetCOREInterface();
+    if (!ip) return L"";
+    MSTR dirStr = ip->GetDir(APP_PLUGCFG_DIR);
+    const MCHAR* dir = dirStr.data();
+    if (!dir || !dir[0]) return L"";
+    return std::wstring(dir) + L"\\PowerShader.cfg";
+}
+
+std::wstring BuildSceneFavoriteKey(const std::wstring& label, const std::wstring& category)
+{
+    std::wstring key = L"scene:";
+    key += Normalize(label, false);
+    key += L":";
+    key += Normalize(category, false);
+    return key;
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Thin MaxScript bridges (no C++ SDK for these)
 // ═══════════════════════════════════════════════════════════════
@@ -335,6 +357,7 @@ public:
     bool Init()
     {
         if (hotkeyWnd_) return true;
+        LoadFavorites();
         Theme::Init();
         INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES };
         InitCommonControlsEx(&icc);
@@ -613,6 +636,22 @@ private:
             self->dragging_ = false;
             self->dragIndex_ = -1;
             break;
+
+        case WM_RBUTTONUP:
+        {
+            POINT clientPt = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+            self->ToggleFavoriteAtPoint(h, clientPt);
+            return 0;
+        }
+
+        case WM_CONTEXTMENU:
+        {
+            if (GET_X_LPARAM(l) != -1 || GET_Y_LPARAM(l) != -1) return 0;
+            int cur = static_cast<int>(SendMessageW(h, LB_GETCURSEL, 0, 0));
+            if (cur == LB_ERR) return 0;
+            self->ToggleFavoriteByFilteredIndex(cur);
+            return 0;
+        }
         }
         return DefSubclassProc(h, m, w, l);
     }
@@ -761,6 +800,7 @@ private:
         int si = filtered_[static_cast<size_t>(fi)];
         if (si < 0 || si >= static_cast<int>(activeItems_->size())) return;
         const Item& item = (*activeItems_)[static_cast<size_t>(si)];
+        const bool favorite = IsFavorite(item);
 
         bool sel = (dis->itemState & ODS_SELECTED) != 0;
         FillRect(dis->hDC, &dis->rcItem, sel ? Theme::brAccent : Theme::brBg);
@@ -777,12 +817,18 @@ private:
         HFONT oldF = static_cast<HFONT>(SelectObject(dis->hDC, Theme::fontUI));
 
         // Right side: category · TAG
-        std::wstring info = item.category;
+        std::wstring info;
+        if (favorite) info = L"PIN";
+        if (!item.category.empty())
+        {
+            if (!info.empty()) info += L" \u00B7 ";
+            info += item.category;
+        }
         if (!info.empty()) info += L" \u00B7 ";
         info += TagForKind(item.kind);
         RECT rr = dis->rcItem;
         rr.right -= 6;
-        SetTextColor(dis->hDC, sel ? Theme::textBrt : Theme::textDim);
+        SetTextColor(dis->hDC, sel ? Theme::textBrt : (favorite ? Theme::accent : Theme::textDim));
         DrawTextW(dis->hDC, info.c_str(), -1, &rr,
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 
@@ -853,6 +899,7 @@ private:
     void Show()
     {
         CancelPendingRebuild();
+        if (!favoritesLoaded_) LoadFavorites();
         SetWindowTextW(edit_, L"");
         EnsureClassCache();
         if (IsSceneOnly()) RefreshSceneCache();
@@ -994,6 +1041,7 @@ private:
                 item.search = Normalize(
                     item.label + L" " + std::wstring(className.data()), true);
                 item.key = Normalize(item.label, false);
+                item.favoriteKey = BuildSceneFavoriteKey(item.label, std::wstring(className.data()));
                 item.kind = ItemKind::SceneMaterial;
                 item.category = std::wstring(className.data());
                 item.live = m;
@@ -1046,6 +1094,10 @@ private:
             item.scriptName = (internalName && internalName[0])
                 ? std::wstring(internalName) : L"";
             item.scriptKey  = Normalize(item.scriptName, false);
+            const wchar_t* favoriteKind = (kind == ItemKind::ClassMap) ? L"map" : L"mat";
+            item.favoriteKey = std::wstring(L"class:") + favoriteKind + L":" +
+                std::to_wstring(static_cast<unsigned long>(classId.PartA())) + L":" +
+                std::to_wstring(static_cast<unsigned long>(classId.PartB()));
             item.kind       = kind;
             item.category   = (categoryName && categoryName[0])
                 ? std::wstring(categoryName) : L"";
@@ -1094,10 +1146,28 @@ private:
             if (s > 0) scored.push_back({static_cast<int>(i), s});
         }
 
-        // Sort by score descending when searching, alphabetical otherwise
+        // Favorites stay pinned at the top; in-search results still rank by score inside each group.
         if (!tokens.empty())
-            std::sort(scored.begin(), scored.end(),
-                [](const Scored& a, const Scored& b) { return a.score > b.score; });
+        {
+            std::stable_sort(scored.begin(), scored.end(),
+                [&](const Scored& a, const Scored& b)
+                {
+                    const bool favA = IsFavorite(source[static_cast<size_t>(a.idx)]);
+                    const bool favB = IsFavorite(source[static_cast<size_t>(b.idx)]);
+                    if (favA != favB) return favA > favB;
+                    return a.score > b.score;
+                });
+        }
+        else
+        {
+            std::stable_sort(scored.begin(), scored.end(),
+                [&](const Scored& a, const Scored& b)
+                {
+                    const bool favA = IsFavorite(source[static_cast<size_t>(a.idx)]);
+                    const bool favB = IsFavorite(source[static_cast<size_t>(b.idx)]);
+                    return favA > favB;
+                });
+        }
 
         filtered_.clear();
         filtered_.reserve(scored.size());
@@ -1246,6 +1316,75 @@ private:
         if (status_) SetWindowTextW(status_, s.c_str());
     }
 
+    bool IsFavorite(const Item& item) const
+    {
+        return !item.favoriteKey.empty() &&
+            favorites_.count(item.favoriteKey) > 0;
+    }
+
+    void ToggleFavorite(const Item& item)
+    {
+        if (item.favoriteKey.empty()) return;
+        if (favorites_.count(item.favoriteKey)) favorites_.erase(item.favoriteKey);
+        else favorites_.insert(item.favoriteKey);
+        SaveFavorites();
+    }
+
+    bool SaveFavorites() const
+    {
+        std::wstring path = GetFavoritesCfgPath();
+        if (path.empty()) return false;
+        FILE* f = _wfopen(path.c_str(), L"w");
+        if (!f) return false;
+        for (const auto& favorite : favorites_) fwprintf(f, L"F:%s\n", favorite.c_str());
+        fclose(f);
+        return true;
+    }
+
+    void LoadFavorites()
+    {
+        favorites_.clear();
+        std::wstring path = GetFavoritesCfgPath();
+        if (path.empty()) return;
+        favoritesLoaded_ = true;
+        FILE* f = _wfopen(path.c_str(), L"r");
+        if (!f) return;
+        wchar_t line[1024] = {};
+        while (fgetws(line, static_cast<int>(std::size(line)), f))
+        {
+            size_t len = wcslen(line);
+            while (len > 0 && (line[len - 1] == L'\n' || line[len - 1] == L'\r'))
+                line[--len] = 0;
+            if (len < 3 || line[0] != L'F' || line[1] != L':') continue;
+            favorites_.insert(std::wstring(line + 2));
+        }
+        fclose(f);
+    }
+
+    void ToggleFavoriteByFilteredIndex(int idx)
+    {
+        if (!activeItems_ || idx < 0 || idx >= static_cast<int>(filtered_.size())) return;
+        const int sourceIdx = filtered_[static_cast<size_t>(idx)];
+        if (sourceIdx < 0 || sourceIdx >= static_cast<int>(activeItems_->size())) return;
+        const Item& item = (*activeItems_)[static_cast<size_t>(sourceIdx)];
+        if (item.favoriteKey.empty()) return;
+        const bool favorite = IsFavorite(item);
+        ToggleFavorite(item);
+        CancelPendingRebuild();
+        Rebuild(true);
+        SetStatus(favorite ? L"Unpinned." : L"Pinned to top.");
+    }
+
+    void ToggleFavoriteAtPoint(HWND listHwnd, POINT clientPt)
+    {
+        LRESULT hit = SendMessageW(listHwnd, LB_ITEMFROMPOINT, 0,
+            MAKELPARAM(clientPt.x, clientPt.y));
+        if (HIWORD(hit) != 0) return;
+        const int idx = LOWORD(hit);
+        SendMessageW(listHwnd, LB_SETCURSEL, static_cast<WPARAM>(idx), 0);
+        ToggleFavoriteByFilteredIndex(idx);
+    }
+
     // ─── State ──────────────────────────────────────────────────
     HWND hotkeyWnd_ = nullptr;
     HWND wnd_       = nullptr;
@@ -1262,6 +1401,8 @@ private:
     std::wstring lastQuery_;
     TabMode lastTab_ = TabMode::All;
     bool lastSceneOnly_ = false;
+    std::set<std::wstring> favorites_;
+    bool favoritesLoaded_ = false;
     bool classCacheReady_ = false;
     bool forcedAliasRetry_ = false;
     bool sceneCacheReady_ = false;
