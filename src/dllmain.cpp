@@ -311,6 +311,28 @@ static const BtnDef kSplineOps[] = {
 };
 static int g_hoverBtn  = -1;  // hovered button ID for strip windows
 static bool g_showBtns = true; // toggle for side button strips
+
+// Module enable flags (read from FlowState.ini)
+static bool g_enablePowerParams = true;
+static bool g_enablePowerShader = true;
+static bool g_enableModStack    = true;
+
+static void LoadModuleFlags() {
+    Interface* ip = GetCOREInterface();
+    if (!ip) return;
+    MSTR dirStr = ip->GetDir(APP_PLUGCFG_DIR);
+    if (!dirStr.data() || !dirStr.data()[0]) return;
+    std::wstring ini = std::wstring(dirStr.data()) + L"\\FlowState.ini";
+    FILE* f = _wfopen(ini.c_str(), L"r");
+    if (!f) return;  // no ini = all enabled (defaults)
+    wchar_t line[256];
+    while (fgetws(line, 256, f)) {
+        if (wcsstr(line, L"PowerParams=0")) g_enablePowerParams = false;
+        if (wcsstr(line, L"PowerShader=0")) g_enablePowerShader = false;
+        if (wcsstr(line, L"ModStack=0"))    g_enableModStack = false;
+    }
+    fclose(f);
+}
 static int g_contentStartY = 0;  // where scrollable content begins
 
 // Tool tip overlay (shows active EPoly tool name near cursor)
@@ -433,11 +455,11 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             bool matEd = IsMaterialEditorFocused();
-            if (ctrl) {
+            if (ctrl && g_enableModStack) {
                 PostMessage(g_panel, WM_PP_MODSTACK, 0, 0);
-            } else if (shift || matEd) {
+            } else if ((shift || matEd) && g_enablePowerShader) {
                 PostMessage(g_panel, WM_PP_SHADER, 0, 0);
-            } else {
+            } else if (g_enablePowerParams) {
                 PostMessage(g_panel, WM_PP_TOGGLE, 0, 0);
             }
             return 1;
@@ -616,12 +638,12 @@ static void CollectAllParams(ReferenceTarget* obj, const std::wstring& groupTitl
 
         // Build a MaxScript that returns "propName|type|value\n" for each numeric property
         std::wstring script =
-            L"(local s=\"\"; local o=" + msPath + L"; "
+            L"try(local s=\"\"; local o=" + msPath + L"; "
             L"for p in (getPropNames o) do ("
             L"try(local v=getProperty o p; local c=classof v; "
             L"if c==Float or c==Integer or c==BooleanClass do ("
             L"s+=p as string+\"|\"+(if c==Float then \"f\" else if c==Integer then \"i\" else \"b\")"
-            L"+\"|\"+(v as string)+\"\\n\"))catch()); s)";
+            L"+\"|\"+(v as string)+\"\\n\"))catch()); s)catch(\"\")";
         FPValue result;
         BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic,
             TRUE, &result);
@@ -2567,6 +2589,7 @@ class PowerParamsGUP : public GUP {
 public:
     DWORD Start() override {
         LoadSettings();
+        LoadModuleFlags();
 
         WNDCLASSEX wc = {};
         wc.cbSize = sizeof(wc);
