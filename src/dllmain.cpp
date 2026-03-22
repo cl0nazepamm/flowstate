@@ -242,6 +242,21 @@ static void UpdateModSearch() {
         KillActiveEdit(false);
         g_hoverParam = -1;
         g_modSearchScrollY = 0;
+        // Expand panel if too narrow/short for search results
+        RECT wr; GetWindowRect(g_panel, &wr);
+        int pw = wr.right - wr.left;
+        int ph = wr.bottom - wr.top;
+        int needW = std::max(pw, 360);
+        int needH = std::max(ph, 400);
+        if (needW != pw || needH != ph) {
+            SetWindowPos(g_panel, nullptr, 0, 0, needW, needH,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            if (g_modSearchEdit) {
+                RECT rc2; GetClientRect(g_panel, &rc2);
+                SetWindowPos(g_modSearchEdit, nullptr, kPad, kPad - 1,
+                    rc2.right - kPad * 2 - 20, kFontHdr + 2, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
     }
     if (g_modSearch) {
         EnsureModCache();
@@ -311,6 +326,9 @@ static const BtnDef kSplineOps[] = {
 };
 static int g_hoverBtn  = -1;  // hovered button ID for strip windows
 static bool g_showBtns = true; // toggle for side button strips
+static bool  g_mmDragging = false;  // middle-mouse panel drag
+static POINT g_mmStart = {};
+static RECT  g_mmPanelRect = {};
 
 // Module enable flags (read from FlowState.ini)
 static bool g_enablePowerParams = true;
@@ -448,10 +466,75 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
         }
     }
 
-    if (wp == WM_XBUTTONDOWN) {
+    // ── XButton1 hold-drag tools ──────────────────────────────
+    enum DragMode { DRAG_NONE, DRAG_TIME, DRAG_OPACITY };
+    static DragMode s_dragMode = DRAG_NONE;
+    static int   s_lastMouseX  = 0;
+    static float s_dragFloat   = 0;
+
+    if (s_dragMode != DRAG_NONE && wp == WM_MOUSEMOVE) {
+        MOUSEHOOKSTRUCT* ms2 = (MOUSEHOOKSTRUCT*)lp;
+        int dx = ms2->pt.x - s_lastMouseX;
+        s_lastMouseX = ms2->pt.x;
+        if (dx != 0) {
+            Interface* ip = GetCOREInterface();
+            if (s_dragMode == DRAG_TIME && ip) {
+                float speed = 1.0f;
+                if (GetKeyState(VK_MENU) & 0x8000) speed = 0.2f;
+                s_dragFloat += (float)dx / 10.0f * speed;
+                Interval range = ip->GetAnimRange();
+                float minF = (float)range.Start() / GetTicksPerFrame();
+                float maxF = (float)range.End() / GetTicksPerFrame();
+                if (s_dragFloat < minF) s_dragFloat = minF;
+                if (s_dragFloat > maxF) s_dragFloat = maxF;
+                ip->SetTime((TimeValue)(s_dragFloat * GetTicksPerFrame()), TRUE);
+            }
+            else if (s_dragMode == DRAG_OPACITY && ip && ip->GetSelNodeCount() > 0) {
+                s_dragFloat += (float)dx * 0.005f;
+                if (s_dragFloat < 0.0f) s_dragFloat = 0.0f;
+                if (s_dragFloat > 1.0f) s_dragFloat = 1.0f;
+                for (int i = 0; i < ip->GetSelNodeCount(); i++) {
+                    INode* nd = ip->GetSelNode(i);
+                    if (nd) nd->SetVisibility(ip->GetTime(), s_dragFloat);
+                }
+                ip->RedrawViews(ip->GetTime());
+            }
+        }
+        return 1;
+    }
+
+    if (wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP) {
         WORD xbutton = HIWORD(reinterpret_cast<MOUSEHOOKSTRUCTEX*>(lp)->mouseData);
 
-        if (xbutton == XBUTTON2) {
+        // XButton1: Shift=time slider, Ctrl=opacity slider
+        if (xbutton == XBUTTON1) {
+            if (wp == WM_XBUTTONDOWN) {
+                bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                Interface* ip = GetCOREInterface();
+                if (shift && ip) {
+                    s_dragMode = DRAG_TIME;
+                    s_lastMouseX = ((MOUSEHOOKSTRUCT*)lp)->pt.x;
+                    s_dragFloat = (float)ip->GetTime() / GetTicksPerFrame();
+                    return 1;
+                }
+                if (ctrl && ip && ip->GetSelNodeCount() > 0) {
+                    s_dragMode = DRAG_OPACITY;
+                    s_lastMouseX = ((MOUSEHOOKSTRUCT*)lp)->pt.x;
+                    s_dragFloat = ip->GetSelNode(0)->GetVisibility(ip->GetTime());
+                    if (s_dragFloat < 0) s_dragFloat = 1.0f;
+                    return 1;
+                }
+                // No modifier = future dynamic assignment
+                return 0;
+            }
+            if (wp == WM_XBUTTONUP && s_dragMode != DRAG_NONE) {
+                s_dragMode = DRAG_NONE;
+                return 1;
+            }
+        }
+
+        if (xbutton == XBUTTON2 && wp == WM_XBUTTONDOWN) {
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             bool matEd = IsMaterialEditorFocused();
@@ -1844,11 +1927,7 @@ static void BuildFavorites() {
             if (!IsFloat(ptype) && !IsInt(ptype) && ptype != TYPE_BOOL) continue;
             size_t sep = key.find(L':');
             EditField ef;
-            // Use "Class · Param" format so duplicates are distinguishable
-            if (sep != std::wstring::npos)
-                ef.label = key.substr(0, sep) + L" \u00B7 " + key.substr(sep + 1);
-            else
-                ef.label = key;
+            ef.label = (sep != std::wstring::npos) ? key.substr(sep + 1) : key;
             ef.key = key; ef.pb = pb; ef.id = pid; ef.type = ptype; ef.hwnd = nullptr;
             g_favEdits.push_back(std::move(ef));
         } else {
@@ -1874,9 +1953,21 @@ static void BuildFavorites() {
             if (_wcsicmp(result.s, L"Integer") == 0) pt2 = (ParamType2)TYPE_INT;
             if (_wcsicmp(result.s, L"BooleanClass") == 0) pt2 = (ParamType2)TYPE_BOOL;
             EditField ef;
-            ef.label = key.substr(0, sep) + L" \u00B7 " + prop;
+            ef.label = prop;
             ef.key = key; ef.pb = nullptr; ef.id = 0; ef.type = pt2; ef.hwnd = nullptr;
             g_favEdits.push_back(std::move(ef));
+        }
+    }
+
+    // Disambiguate duplicate labels by adding class prefix
+    for (size_t i = 0; i < g_favEdits.size(); i++) {
+        bool dup = false;
+        for (size_t j = 0; j < g_favEdits.size(); j++)
+            if (i != j && g_favEdits[i].label == g_favEdits[j].label) { dup = true; break; }
+        if (dup) {
+            size_t sep = g_favEdits[i].key.find(L':');
+            if (sep != std::wstring::npos)
+                g_favEdits[i].label = g_favEdits[i].key.substr(0, sep) + L" \u00B7 " + g_favEdits[i].label;
         }
     }
 
@@ -2019,16 +2110,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_NCHITTEST: {
-        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        ScreenToClient(hwnd, &pt);
-        if (PtInRect(&g_closeRect, pt)) return HTCLIENT;
-        // Search bar is in the header — don't return HTCAPTION for its area
-        if (g_modSearchEdit) {
-            RECT sr; GetWindowRect(g_modSearchEdit, &sr);
-            MapWindowPoints(HWND_DESKTOP, hwnd, (LPPOINT)&sr, 2);
-            if (PtInRect(&sr, pt)) return HTCLIENT;
-        }
-        if (pt.y < kHeaderH) return HTCAPTION;
+        // No HTCAPTION — panel is dragged via middle-mouse only
         return HTCLIENT;
     }
 
@@ -2216,53 +2298,44 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_MBUTTONDOWN: {
-        if (g_modSearch) { return 0; }  // no middle-click actions during search
-        POINT mpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        int gIdx = FindGroupAtY(mpt.y);
-        if (gIdx >= 0 && g_groups[gIdx].mod) {
-            // Middle-click on modifier header = set as active modifier
-            Modifier* mod = g_groups[gIdx].mod;
-            Interface* ip2 = GetCOREInterface();
-            if (ip2 && ip2->GetSelNodeCount() > 0) {
-                // Find modifier index
-                INode* nd = ip2->GetSelNode(0);
-                Object* ob = nd ? nd->GetObjectRef() : nullptr;
-                while (ob && ob->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-                    IDerivedObject* dv = static_cast<IDerivedObject*>(ob);
-                    for (int mi = 0; mi < dv->NumModifiers(); mi++) {
-                        if (dv->GetModifier(mi) == mod) {
-                            std::wstring s = L"modPanel.setCurrentObject $.modifiers[" +
-                                std::to_wstring(mi + 1) + L"]";
-                            ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
-                            InvalidateRect(hwnd, nullptr, FALSE);
-                            break;
-                        }
-                    }
-                    ob = dv->GetObjRef();
-                }
-            }
-        } else if (gIdx >= 0 && !g_groups[gIdx].mod) {
-            // Middle-click on base object header = set base as active
-            ExecuteMAXScriptScript(_T("modPanel.setCurrentObject $.baseObject"),
-                MAXScript::ScriptSource::Dynamic);
-            InvalidateRect(hwnd, nullptr, FALSE);
-        } else {
-            // Middle-click on empty area = toggle side buttons
-            g_showBtns = !g_showBtns;
-            PositionBtnStrips();
-        }
+        // Middle-mouse drag to move panel
+        g_mmDragging = true;
+        GetCursorPos(&g_mmStart);
+        GetWindowRect(hwnd, &g_mmPanelRect);
+        SetCapture(hwnd);
+        return 0;
+    }
+    case WM_MBUTTONUP: {
+        if (g_mmDragging) { g_mmDragging = false; ReleaseCapture(); }
         return 0;
     }
     case WM_NCMBUTTONDOWN: {
-        g_showBtns = !g_showBtns;
-        PositionBtnStrips();
+        // Middle-mouse drag from non-client area
+        g_mmDragging = true;
+        GetCursorPos(&g_mmStart);
+        GetWindowRect(hwnd, &g_mmPanelRect);
+        SetCapture(hwnd);
         return 0;
     }
 
     case WM_RBUTTONDOWN: {
-        if (g_modSearch) return 0;  // no right-click during search
-        // Right-click on param → toggle favorite
+        if (g_modSearch) return 0;
         POINT rpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+
+        // Right-click on group header → unhide all hidden params for that group
+        int gIdx = FindGroupAtY(rpt.y);
+        if (gIdx >= 0) {
+            const auto& title = g_groups[gIdx].title;
+            std::wstring prefix = title + L":";
+            bool found = false;
+            for (auto it = g_hidden.begin(); it != g_hidden.end(); )
+                if (it->compare(0, prefix.size(), prefix) == 0) { it = g_hidden.erase(it); found = true; }
+                else ++it;
+            if (found) { SaveSettings(); GatherParams(); BuildLayout(); }
+            return 0;
+        }
+
+        // Right-click on param → toggle favorite
         int idx = FindParamAtY(rpt.y);
         if (idx >= 0 && idx < (int)g_edits.size()) {
             const std::wstring& key = g_edits[idx].key;
@@ -2277,6 +2350,15 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_MOUSEMOVE: {
+        // Middle-mouse panel drag
+        if (g_mmDragging) {
+            POINT cur; GetCursorPos(&cur);
+            SetWindowPos(hwnd, nullptr,
+                g_mmPanelRect.left + (cur.x - g_mmStart.x),
+                g_mmPanelRect.top + (cur.y - g_mmStart.y),
+                0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
         TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
         TrackMouseEvent(&tme);
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -2519,11 +2601,18 @@ static void ClosePanel() {
     ExitModSearch();
     if (g_modSearchEdit) ShowWindow(g_modSearchEdit, SW_HIDE);
     EPolyAccept();  // commit the takeover preview
-    // Exit command mode so tool doesn't stay idle (prevents duplication on reopen)
-    if (g_epolyFP) {
-        FPValue d;
-        g_epolyFP->Invoke(epfn_exit_command_modes, d);
-        g_epolyFP->Invoke(epfn_close_popup_dialog, d);
+    // Always exit any active EPoly command mode on close
+    {
+        Interface* ipClose = GetCOREInterface();
+        if (ipClose && ipClose->GetSelNodeCount() > 0) {
+            EPoly* ep = FindEPoly(ipClose->GetSelNode(0));
+            if (ep) {
+                FPInterface* fp = (FPInterface*)ep;
+                FPValue d;
+                fp->Invoke(epfn_exit_command_modes, d);
+                fp->Invoke(epfn_close_popup_dialog, d);
+            }
+        }
     }
     g_epolyOp = -1;
     g_epolyFP = nullptr;

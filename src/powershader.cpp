@@ -153,7 +153,7 @@ constexpr int kTabAllId  = 1005;
 constexpr int kTabMatId  = 1006;
 constexpr int kTabMapId  = 1007;
 constexpr int kQuickBase = 1100;
-constexpr int kQuickCount = 11;
+constexpr int kQuickCount = 13;
 constexpr int kWindowWidth  = 380;
 constexpr int kWindowHeight = 540;
 constexpr int kHeaderH      = 34;
@@ -195,7 +195,120 @@ const QuickButton kQuickButtons[] = {
     {L"TY",   L"tybitmap"},
     {L"NOISE",L"osl_UberNoise"},
     {L"GRAD", L"Gradient_Ramp"},
+    {L"SHLL", L"__CMD_SHLL"},
+    {L"LINK", L"__CMD_LINK"},
 };
+
+// MaxScript commands for utility buttons
+static const wchar_t* kShellScript =
+    L"try(\n"
+    L"if selection.count==0 do throw\"no sel\"\n"
+    L"local hasOSL=try(classof OSL_uberBitmap2b==OSLMap\ntrue)catch(false)\n"
+    L"fn findTexInTree m visited=(\n"
+    L"if m==undefined or(findItem visited m)>0 do return\"\"\n"
+    L"append visited m\n"
+    L"if classof m==Bitmaptexture do return(try(m.filename)catch(\"\"))\n"
+    L"if classof m==ai_image do return(try(m.filename)catch(\"\"))\n"
+    L"if classof m==OSLMap do return(try(m.filename)catch(\"\"))\n"
+    L"for p in(getPropNames m)do(try(local v=getProperty m p\n"
+    L"if superclassof v==textureMap do(local r=findTexInTree v visited\nif r!=\"\"do return r))catch())\n"
+    L"return\"\")\n"
+    L"fn findAlbedo mat=(\n"
+    L"local cls=classof mat\n"
+    L"if cls==ai_standard_surface do return(try(mat.base_color_shader)catch(undefined))\n"
+    L"if cls==PhysicalMaterial do return(try(mat.base_color_map)catch(undefined))\n"
+    L"if cls==StandardMaterial do return(try(mat.diffuseMap)catch(undefined))\n"
+    L"for p in #(#base_color_map,#base_color_shader,#diffuseMap,#color_map,#diffuse_map,#texmap_diffuse)do(\n"
+    L"try(local v=getProperty mat p\nif v!=undefined do return v)catch())\nundefined)\n"
+    L"fn resizeUdimSet texPath tmpDir=(\n"
+    L"local srcDir=getFilenamePath texPath\n"
+    L"local srcFile=getFilenameFile texPath\n"
+    L"local srcExt=getFilenameType texPath\n"
+    L"local isUdim=findString srcFile \"<UDIM>\" != undefined\n"
+    L"if not isUdim do(\n"
+    L"if not doesFileExist texPath do return undefined\n"
+    L"local outPath=tmpDir+\"\\\\\"+(getFilenameFile texPath)+(getFilenameType texPath)\n"
+    L"local ok=try(local s=openBitmap texPath\nif s!=undefined do(\n"
+    L"local d=bitmap 256 256 filename:outPath\ncopy s d\nsave d\nclose d\nclose s\ntrue))catch(false)\n"
+    L"return(if ok then outPath else texPath))\n"
+    L"local pattern=substituteString srcFile \"<UDIM>\" \"*\"\n"
+    L"local mask=srcDir+pattern+srcExt\n"
+    L"local tiles=getFiles mask\n"
+    L"if tiles.count==0 do return undefined\n"
+    L"local anyOK=false\n"
+    L"for t in tiles do(\n"
+    L"local tName=(getFilenameFile t)+(getFilenameType t)\n"
+    L"local outPath=tmpDir+\"\\\\\"+ tName\n"
+    L"try(local s=openBitmap t\nif s!=undefined do(\n"
+    L"local d=bitmap 256 256 filename:outPath\ncopy s d\nsave d\nclose d\nclose s\nanyOK=true))catch())\n"
+    L"if not anyOK do return undefined\n"
+    L"tmpDir+\"\\\\\"+ srcFile + srcExt)\n"
+    L"fn buildPreview mat lbl=(\n"
+    L"if mat==undefined do return undefined\n"
+    L"local alb=findAlbedo mat\n"
+    L"if alb==undefined do return undefined\n"
+    L"local texPath=findTexInTree alb #()\n"
+    L"if texPath==\"\"do return undefined\n"
+    L"local tmpDir=(getDir #temp)+\"\\\\PowerShader_SHLL\"\n"
+    L"try(makeDir tmpDir)catch()\n"
+    L"local usePath=resizeUdimSet texPath tmpDir\n"
+    L"if usePath==undefined do return undefined\n"
+    L"if hasOSL then(local u=try(OSL_uberBitmap2b())catch(undefined)\n"
+    L"if u!=undefined do(try(u.filename=usePath)catch()\ntry(u.name=\"preview_\"+lbl)catch())\nu)\n"
+    L"else(local b=Bitmaptexture()\ntry(b.filename=usePath)catch()\nb))\n"
+    L"local objsDone=0\nlocal srcMats=#()\nlocal shellMats=#()\n"
+    L"for obj in selection do(\n"
+    L"local src=try(obj.material)catch(undefined)\n"
+    L"if src==undefined do continue\n"
+    L"if isKindOf src Shell_Material do continue\n"
+    L"local idx=findItem srcMats src\nlocal sm=undefined\n"
+    L"if idx>0 then(sm=shellMats[idx])else(\n"
+    L"local bn=try(src.name)catch(classof src as string)\n"
+    L"local pm=buildPreview src bn\n"
+    L"if pm==undefined do continue\n"
+    L"local phys=PhysicalMaterial()\ntry(phys.name=\"preview_\"+bn)catch()\n"
+    L"try(phys.base_color_map=pm\nphys.base_color_map_on=true)catch()\n"
+    L"sm=Shell_Material()\ntry(sm.name=\"shell_\"+bn)catch()\n"
+    L"try(sm.originalMaterial=src\nsm.bakedMaterial=phys)catch()\n"
+    L"try(sm.viewportMtlIndex=1\nsm.renderMtlIndex=0)catch()\n"
+    L"append srcMats src\nappend shellMats sm)\n"
+    L"if sm!=undefined do(try(obj.material=sm\nobjsDone+=1)catch()))\n"
+    L"if objsDone>0 do redrawViews()\n"
+    L")catch()";
+
+static const wchar_t* kLinkScript =
+    L"(\n"
+    L"if SME.isOpen() do (\n"
+    L"local v = SME.GetView (SME.activeView)\n"
+    L"local sn = v.GetSelectedNodes()\n"
+    L"if sn.count >= 2 do (\n"
+    L"local maps = #()\n"
+    L"for i = 1 to sn.count do (\n"
+    L"local r = try(sn[i].reference)catch(undefined)\n"
+    L"if r != undefined do (\n"
+    L"local c = classof r\n"
+    L"if c == ai_image or c == Bitmaptexture or c == OSLMap or c == RS_Texture do append maps r\n"
+    L"))\n"
+    L"if maps.count >= 2 do (\n"
+    L"local ctrl = bezier_float()\n"
+    L"local c1 = classof maps[1]\n"
+    L"ctrl.value = case c1 of (\n"
+    L"ai_image: maps[1].sscale\n"
+    L"Bitmaptexture: maps[1].coords.U_Tiling\n"
+    L"RS_Texture: maps[1].scale_x\n"
+    L"OSLMap: (try(maps[1].scale)catch(1.0))\n"
+    L"default: 1.0)\n"
+    L"for m in maps do (\n"
+    L"local c = classof m\n"
+    L"case c of (\n"
+    L"ai_image: (try(m.sscale.controller = ctrl)catch(); try(m.tscale.controller = ctrl)catch())\n"
+    L"Bitmaptexture: (try(m.coords.U_Tiling.controller = ctrl)catch(); try(m.coords.V_Tiling.controller = ctrl)catch())\n"
+    L"RS_Texture: (try(m.scale_x.controller = ctrl)catch(); try(m.scale_y.controller = ctrl)catch())\n"
+    L"OSLMap: (try(m.scale.controller = ctrl)catch())\n"
+    L"))))))";
+
+static const wchar_t* kFlushScript =
+    L"try(actionMan.executeAction 695602995 \"2\";true)catch(false)";
 
 // ═══════════════════════════════════════════════════════════════
 //  Search helpers
@@ -477,6 +590,9 @@ private:
                 int btnIdx = self->quickDragId_ - kQuickBase;
                 self->quickDragging_ = false;
                 self->quickDragId_ = -1;
+                // Skip drag for command buttons
+                const wchar_t* alias = kQuickButtons[btnIdx].alias;
+                if (wcsncmp(alias, L"__CMD_", 6) == 0) return 0;
                 if (btnIdx >= 0 && btnIdx < static_cast<int>(std::size(kQuickButtons)))
                     self->ActivateAlias(kQuickButtons[btnIdx].alias, true);
                 return 0;
@@ -914,8 +1030,17 @@ private:
         }
         if (id == kListId && code == LBN_DBLCLK)
             { ActivateCurrent(false); return; }
-        if (id >= kQuickBase && id < kQuickBase + kQuickCount)
-            { ActivateAlias(kQuickButtons[id - kQuickBase].alias); return; }
+        if (id >= kQuickBase && id < kQuickBase + kQuickCount) {
+            const wchar_t* alias = kQuickButtons[id - kQuickBase].alias;
+            if (wcscmp(alias, L"__CMD_SHLL") == 0) {
+                ExecuteMAXScriptScript(kShellScript, MAXScript::ScriptSource::Dynamic);
+            } else if (wcscmp(alias, L"__CMD_LINK") == 0) {
+                ExecuteMAXScriptScript(kLinkScript, MAXScript::ScriptSource::Dynamic);
+            } else {
+                ActivateAlias(alias);
+            }
+            return;
+        }
     }
 
     void OnTimer(UINT_PTR id)
