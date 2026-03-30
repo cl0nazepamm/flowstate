@@ -77,7 +77,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
     # Geom.lib
     Maxscrpt.lib
     # mesh.lib
-    # bmm.lib
+    bmm.lib
 )
 
 # ── MSVC settings ────────────────────────────────────────────────

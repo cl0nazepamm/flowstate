@@ -10,16 +10,58 @@ macroscript FlowState_Config
 
     local iniPath = (getDir #plugcfg) + "\\FlowState.ini"
 
-    rollout FlowState_ConfigDialog "FlowState Configuration" width:280 height:320
+    -- Read raw ini lines (no sections — matches C++ reader)
+    fn readFlag path key default:true = (
+        local f = openFile path mode:"r"
+        if f == undefined do return default
+        local result = default
+        while not eof f do (
+            local ln = readLine f
+            if findString ln (key + "=0") != undefined do result = false
+            if findString ln (key + "=1") != undefined do result = true
+        )
+        close f
+        result
+    )
+
+    -- Write config preserving XB1 and unknown lines
+    fn writeConfig path pp ps ms subobj = (
+        -- Read existing lines, keep XB1 assignments and unknowns
+        local keep = #()
+        local f = openFile path mode:"r"
+        if f != undefined do (
+            while not eof f do (
+                local ln = readLine f
+                if findString ln "XB1:" == 1 do append keep ln
+            )
+            close f
+        )
+        -- Write fresh
+        f = createFile path
+        if f == undefined do return()
+        if not pp do format "PowerParams=0\n" to:f
+        if not ps do format "PowerShader=0\n" to:f
+        if not ms do format "ModStack=0\n" to:f
+        if subobj do format "SubObjToggles=1\n" to:f
+        for ln in keep do format "%\n" ln to:f
+        close f
+    )
+
+    rollout FlowState_ConfigDialog "FlowState Configuration" width:280 height:360
     (
         group "Modules"
         (
-            checkbox chk_powerparams "PowerParams (Mouse4 Panel)" checked:true
-            checkbox chk_powershader "PowerShader (Shift+Mouse4)" checked:true
-            checkbox chk_modstack "ModStack Search (Ctrl+Mouse4)" checked:true
+            checkbox chk_powerparams "PowerParams (XButton2)" checked:true
+            checkbox chk_powershader "PowerShader (Shift+XButton2)" checked:true
+            checkbox chk_modstack "ModStack Search (Ctrl+XButton2)" checked:true
         )
 
-        group "Settings"
+        group "Options"
+        (
+            checkbox chk_subobj "Show Sub-Object Toggles (V/E/B/F/El)" checked:false
+        )
+
+        group "Actions"
         (
             button btn_save "Save Configuration" width:240 height:28
             button btn_forget "Clear All Settings (Reset)" width:240 height:28
@@ -27,46 +69,43 @@ macroscript FlowState_Config
 
         group "About"
         (
-            label lbl_name "FlowState" align:#center
-            label lbl_ver "v1.0.0" align:#center
-            label lbl_desc "Modifier stack under the cursor." align:#center
+            label lbl_name "FlowState v1.1" align:#center
+            label lbl_desc "Floating parameters under the cursor." align:#center
             label lbl_author "CloneTools" align:#center
             label lbl_blank ""
-            label lbl_keys1 "Mouse4: PowerParams panel" align:#left
-            label lbl_keys2 "Shift+Mouse4: PowerShader" align:#left
-            label lbl_keys3 "Ctrl+Mouse4: ModStack search" align:#left
-            label lbl_keys4 "Middle-click: Toggle side buttons" align:#left
-            label lbl_keys5 "Right-click param: Toggle favorite" align:#left
-            label lbl_keys6 "Ctrl+click param: Hide param" align:#left
-            label lbl_keys7 "Shift+click header: Unhide params" align:#left
+            label lbl_keys1 "XButton2: PowerParams panel" align:#left
+            label lbl_keys2 "Shift+XButton2: PowerShader" align:#left
+            label lbl_keys3 "Ctrl+XButton2: ModStack search" align:#left
+            label lbl_keys4 "Shift+XButton1: Time slider" align:#left
+            label lbl_keys5 "Ctrl+XButton1: Opacity slider" align:#left
+            label lbl_keys6 "XButton1 on fav: Assign drag axis" align:#left
+            label lbl_keys7 "Right-click param: Toggle favorite" align:#left
+            label lbl_keys8 "Ctrl+click param: Hide param" align:#left
         )
 
         on FlowState_ConfigDialog open do
         (
-            local v1 = getINISetting iniPath "FlowState" "PowerParams"
-            local v2 = getINISetting iniPath "FlowState" "PowerShader"
-            local v3 = getINISetting iniPath "FlowState" "ModStack"
-            chk_powerparams.checked = (if v1 == "" then true else v1 == "1")
-            chk_powershader.checked = (if v2 == "" then true else v2 == "1")
-            chk_modstack.checked = (if v3 == "" then true else v3 == "1")
+            chk_powerparams.checked = readFlag iniPath "PowerParams"
+            chk_powershader.checked = readFlag iniPath "PowerShader"
+            chk_modstack.checked = readFlag iniPath "ModStack"
+            chk_subobj.checked = readFlag iniPath "SubObjToggles" default:false
         )
 
         on btn_save pressed do
         (
-            setINISetting iniPath "FlowState" "PowerParams" (if chk_powerparams.checked then "1" else "0")
-            setINISetting iniPath "FlowState" "PowerShader" (if chk_powershader.checked then "1" else "0")
-            setINISetting iniPath "FlowState" "ModStack" (if chk_modstack.checked then "1" else "0")
-            messageBox "Configuration saved. Restart 3ds Max for changes to take effect." title:"FlowState"
+            writeConfig iniPath chk_powerparams.checked chk_powershader.checked chk_modstack.checked chk_subobj.checked
+            messageBox "Configuration saved.\nRestart 3ds Max for changes to take effect." title:"FlowState"
         )
 
         on btn_forget pressed do
         (
-            if queryBox "Clear all FlowState settings?\n\nThis will reset collapsed groups, hidden params, and favorites." title:"FlowState" then
+            if queryBox "Clear all FlowState settings?\n\nThis will reset collapsed groups, hidden params, favorites, and XB1 assignments." title:"FlowState" then
             (
-                local cfgPath = (getDir #plugcfg) + "\\PowerParams.cfg"
-                try(deleteFile cfgPath)catch()
+                try(deleteFile ((getDir #plugcfg) + "\\PowerParams.cfg"))catch()
+                try(deleteFile ((getDir #plugcfg) + "\\PowerShader.cfg"))catch()
+                try(deleteFile ((getDir #plugcfg) + "\\PowerShader_Pins.cfg"))catch()
                 try(deleteFile iniPath)catch()
-                messageBox "Settings cleared. Restart 3ds Max to apply." title:"FlowState"
+                messageBox "Settings cleared.\nRestart 3ds Max to apply." title:"FlowState"
             )
         )
     )
@@ -79,5 +118,5 @@ macroscript FlowState_About
     buttonText:"FlowState About"
     tooltip:"About FlowState"
 (
-    messageBox "FlowState v1.0.0\n\nModifier stack under the cursor.\nPowered by CloneTools.\n\nMouse4: PowerParams\nShift+Mouse4: PowerShader\nCtrl+Mouse4: ModStack" title:"About FlowState"
+    messageBox "FlowState v1.1\n\nFloating parameters under the cursor.\nPowered by CloneTools.\n\nXButton2: PowerParams\nShift+XButton2: PowerShader\nCtrl+XButton2: ModStack\nShift+XButton1: Time slider\nCtrl+XButton1: Opacity slider\nXButton1: Assigned param drag" title:"About FlowState"
 )
