@@ -1473,7 +1473,7 @@ static void GatherParams() {
         }
     }
 
-    // ── Spline detection — base Editable Spline only ───────────
+    // ── Spline detection — base Editable Spline only (not Edit Spline modifier)
     if (g_ctx == CTX_NONE) {
         SplineShape* ss = FindSplineShape(node);
         if (ss) {

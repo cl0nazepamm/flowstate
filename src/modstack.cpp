@@ -20,6 +20,8 @@
 #include <object.h>
 #include <GetCOREInterface.h>
 #include <maxscript/maxscript.h>
+#include <imacroscript.h>
+#include <hold.h>
 #include <custcont.h>
 
 extern HINSTANCE hInstance;
@@ -41,6 +43,7 @@ namespace Theme
     constexpr COLORREF textBrt  = RGB(255, 255, 255);
     constexpr COLORREF border   = RGB(42, 42, 42);
     constexpr COLORREF wsmClr   = RGB(200, 180, 255);
+    constexpr COLORREF macroClr = RGB(255, 200, 120);
 
     HBRUSH brBg     = nullptr;
     HBRUSH brPanel  = nullptr;
@@ -87,7 +90,7 @@ constexpr UINT kSearchDebounceMs = 14;
 // ═════════════════════════════════════════════════════════════════
 //  Data
 // ═════════════════════════════════════════════════════════════════
-enum class ModKind { OSM, WSM };
+enum class ModKind { OSM, WSM, Macro };
 
 struct ModItem
 {
@@ -98,6 +101,7 @@ struct ModItem
     std::wstring internalName;
     ModKind kind = ModKind::OSM;
     ClassDesc* classDesc = nullptr;
+    MacroID macroId = -1; // for macroscripts
 };
 
 // ═════════════════════════════════════════════════════════════════
@@ -410,7 +414,8 @@ private:
         FillRect(dis->hDC, &dis->rcItem, sel ? Theme::brAccent : Theme::brBg);
 
         COLORREF tc = sel ? Theme::textBrt : Theme::text;
-        if (!sel && item.kind == ModKind::WSM) tc = Theme::wsmClr;
+        if (!sel && item.kind == ModKind::WSM)   tc = Theme::wsmClr;
+        if (!sel && item.kind == ModKind::Macro) tc = Theme::macroClr;
 
         SetBkMode(dis->hDC, TRANSPARENT);
         HFONT oldF = (HFONT)SelectObject(dis->hDC, Theme::fontUI);
@@ -518,6 +523,7 @@ private:
         cache_.reserve(512);
         ScanClasses(OSM_CLASS_ID, ModKind::OSM);
         ScanClasses(WSM_CLASS_ID, ModKind::WSM);
+        ScanMacros();
         std::sort(cache_.begin(), cache_.end(),
             [](const ModItem& a, const ModItem& b) { return a.label < b.label; });
         cacheReady_ = true;
@@ -568,6 +574,39 @@ private:
             item.internalName = (intName && intName[0]) ? std::wstring(intName) : L"";
             item.kind         = kind;
             item.classDesc    = cd;
+            cache_.push_back(std::move(item));
+        }
+    }
+
+    void ScanMacros()
+    {
+        MacroDir& dir = GetMacroScriptDir();
+        int count = dir.Count();
+        std::set<std::wstring> seen;
+        for (int i = 0; i < count; i++) {
+            MacroEntry* me = dir.GetMacro(i);
+            if (!me) continue;
+            MSTR name = me->GetName();
+            MSTR cat  = me->GetCategory();
+            MSTR btn  = me->GetButtonText();
+            // Use buttonText if available, else name
+            std::wstring label = (btn.data() && btn.data()[0]) ? std::wstring(btn.data())
+                               : (name.data() && name.data()[0]) ? std::wstring(name.data()) : L"";
+            if (label.empty()) continue;
+            // Skip duplicates (same name+category)
+            std::wstring dedupKey = label + L"|" + (cat.data() ? cat.data() : L"");
+            if (!seen.insert(dedupKey).second) continue;
+
+            ModItem item;
+            item.label      = label;
+            item.normLabel  = Normalize(label, true);
+            item.search     = Normalize(
+                label + L" " +
+                (name.data() ? name.data() : L"") + L" " +
+                (cat.data() ? cat.data() : L""), true);
+            item.category   = (cat.data() && cat.data()[0]) ? std::wstring(cat.data()) : L"";
+            item.kind       = ModKind::Macro;
+            item.macroId    = me->GetID();
             cache_.push_back(std::move(item));
         }
     }
@@ -623,19 +662,28 @@ private:
         const ModItem& item = cache_[static_cast<size_t>(si)];
 
         Interface* ip = GetCOREInterface();
+
+        if (item.kind == ModKind::Macro) {
+            // Macroscript — execute it
+            MacroDir& dir = GetMacroScriptDir();
+            if (dir.ValidID(item.macroId))
+                dir.Execute(item.macroId);
+            SetStatus(L"Run: " + item.label);
+            Hide();
+            return;
+        }
+
         if (!ip || ip->GetSelNodeCount() == 0) { SetStatus(L"No selection."); return; }
 
-        // Create modifier and add via MaxScript for proper undo support
-        if (!item.internalName.empty())
-        {
-            std::wstring script = L"addModifier $ (" + item.internalName + L"())";
-            ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
-        }
-        else
-        {
-            // Fallback: use class name
-            std::wstring script = L"addModifier $ (" + item.label + L"())";
-            ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
+        // Modifier — add via C++ SDK
+        if (item.classDesc) {
+            void* obj = item.classDesc->Create(FALSE);
+            Modifier* mod = static_cast<Modifier*>(obj);
+            if (mod) {
+                theHold.Begin();
+                GetCOREInterface7()->AddModifier(*ip->GetSelNode(0), *mod);
+                theHold.Accept(_T("Add Modifier"));
+            }
         }
 
         if (ip) ip->RedrawViews(ip->GetTime());
