@@ -467,16 +467,24 @@ private:
                            wa.left, wa.right - static_cast<long>(kWindowWidth));
         int y = std::clamp(static_cast<long>(p.y - 36),
                            wa.top, wa.bottom - static_cast<long>(kWindowHeight));
+        int startY = y + 15;
         SetLayeredWindowAttributes(wnd_, 0, 0, LWA_ALPHA);
-        SetWindowPos(wnd_, HWND_TOPMOST, x, y, kWindowWidth, kWindowHeight, 0);
+        SetWindowPos(wnd_, HWND_TOPMOST, x, startY, kWindowWidth, kWindowHeight, 0);
         ShowWindow(wnd_, SW_SHOW);
-        // Fade in — cubic ease-out, 80ms
+        // Fade & slide in — cubic ease-out, 80ms
         DWORD t0 = GetTickCount();
         for (;;) {
             float t = (float)(GetTickCount() - t0) / 80.0f;
-            if (t >= 1.0f) { SetLayeredWindowAttributes(wnd_, 0, 255, LWA_ALPHA); break; }
-            BYTE a = (BYTE)(255.0f * (1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t)));
+            if (t >= 1.0f) { 
+                SetLayeredWindowAttributes(wnd_, 0, 255, LWA_ALPHA); 
+                SetWindowPos(wnd_, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                break; 
+            }
+            float ease = 1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t);
+            BYTE a = (BYTE)(255.0f * ease);
+            int curY = startY - (int)(15.0f * ease);
             SetLayeredWindowAttributes(wnd_, 0, a, LWA_ALPHA);
+            SetWindowPos(wnd_, nullptr, x, curY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             MSG msg; while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
         }
         SetActiveWindow(wnd_);
@@ -493,14 +501,19 @@ private:
     void Hide()
     {
         CancelPendingRebuild();
-        // Fade out — 50ms
+        // Fade & slide out — 50ms
         if (IsWindowVisible(wnd_)) {
+            RECT r; GetWindowRect(wnd_, &r);
+            int x = r.left, y = r.top;
             DWORD t0 = GetTickCount();
             for (;;) {
                 float t = (float)(GetTickCount() - t0) / 50.0f;
                 if (t >= 1.0f) break;
-                BYTE a = (BYTE)(255.0f * (1.0f-t)*(1.0f-t)*(1.0f-t));
+                float ease = t * t * t; // cubic ease-in
+                BYTE a = (BYTE)(255.0f * (1.0f - ease));
+                int curY = y + (int)(10.0f * ease);
                 SetLayeredWindowAttributes(wnd_, 0, a, LWA_ALPHA);
+                SetWindowPos(wnd_, nullptr, x, curY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
                 MSG msg; while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
             }
         }

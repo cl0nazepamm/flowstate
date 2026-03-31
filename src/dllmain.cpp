@@ -501,6 +501,8 @@ struct FadeState {
     bool fadingIn = false;
     bool fadingOut = false;
     DWORD startTime = 0;
+    POINT basePos = {};
+    POINT compPos[4] = {};
     // Companion windows to fade alongside
     HWND companions[4] = {};
     int numCompanions = 0;
@@ -514,18 +516,41 @@ static void FadeSetAlpha(BYTE alpha) {
             SetLayeredWindowAttributes(g_fade.companions[i], 0, alpha, LWA_ALPHA);
 }
 
+static void FadeSetPos(float curve) {
+    // fadingIn: curve goes 0->1. offset goes 15->0. pos = base + offset (slides UP to base)
+    // fadingOut: curve goes 0->1. offset goes 0->10. pos = base + offset (slides DOWN from base)
+    int offset = g_fade.fadingIn ? (int)(15.0f * (1.0f - curve)) : (int)(10.0f * curve);
+    
+    SetWindowPos(g_fade.hwnd, nullptr, g_fade.basePos.x, g_fade.basePos.y + offset, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    for (int i = 0; i < g_fade.numCompanions; i++) {
+        if (g_fade.companions[i] && IsWindowVisible(g_fade.companions[i])) {
+            SetWindowPos(g_fade.companions[i], nullptr, g_fade.compPos[i].x, g_fade.compPos[i].y + offset, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+}
+
 static void CALLBACK FadeTimerProc(HWND, UINT, UINT_PTR, DWORD) {
     float t = (float)(GetTickCount() - g_fade.startTime) / (float)kFadeDurationMs;
     if (t >= 1.0f) t = 1.0f;
-    // Cubic ease-out: fast start, smooth settle
-    float curve = g_fade.fadingIn ? (1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t)) : ((1.0f-t)*(1.0f-t)*(1.0f-t));
-    BYTE alpha = (BYTE)(curve * 255.0f);
+    // Cubic ease-out: fast start, smooth settle for both alpha and pos
+    float curve = g_fade.fadingIn ? (1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t)) : (t*t*t);
+    BYTE alpha = g_fade.fadingIn ? (BYTE)(curve * 255.0f) : (BYTE)((1.0f - curve) * 255.0f);
     FadeSetAlpha(alpha);
+    FadeSetPos(curve);
     if (t >= 1.0f) {
         KillTimer(g_fade.hwnd, kFadeTimerId);
         if (g_fade.fadingOut) {
             ShowWindow(g_fade.hwnd, SW_HIDE);
             FadeSetAlpha(255); // reset for next show
+            SetWindowPos(g_fade.hwnd, nullptr, g_fade.basePos.x, g_fade.basePos.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            for (int i = 0; i < g_fade.numCompanions; i++) {
+                if (g_fade.companions[i]) SetWindowPos(g_fade.companions[i], nullptr, g_fade.compPos[i].x, g_fade.compPos[i].y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        } else {
+            SetWindowPos(g_fade.hwnd, nullptr, g_fade.basePos.x, g_fade.basePos.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            for (int i = 0; i < g_fade.numCompanions; i++) {
+                if (g_fade.companions[i]) SetWindowPos(g_fade.companions[i], nullptr, g_fade.compPos[i].x, g_fade.compPos[i].y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
         }
         g_fade.fadingIn = g_fade.fadingOut = false;
     }
@@ -536,7 +561,15 @@ static void FadeIn(HWND hwnd, HWND* companions = nullptr, int numComp = 0) {
     g_fade.fadingIn = true; g_fade.fadingOut = false;
     g_fade.startTime = GetTickCount();
     g_fade.numCompanions = std::min(numComp, 4);
-    for (int i = 0; i < g_fade.numCompanions; i++) g_fade.companions[i] = companions[i];
+    RECT r; GetWindowRect(hwnd, &r); g_fade.basePos = {r.left, r.top};
+    for (int i = 0; i < g_fade.numCompanions; i++) {
+        g_fade.companions[i] = companions[i];
+        if (companions[i]) {
+            RECT cr; GetWindowRect(companions[i], &cr);
+            g_fade.compPos[i] = {cr.left, cr.top};
+            ShowWindow(companions[i], SW_SHOWNA);
+        }
+    }
     FadeSetAlpha(0);
     ShowWindow(hwnd, SW_SHOWNA);
     SetTimer(hwnd, kFadeTimerId, kFadeIntervalMs, FadeTimerProc);
@@ -547,6 +580,13 @@ static void FadeOut(HWND hwnd) {
     g_fade.hwnd = hwnd;
     g_fade.fadingOut = true; g_fade.fadingIn = false;
     g_fade.startTime = GetTickCount();
+    RECT r; GetWindowRect(hwnd, &r); g_fade.basePos = {r.left, r.top};
+    for (int i = 0; i < g_fade.numCompanions; i++) {
+        if (g_fade.companions[i]) {
+            RECT cr; GetWindowRect(g_fade.companions[i], &cr);
+            g_fade.compPos[i] = {cr.left, cr.top};
+        }
+    }
     SetTimer(hwnd, kFadeTimerId, kFadeIntervalMs, FadeTimerProc);
 }
 
@@ -1961,7 +2001,7 @@ static void PositionBtnStrips() {
     int topY = pr.top - sh - kSideGap;
 
     SetWindowPos(g_btnLeft, HWND_TOPMOST, pr.left, topY, lw, sh,
-        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SWP_NOACTIVATE | SWP_NOZORDER);
     InvalidateRect(g_btnLeft, nullptr, FALSE);
 }
 
@@ -2588,7 +2628,7 @@ static void PositionFavStrip() {
     int h = 8 + rows * (kFavCellH + kFavGap);
     SetWindowPos(g_favWnd, HWND_TOPMOST,
         pr.left + (panelW - w) / 2, pr.bottom + kSideGap,
-        w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        w, h, SWP_NOACTIVATE | SWP_NOZORDER);
 }
 
 static HFONT g_fontTiny = nullptr;
@@ -3173,10 +3213,15 @@ static void OpenPanel() {
 
     BuildLayout();
     PositionBtnStrips();
+    BuildFavorites();
+    PositionFavStrip();
+
     // Fade in panel with companions (button strips, fav strip)
     HWND fadeComps[] = { g_btnLeft, g_favWnd };
     FadeIn(g_panel, fadeComps, 2);
     SetTimer(g_panel, 1, kRefreshMs, nullptr);
+    if (g_favWnd && !g_favEdits.empty())
+        SetTimer(g_favWnd, 1, kRefreshMs, nullptr);
 
     // Create search bar in header
     if (!g_modSearchEdit) {
@@ -3198,12 +3243,6 @@ static void OpenPanel() {
 
     // Only take focus if no EPoly tool is being taken over
     if (g_epolyOp < 0) SetFocus(g_panel);
-
-    // Build and show favorites strip
-    BuildFavorites();
-    PositionFavStrip();
-    if (g_favWnd && !g_favEdits.empty())
-        SetTimer(g_favWnd, 1, kRefreshMs, nullptr);
 }
 
 static void ClosePanel() {
