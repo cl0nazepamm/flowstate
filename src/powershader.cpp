@@ -113,17 +113,17 @@ bool IsCursorOverSme()
 // ═══════════════════════════════════════════════════════════════
 namespace Theme
 {
-    constexpr COLORREF bg       = RGB(46, 46, 46);
-    constexpr COLORREF panel    = RGB(56, 56, 56);
-    constexpr COLORREF panelLt  = RGB(68, 68, 68);
-    constexpr COLORREF panelHov = RGB(80, 80, 80);
-    constexpr COLORREF accent   = RGB(38, 148, 168);
-    constexpr COLORREF text     = RGB(220, 220, 220);
-    constexpr COLORREF textDim  = RGB(140, 140, 140);
-    constexpr COLORREF textBrt  = RGB(255, 255, 255);
-    constexpr COLORREF border   = RGB(42, 42, 42);
-    constexpr COLORREF mapClr   = RGB(180, 200, 255);
-    constexpr COLORREF sceneClr = RGB(100, 200, 100);
+    constexpr COLORREF bg       = RGB(215, 218, 222);
+    constexpr COLORREF panel    = RGB(225, 228, 232);
+    constexpr COLORREF panelLt  = RGB(240, 242, 245);
+    constexpr COLORREF panelHov = RGB(250, 250, 250);
+    constexpr COLORREF accent   = RGB(150, 155, 165);
+    constexpr COLORREF text     = RGB(30, 30, 30);
+    constexpr COLORREF textDim  = RGB(100, 100, 100);
+    constexpr COLORREF textBrt  = RGB(10, 10, 10);
+    constexpr COLORREF border   = RGB(140, 145, 150);
+    constexpr COLORREF mapClr   = RGB(80, 100, 180);
+    constexpr COLORREF sceneClr = RGB(50, 120, 50);
 
     HBRUSH brBg      = nullptr;
     HBRUSH brPanel   = nullptr;

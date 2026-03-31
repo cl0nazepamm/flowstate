@@ -51,18 +51,18 @@ static const int kSideGap   = 4;     // gap between button strip and panel
 static const int kMaxPanelH = 700;
 
 // 3ds Max dark theme colors
-static const COLORREF kBg        = RGB(56, 56, 56);
-static const COLORREF kBorder    = RGB(42, 42, 42);
-static const COLORREF kAccent    = RGB(38, 148, 168);   // teal
-static const COLORREF kGroupClr  = RGB(190, 190, 190);
-static const COLORREF kLabelClr  = RGB(195, 195, 195);
-static const COLORREF kValueClr  = RGB(230, 230, 230);
-static const COLORREF kEditBg    = RGB(42, 42, 42);
-static const COLORREF kEditFocus = RGB(48, 58, 65);
-static const COLORREF kCloseHov  = RGB(200, 60, 60);
-static const COLORREF kBtnBg     = RGB(68, 68, 68);
-static const COLORREF kBtnHov    = RGB(80, 80, 80);
-static const COLORREF kBtnAct    = RGB(38, 148, 168);   // active = teal
+static const COLORREF kBg        = RGB(215, 218, 222);
+static const COLORREF kBorder    = RGB(140, 145, 150);
+static const COLORREF kAccent    = RGB(150, 155, 165);
+static const COLORREF kGroupClr  = RGB(40, 40, 40);
+static const COLORREF kLabelClr  = RGB(60, 60, 60);
+static const COLORREF kValueClr  = RGB(20, 20, 20);
+static const COLORREF kEditBg    = RGB(240, 242, 245);
+static const COLORREF kEditFocus = RGB(255, 255, 255);
+static const COLORREF kCloseHov  = RGB(180, 50, 50);
+static const COLORREF kBtnBg     = RGB(225, 228, 232);
+static const COLORREF kBtnHov    = RGB(240, 242, 245);
+static const COLORREF kBtnAct    = RGB(180, 185, 190);
 
 static std::wstring MakeParamLabel(const MCHAR* rawName) {
     if (!rawName || !rawName[0]) return L"?";
@@ -1907,7 +1907,7 @@ static void DrawBtnStrip(HDC mem, const BtnDef* btns, int count,
     HPEN penB = CreatePen(PS_SOLID, 1, kBorder);
     HPEN oldP = (HPEN)SelectObject(mem, penB);
     SelectObject(mem, GetStockObject(NULL_BRUSH));
-    RoundRect(mem, 0, 0, w, h, 6, 6);
+    Rectangle(mem, 0, 0, w, h);
     SelectObject(mem, oldP); DeleteObject(penB);
 
     SetBkMode(mem, TRANSPARENT);
@@ -2609,7 +2609,7 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         HPEN p = CreatePen(PS_SOLID, 1, kBorder);
         HPEN op2 = (HPEN)SelectObject(mem, p);
         SelectObject(mem, GetStockObject(NULL_BRUSH));
-        RoundRect(mem, 0, 0, rc.right, rc.bottom, 6, 6);
+        Rectangle(mem, 0, 0, rc.right, rc.bottom);
         SelectObject(mem, op2); DeleteObject(p);
 
         // Tiny labels — brick layout
