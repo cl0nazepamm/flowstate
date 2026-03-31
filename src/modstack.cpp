@@ -350,7 +350,7 @@ private:
     {
         if (wnd_) return true;
         wnd_ = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kWndClass,
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, kWndClass,
             nullptr, WS_POPUP,
             CW_USEDEFAULT, CW_USEDEFAULT, kWindowWidth, kWindowHeight,
             GetCOREInterface() ? GetCOREInterface()->GetMAXHWnd() : nullptr,
@@ -467,8 +467,18 @@ private:
                            wa.left, wa.right - static_cast<long>(kWindowWidth));
         int y = std::clamp(static_cast<long>(p.y - 36),
                            wa.top, wa.bottom - static_cast<long>(kWindowHeight));
+        SetLayeredWindowAttributes(wnd_, 0, 0, LWA_ALPHA);
         SetWindowPos(wnd_, HWND_TOPMOST, x, y, kWindowWidth, kWindowHeight, 0);
         ShowWindow(wnd_, SW_SHOW);
+        // Fade in — cubic ease-out, 80ms
+        DWORD t0 = GetTickCount();
+        for (;;) {
+            float t = (float)(GetTickCount() - t0) / 80.0f;
+            if (t >= 1.0f) { SetLayeredWindowAttributes(wnd_, 0, 255, LWA_ALPHA); break; }
+            BYTE a = (BYTE)(255.0f * (1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t)));
+            SetLayeredWindowAttributes(wnd_, 0, a, LWA_ALPHA);
+            MSG msg; while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+        }
         SetActiveWindow(wnd_);
         SetForegroundWindow(wnd_);
         SetFocus(edit_);
@@ -483,7 +493,19 @@ private:
     void Hide()
     {
         CancelPendingRebuild();
+        // Fade out — 50ms
+        if (IsWindowVisible(wnd_)) {
+            DWORD t0 = GetTickCount();
+            for (;;) {
+                float t = (float)(GetTickCount() - t0) / 50.0f;
+                if (t >= 1.0f) break;
+                BYTE a = (BYTE)(255.0f * (1.0f-t)*(1.0f-t)*(1.0f-t));
+                SetLayeredWindowAttributes(wnd_, 0, a, LWA_ALPHA);
+                MSG msg; while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+            }
+        }
         ShowWindow(wnd_, SW_HIDE);
+        SetLayeredWindowAttributes(wnd_, 0, 255, LWA_ALPHA);
         EnableAccelerators();
     }
 

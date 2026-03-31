@@ -171,7 +171,6 @@ constexpr int kShllId    = 1008;
 constexpr int kSceneId   = 1004;
 constexpr int kTabMatId  = 1006;
 constexpr int kTabMapId  = 1007;
-constexpr int kApplyChk  = 1009;
 constexpr int kWindowWidth  = 380;
 constexpr int kWindowHeight = 540;
 constexpr int kHeaderH      = 34;
@@ -1028,7 +1027,7 @@ private:
                 { self->DrawListItem(dis); return TRUE; }
             if (dis->CtlID == kTabMatId || dis->CtlID == kTabMapId ||
                 dis->CtlID == kLinkId || dis->CtlID == kShllId ||
-                dis->CtlID == kApplyChk || dis->CtlID == kSceneId ||
+                dis->CtlID == kSceneId ||
                 (dis->CtlID >= kBrickBase && dis->CtlID < kBrickBase + kBrickMax))
                 { self->DrawButton(dis); return TRUE; }
             break;
@@ -1145,7 +1144,7 @@ private:
     {
         if (wnd_) return true;
         wnd_ = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kPaletteClass,
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, kPaletteClass,
             nullptr,
             WS_POPUP,
             CW_USEDEFAULT, CW_USEDEFAULT, kWindowWidth, kWindowHeight,
@@ -1188,25 +1187,21 @@ private:
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTabMapId)), hInstance, nullptr);
         y += 26;
 
-        // Command row: LINK | SHLL | Scene Items | [✓] Apply
+        // Command row: LINK | SHLL | Scene
         const int gap = 3;
-        int btnW4 = (cw - 3 * gap) / 4;
+        int btnW3 = (cw - 2 * gap) / 3;
         link_ = CreateWindowExW(0, L"BUTTON", L"LINK",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            pad, y, btnW4, 22, h,
+            pad, y, btnW3, 22, h,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLinkId)), hInstance, nullptr);
         shll_ = CreateWindowExW(0, L"BUTTON", L"SHLL",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            pad + btnW4 + gap, y, btnW4, 22, h,
+            pad + btnW3 + gap, y, btnW3, 22, h,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kShllId)), hInstance, nullptr);
         scene_ = CreateWindowExW(0, L"BUTTON", L"Scene",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            pad + 2 * (btnW4 + gap), y, btnW4, 22, h,
+            pad + 2 * (btnW3 + gap), y, cw - 2 * (btnW3 + gap), 22, h,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSceneId)), hInstance, nullptr);
-        applyChk_ = CreateWindowExW(0, L"BUTTON", L"\u2610 Sel",
-            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            pad + 3 * (btnW4 + gap), y, cw - 3 * (btnW4 + gap), 22, h,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kApplyChk)), hInstance, nullptr);
         y += 26;
 
         // Results list (owner-drawn)
@@ -1308,7 +1303,6 @@ private:
         // Determine active state based on control type
         if (id == kTabMatId)      active = (tab_ == TabMode::Materials);
         else if (id == kTabMapId) active = (tab_ == TabMode::Maps);
-        else if (id == kApplyChk) active = applyToSel_;
         else if (id == kSceneId)  active = sceneOnly_;
         else                      active = (dis->itemState & ODS_SELECTED) != 0;
 
@@ -1354,8 +1348,18 @@ private:
                            wa.left, wa.right - static_cast<long>(kWindowWidth));
         int y = std::clamp(static_cast<long>(p.y + 20),
                            wa.top, wa.bottom - static_cast<long>(kWindowHeight));
+        SetLayeredWindowAttributes(wnd_, 0, 0, LWA_ALPHA);
         ShowWindow(wnd_, SW_SHOW);
         SetWindowPos(wnd_, HWND_TOPMOST, x, y, kWindowWidth, kWindowHeight, 0);
+        // Fade in — cubic ease-out, 80ms
+        DWORD t0 = GetTickCount();
+        for (;;) {
+            float t = (float)(GetTickCount() - t0) / 80.0f;
+            if (t >= 1.0f) { SetLayeredWindowAttributes(wnd_, 0, 255, LWA_ALPHA); break; }
+            BYTE a = (BYTE)(255.0f * (1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t)));
+            SetLayeredWindowAttributes(wnd_, 0, a, LWA_ALPHA);
+            MSG msg; while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+        }
         SetActiveWindow(wnd_);
         SetForegroundWindow(wnd_);
         SetFocus(edit_);
@@ -1367,7 +1371,19 @@ private:
     void Hide()
     {
         CancelPendingRebuild();
+        // Fade out — cubic ease-in, 50ms
+        if (IsWindowVisible(wnd_)) {
+            DWORD t0 = GetTickCount();
+            for (;;) {
+                float t = (float)(GetTickCount() - t0) / 50.0f;
+                if (t >= 1.0f) break;
+                BYTE a = (BYTE)(255.0f * (1.0f-t)*(1.0f-t)*(1.0f-t));
+                SetLayeredWindowAttributes(wnd_, 0, a, LWA_ALPHA);
+                MSG msg; while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+            }
+        }
         ShowWindow(wnd_, SW_HIDE);
+        SetLayeredWindowAttributes(wnd_, 0, 255, LWA_ALPHA);
         dragging_ = false;
         dragIndex_ = -1;
         // Restore Max keyboard shortcuts
@@ -1384,13 +1400,6 @@ private:
         }
         if (id == kShllId) {
             ExecuteShellCommand(shllRes_);
-            return;
-        }
-        if (id == kApplyChk) {
-            applyToSel_ = !applyToSel_;
-            // Update checkbox label
-            SetWindowTextW(applyChk_, applyToSel_ ? L"\u2611 Sel" : L"\u2610 Sel");
-            InvalidateRect(applyChk_, nullptr, FALSE);
             return;
         }
         if (id == kSceneId)
@@ -1700,14 +1709,6 @@ private:
         if (isNew)
             mb->SetName(MSTR((item.label + L"_" +
                 std::to_wstring((GetTickCount() % 9000) + 1000)).c_str()));
-
-        // Apply to selection (materials only)
-        if (applyToSel_ && isMat)
-        {
-            Mtl* mtl = static_cast<Mtl*>(mb);
-            for (int i = 0; i < ip->GetSelNodeCount(); ++i)
-                if (INode* n = ip->GetSelNode(i)) n->SetMtl(mtl);
-        }
 
         // Get medit slot
         int slot = 0;
@@ -2025,7 +2026,6 @@ private:
     HWND link_      = nullptr;
     HWND shll_      = nullptr;
     HWND scene_     = nullptr;
-    HWND applyChk_  = nullptr;
     HWND status_    = nullptr;
     TabMode tab_    = TabMode::All;
     std::vector<Item> classItems_;
@@ -2045,7 +2045,6 @@ private:
     RECT  closeRect_ = {};
     bool  hoverClose_ = false;
     bool  trackingMouse_ = false;
-    bool  applyToSel_ = false;
     bool  sceneOnly_  = false;
     int   listBaseY_  = 0;
     // Dual favorites

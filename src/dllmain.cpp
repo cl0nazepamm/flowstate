@@ -491,6 +491,65 @@ static void SaveXB1Assignment() {
     if (f) { for (auto& l : lines) fwprintf(f, L"%s", l.c_str()); fclose(f); }
 }
 
+// ── Fade animation (non-blocking, ease-out curve) ───────────────
+constexpr UINT_PTR kFadeTimerId = 99;
+constexpr int kFadeDurationMs = 80;   // total fade time
+constexpr int kFadeIntervalMs = 10;   // timer tick
+
+struct FadeState {
+    HWND hwnd = nullptr;
+    bool fadingIn = false;
+    bool fadingOut = false;
+    DWORD startTime = 0;
+    // Companion windows to fade alongside
+    HWND companions[4] = {};
+    int numCompanions = 0;
+};
+static FadeState g_fade;
+
+static void FadeSetAlpha(BYTE alpha) {
+    SetLayeredWindowAttributes(g_fade.hwnd, 0, alpha, LWA_ALPHA);
+    for (int i = 0; i < g_fade.numCompanions; i++)
+        if (g_fade.companions[i] && IsWindowVisible(g_fade.companions[i]))
+            SetLayeredWindowAttributes(g_fade.companions[i], 0, alpha, LWA_ALPHA);
+}
+
+static void CALLBACK FadeTimerProc(HWND, UINT, UINT_PTR, DWORD) {
+    float t = (float)(GetTickCount() - g_fade.startTime) / (float)kFadeDurationMs;
+    if (t >= 1.0f) t = 1.0f;
+    // Cubic ease-out: fast start, smooth settle
+    float curve = g_fade.fadingIn ? (1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t)) : ((1.0f-t)*(1.0f-t)*(1.0f-t));
+    BYTE alpha = (BYTE)(curve * 255.0f);
+    FadeSetAlpha(alpha);
+    if (t >= 1.0f) {
+        KillTimer(g_fade.hwnd, kFadeTimerId);
+        if (g_fade.fadingOut) {
+            ShowWindow(g_fade.hwnd, SW_HIDE);
+            FadeSetAlpha(255); // reset for next show
+        }
+        g_fade.fadingIn = g_fade.fadingOut = false;
+    }
+}
+
+static void FadeIn(HWND hwnd, HWND* companions = nullptr, int numComp = 0) {
+    g_fade.hwnd = hwnd;
+    g_fade.fadingIn = true; g_fade.fadingOut = false;
+    g_fade.startTime = GetTickCount();
+    g_fade.numCompanions = std::min(numComp, 4);
+    for (int i = 0; i < g_fade.numCompanions; i++) g_fade.companions[i] = companions[i];
+    FadeSetAlpha(0);
+    ShowWindow(hwnd, SW_SHOWNA);
+    SetTimer(hwnd, kFadeTimerId, kFadeIntervalMs, FadeTimerProc);
+}
+
+static void FadeOut(HWND hwnd) {
+    if (!IsWindowVisible(hwnd)) return;
+    g_fade.hwnd = hwnd;
+    g_fade.fadingOut = true; g_fade.fadingIn = false;
+    g_fade.startTime = GetTickCount();
+    SetTimer(hwnd, kFadeTimerId, kFadeIntervalMs, FadeTimerProc);
+}
+
 // Forward declarations (defined later in file)
 static bool IsFloat(ParamType2 t);
 static bool IsInt(ParamType2 t);
@@ -3113,8 +3172,10 @@ static void OpenPanel() {
     g_open = true;
 
     BuildLayout();
-    ShowWindow(g_panel, SW_SHOWNA);
     PositionBtnStrips();
+    // Fade in panel with companions (button strips, fav strip)
+    HWND fadeComps[] = { g_btnLeft, g_favWnd };
+    FadeIn(g_panel, fadeComps, 2);
     SetTimer(g_panel, 1, kRefreshMs, nullptr);
 
     // Create search bar in header
@@ -3172,10 +3233,10 @@ static void ClosePanel() {
     g_hoverParam = -1;
     g_edits.clear();
     g_groups.clear();
-    ShowWindow(g_panel, SW_HIDE);
     if (g_btnLeft)  ShowWindow(g_btnLeft, SW_HIDE);
     if (g_btnRight) ShowWindow(g_btnRight, SW_HIDE);
     if (g_favWnd)   { KillTimer(g_favWnd, 1); DestroyFavEdits(); ShowWindow(g_favWnd, SW_HIDE); }
+    FadeOut(g_panel);
     if (g_toolTip) ShowWindow(g_toolTip, SW_HIDE);
     g_open = false;
     g_hoverClose = false;
@@ -3242,8 +3303,9 @@ public:
         g_brEdit    = CreateSolidBrush(kEditBg);
         g_brEditFoc = CreateSolidBrush(kEditFocus);
 
-        g_panel = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,
+        g_panel = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_LAYERED,
             kWndClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
+        SetLayeredWindowAttributes(g_panel, 0, 255, LWA_ALPHA);
 
         // Button strip windows (separate floating windows for side buttons)
         WNDCLASSEX wcB = {};
@@ -3253,8 +3315,9 @@ public:
         wcB.lpszClassName = kBtnStripClass;
         wcB.hCursor = LoadCursor(nullptr, IDC_ARROW);
         RegisterClassEx(&wcB);
-        g_btnLeft  = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
+        g_btnLeft  = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED,
             kBtnStripClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
+        SetLayeredWindowAttributes(g_btnLeft, 0, 255, LWA_ALPHA);
         g_btnRight = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
             kBtnStripClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
 
@@ -3266,8 +3329,9 @@ public:
         wcF.lpszClassName = kFavClass;
         wcF.hCursor = LoadCursor(nullptr, IDC_ARROW);
         RegisterClassEx(&wcF);
-        g_favWnd = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
+        g_favWnd = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED,
             kFavClass, nullptr, WS_POPUP | WS_CLIPCHILDREN, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
+        SetLayeredWindowAttributes(g_favWnd, 0, 255, LWA_ALPHA);
 
         // Tool name tooltip window
         WNDCLASSEX wc2 = {};
