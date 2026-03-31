@@ -6,4 +6,5 @@ namespace ModStack {
     void Shutdown();
     void Toggle();
     bool IsOpen();
+    void ReloadTheme(bool lightTheme);
 }

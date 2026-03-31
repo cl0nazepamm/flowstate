@@ -25,7 +25,7 @@ macroscript FlowState_Config
     )
 
     -- Write config preserving XB1 and unknown lines
-    fn writeConfig path pp ps ms subobj = (
+    fn writeConfig path pp ps ms subobj light = (
         -- Read existing lines, keep XB1 assignments and unknowns
         local keep = #()
         local f = openFile path mode:"r"
@@ -43,11 +43,12 @@ macroscript FlowState_Config
         if not ps do format "PowerShader=0\n" to:f
         if not ms do format "ModStack=0\n" to:f
         if subobj do format "SubObjToggles=1\n" to:f
+        if light do format "LightTheme=1\n" to:f
         for ln in keep do format "%\n" ln to:f
         close f
     )
 
-    rollout FlowState_ConfigDialog "FlowState Configuration" width:280 height:360
+    rollout FlowState_ConfigDialog "FlowState Configuration" width:280 height:380
     (
         group "Modules"
         (
@@ -59,6 +60,7 @@ macroscript FlowState_Config
         group "Options"
         (
             checkbox chk_subobj "Show Sub-Object Toggles (V/E/B/F/El)" checked:false
+            checkbox chk_lighttheme "Light Theme (Brushed Aluminium)" checked:false
         )
 
         group "Actions"
@@ -89,11 +91,12 @@ macroscript FlowState_Config
             chk_powershader.checked = readFlag iniPath "PowerShader"
             chk_modstack.checked = readFlag iniPath "ModStack"
             chk_subobj.checked = readFlag iniPath "SubObjToggles" default:false
+            chk_lighttheme.checked = readFlag iniPath "LightTheme" default:false
         )
 
         on btn_save pressed do
         (
-            writeConfig iniPath chk_powerparams.checked chk_powershader.checked chk_modstack.checked chk_subobj.checked
+            writeConfig iniPath chk_powerparams.checked chk_powershader.checked chk_modstack.checked chk_subobj.checked chk_lighttheme.checked
             messageBox "Configuration saved.\nRestart 3ds Max for changes to take effect." title:"FlowState"
         )
 

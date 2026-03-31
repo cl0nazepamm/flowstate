@@ -34,16 +34,16 @@ namespace {
 // ═════════════════════════════════════════════════════════════════
 namespace Theme
 {
-    constexpr COLORREF bg       = RGB(215, 218, 222);
-    constexpr COLORREF panel    = RGB(225, 228, 232);
-    constexpr COLORREF panelLt  = RGB(240, 242, 245);
-    constexpr COLORREF accent   = RGB(150, 155, 165);
-    constexpr COLORREF text     = RGB(30, 30, 30);
-    constexpr COLORREF textDim  = RGB(100, 100, 100);
-    constexpr COLORREF textBrt  = RGB(10, 10, 10);
-    constexpr COLORREF border   = RGB(140, 145, 150);
-    constexpr COLORREF wsmClr   = RGB(100, 80, 180);
-    constexpr COLORREF macroClr = RGB(180, 120, 40);
+    COLORREF bg;
+    COLORREF panel;
+    COLORREF panelLt;
+    COLORREF accent;
+    COLORREF text;
+    COLORREF textDim;
+    COLORREF textBrt;
+    COLORREF border;
+    COLORREF wsmClr;
+    COLORREF macroClr;
 
     HBRUSH brBg     = nullptr;
     HBRUSH brPanel  = nullptr;
@@ -51,18 +51,52 @@ namespace Theme
     HFONT  fontUI   = nullptr;
     HFONT  fontBold = nullptr;
 
-    void Init()
+    void Update(bool light)
     {
-        if (brBg) return;
+        if (light) {
+            bg       = RGB(215, 218, 222);
+            panel    = RGB(225, 228, 232);
+            panelLt  = RGB(240, 242, 245);
+            accent   = RGB(150, 155, 165);
+            text     = RGB(30, 30, 30);
+            textDim  = RGB(100, 100, 100);
+            textBrt  = RGB(10, 10, 10);
+            border   = RGB(140, 145, 150);
+            wsmClr   = RGB(100, 80, 180);
+            macroClr = RGB(180, 120, 40);
+        } else {
+            bg       = RGB(46, 46, 46);
+            panel    = RGB(56, 56, 56);
+            panelLt  = RGB(68, 68, 68);
+            accent   = RGB(38, 148, 168);
+            text     = RGB(220, 220, 220);
+            textDim  = RGB(140, 140, 140);
+            textBrt  = RGB(255, 255, 255);
+            border   = RGB(42, 42, 42);
+            wsmClr   = RGB(200, 180, 255);
+            macroClr = RGB(255, 200, 120);
+        }
+
+        if (brBg) DeleteObject(brBg);
+        if (brPanel) DeleteObject(brPanel);
+        if (brAccent) DeleteObject(brAccent);
+
         brBg     = CreateSolidBrush(bg);
         brPanel  = CreateSolidBrush(panel);
         brAccent = CreateSolidBrush(accent);
-        fontUI   = CreateFontW(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                       DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        fontBold = CreateFontW(-15, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
-                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                       DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    }
+
+    void Init(bool light)
+    {
+        Update(light);
+        if (!fontUI) {
+            fontUI   = CreateFontW(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                           DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+            fontBold = CreateFontW(-15, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
+                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                           DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        }
     }
     void Shutdown()
     {
@@ -162,10 +196,10 @@ class Palette
 public:
     static Palette& Get() { static Palette p; return p; }
 
-    bool Init()
+    bool Init(bool light)
     {
         if (inited_) return true;
-        Theme::Init();
+        Theme::Init(light);
 
         WNDCLASSEXW wc{ sizeof(wc) };
         wc.lpfnWndProc   = WndProc;
@@ -789,9 +823,10 @@ private:
 } // anonymous namespace
 
 // ── Exported API ────────────────────────────────────────────────
-void Init(HINSTANCE)  { Palette::Get().Init(); }
+void Init(HINSTANCE)  { Palette::Get().Init(true); }
 void Shutdown()       { Palette::Get().Shutdown(); }
 void Toggle()         { Palette::Get().Toggle(); }
 bool IsOpen()         { return Palette::Get().IsOpen(); }
+void ReloadTheme(bool lightTheme) { Theme::Update(lightTheme); }
 
 } // namespace ModStack

@@ -50,19 +50,49 @@ static const int kBtnGap    = 2;     // gap between side buttons
 static const int kSideGap   = 4;     // gap between button strip and panel
 static const int kMaxPanelH = 700;
 
-// 3ds Max dark theme colors
-static const COLORREF kBg        = RGB(215, 218, 222);
-static const COLORREF kBorder    = RGB(140, 145, 150);
-static const COLORREF kAccent    = RGB(150, 155, 165);
-static const COLORREF kGroupClr  = RGB(40, 40, 40);
-static const COLORREF kLabelClr  = RGB(60, 60, 60);
-static const COLORREF kValueClr  = RGB(20, 20, 20);
-static const COLORREF kEditBg    = RGB(240, 242, 245);
-static const COLORREF kEditFocus = RGB(255, 255, 255);
-static const COLORREF kCloseHov  = RGB(180, 50, 50);
-static const COLORREF kBtnBg     = RGB(225, 228, 232);
-static const COLORREF kBtnHov    = RGB(240, 242, 245);
-static const COLORREF kBtnAct    = RGB(180, 185, 190);
+// Theme colors
+static COLORREF kBg        = RGB(215, 218, 222);
+static COLORREF kBorder    = RGB(140, 145, 150);
+static COLORREF kAccent    = RGB(150, 155, 165);
+static COLORREF kGroupClr  = RGB(40, 40, 40);
+static COLORREF kLabelClr  = RGB(60, 60, 60);
+static COLORREF kValueClr  = RGB(20, 20, 20);
+static COLORREF kEditBg    = RGB(240, 242, 245);
+static COLORREF kEditFocus = RGB(255, 255, 255);
+static COLORREF kCloseHov  = RGB(180, 50, 50);
+static COLORREF kBtnBg     = RGB(225, 228, 232);
+static COLORREF kBtnHov    = RGB(240, 242, 245);
+static COLORREF kBtnAct    = RGB(180, 185, 190);
+
+static void UpdateTheme(bool light) {
+    if (light) {
+        kBg        = RGB(215, 218, 222);
+        kBorder    = RGB(140, 145, 150);
+        kAccent    = RGB(150, 155, 165);
+        kGroupClr  = RGB(40, 40, 40);
+        kLabelClr  = RGB(60, 60, 60);
+        kValueClr  = RGB(20, 20, 20);
+        kEditBg    = RGB(240, 242, 245);
+        kEditFocus = RGB(255, 255, 255);
+        kCloseHov  = RGB(180, 50, 50);
+        kBtnBg     = RGB(225, 228, 232);
+        kBtnHov    = RGB(240, 242, 245);
+        kBtnAct    = RGB(180, 185, 190);
+    } else {
+        kBg        = RGB(56, 56, 56);
+        kBorder    = RGB(42, 42, 42);
+        kAccent    = RGB(38, 148, 168);   // teal
+        kGroupClr  = RGB(190, 190, 190);
+        kLabelClr  = RGB(195, 195, 195);
+        kValueClr  = RGB(230, 230, 230);
+        kEditBg    = RGB(42, 42, 42);
+        kEditFocus = RGB(48, 58, 65);
+        kCloseHov  = RGB(200, 60, 60);
+        kBtnBg     = RGB(68, 68, 68);
+        kBtnHov    = RGB(80, 80, 80);
+        kBtnAct    = RGB(38, 148, 168);   // active = teal
+    }
+}
 
 static std::wstring MakeParamLabel(const MCHAR* rawName) {
     if (!rawName || !rawName[0]) return L"?";
@@ -348,6 +378,7 @@ static const BtnDef kSplineOps[] = {
 };
 static int g_hoverBtn  = -1;  // hovered button ID for strip windows
 static bool g_showSubObj = false; // sub-object toggles (off by default, configurable)
+static bool g_lightTheme = false; // light theme (brushed aluminium)
 static bool  g_mmDragging = false;  // middle-mouse panel drag
 static POINT g_mmStart = {};
 static RECT  g_mmPanelRect = {};
@@ -394,6 +425,7 @@ static void LoadModuleFlags() {
         if (wcsstr(line, L"PowerShader=0")) g_enablePowerShader = false;
         if (wcsstr(line, L"ModStack=0"))    g_enableModStack = false;
         if (wcsstr(line, L"SubObjToggles=1")) g_showSubObj = true;
+        if (wcsstr(line, L"LightTheme=1")) g_lightTheme = true;
         // Per-class XB1 assignments: XB1:ClassName=vKey|hKey
         if (wcsncmp(line, L"XB1:", 4) == 0) {
             std::wstring l(line);
@@ -409,6 +441,9 @@ static void LoadModuleFlags() {
         }
     }
     fclose(f);
+    UpdateTheme(g_lightTheme);
+    PowerShader::ReloadTheme(g_lightTheme);
+    ModStack::ReloadTheme(g_lightTheme);
 }
 
 static std::wstring GetSelBaseClass() {
