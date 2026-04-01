@@ -3917,26 +3917,6 @@ public:
         PowerShader::Init(hInstance, g_lightTheme);
         ModStack::Init(hInstance, g_lightTheme);
 
-        // Extract MCR from resource to userMacros dir (auto-loaded by Max)
-        {
-            HRSRC hr = FindResource(hInstance, MAKEINTRESOURCE(101), RT_RCDATA);
-            if (hr) {
-                HGLOBAL hg = LoadResource(hInstance, hr);
-                DWORD sz = SizeofResource(hInstance, hr);
-                if (hg && sz) {
-                    const char* data = static_cast<const char*>(LockResource(hg));
-                    MSTR macroDir = GetCOREInterface()->GetDir(APP_USER_MACROS_DIR);
-                    std::wstring outPath = std::wstring(macroDir.data()) + L"\\CloneTools-FlowState_Config.mcr";
-                    // Always overwrite to keep in sync with plugin version
-                    FILE* f = _wfopen(outPath.c_str(), L"wb");
-                    if (f) { fwrite(data, 1, sz, f); fclose(f); }
-                    // Force Max to load it now (GUPs load after macroscript scan)
-                    std::wstring loadScript = L"macros.load \"" + std::wstring(macroDir.data()) + L"\" \"CloneTools-FlowState_Config.mcr\"";
-                    ExecuteMAXScriptScript(loadScript.c_str(), MAXScript::ScriptSource::NotSpecified);
-                }
-            }
-        }
-
         return GUPRESULT_KEEP;
     }
 

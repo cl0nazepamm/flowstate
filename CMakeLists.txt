@@ -23,8 +23,7 @@ endif()
 
 # ── Sources (add your .cpp files here) ───────────────────────────
 file(GLOB_RECURSE SOURCES "src/*.cpp")
-set(RC_FILE "src/flowstate.rc")
-add_library(${PLUGIN_NAME} SHARED ${SOURCES} ${RC_FILE})
+add_library(${PLUGIN_NAME} SHARED ${SOURCES})
 
 # ── Output as plugin extension ───────────────────────────────────
 set_target_properties(${PLUGIN_NAME} PROPERTIES

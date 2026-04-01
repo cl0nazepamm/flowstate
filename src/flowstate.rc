@@ -1,3 +1,0 @@
-#include "resource.h"
-
-IDR_FLOWSTATE_MCR  RCDATA  "..\\macros\\FlowState_Config.mcr"
