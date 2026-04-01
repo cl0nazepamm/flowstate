@@ -193,6 +193,9 @@ static bool     g_hoverClose    = false;
 static RECT     g_closeRect     = {};
 static bool     g_hoverModStack = false;
 static RECT     g_modStackRect  = {};
+static bool     g_hoverVisBtn   = false;
+static RECT     g_visBtnRect    = {};
+static bool     g_visEditMode   = false;  // visibility edit mode — shows hidden params, click to toggle
 
 static const UINT WM_PP_TOGGLE   = WM_USER + 100;
 
@@ -309,7 +312,7 @@ static void UpdateModSearch() {
             if (g_modSearchEdit) {
                 RECT rc2; GetClientRect(g_panel, &rc2);
                 SetWindowPos(g_modSearchEdit, nullptr, kPad, kPad - 1,
-                    rc2.right - kPad * 2 - 42, kFontHdr + 2, SWP_NOZORDER | SWP_NOACTIVATE);
+                    rc2.right - kPad * 2 - 62, kFontHdr + 2, SWP_NOZORDER | SWP_NOACTIVATE);
             }
         }
     }
@@ -495,9 +498,13 @@ static void StashXB1() {
 }
 
 // Load slots for the current selection's base class (keys only — resolve at drag time)
+static std::wstring PrettyLabel(const std::wstring& raw, const std::wstring& groupTitle); // forward decl
 static std::wstring LabelFromKey(const std::wstring& key) {
     size_t sep = key.find(L':');
-    return (sep != std::wstring::npos) ? key.substr(sep + 1) : key;
+    if (sep == std::wstring::npos) return key;
+    std::wstring cls = key.substr(0, sep);
+    std::wstring raw = key.substr(sep + 1);
+    return PrettyLabel(raw, cls);
 }
 
 static void SyncXB1ToSelection() {
@@ -1406,7 +1413,7 @@ static void CollectParams(IParamBlock2* pb, const std::wstring& groupTitle, int&
         std::wstring rawName = d.int_name ? d.int_name : L"?";
         std::wstring key = groupTitle + L":" + rawName;
 
-        if (g_hidden.count(key)) continue;  // skip hidden
+        if (!g_visEditMode && g_hidden.count(key)) continue;  // skip hidden
 
         EditField ef;
         ef.label = PrettyLabel(rawName, groupTitle);
@@ -1499,7 +1506,7 @@ static void CollectAllParams(ReferenceTarget* obj, const std::wstring& groupTitl
                 if (propName.find(L"render_") == 0 || propName.find(L"viewport_") == 0) continue;
 
                 std::wstring key = groupTitle + L":" + propName;
-                if (g_hidden.count(key)) continue;
+                if (!g_visEditMode && g_hidden.count(key)) continue;
 
                 EditField ef;
                 ef.label = PrettyLabel(propName, groupTitle);
@@ -1685,7 +1692,7 @@ static void GatherParams() {
                         gh.startIdx = (int)g_edits.size();
                         for (int i = 0; i < cnt; i++) {
                             std::wstring key = cls + L":" + fb[i].label;
-                            if (g_hidden.count(key)) continue;
+                            if (!g_visEditMode && g_hidden.count(key)) continue;
                             EditField ef;
                             ef.label = fb[i].label;
                             ef.key   = key;
@@ -1740,7 +1747,7 @@ static void GatherParams() {
             gh.startIdx = (int)g_edits.size();
             for (int si = 0; si < kSpCount; si++) {
                 std::wstring key = L"SplineShape:" + std::wstring(kSpLabels[si]);
-                if (g_hidden.count(key)) continue;
+                if (!g_visEditMode && g_hidden.count(key)) continue;
                 EditField ef;
                 ef.label = kSpLabels[si];
                 ef.key   = key;
@@ -2350,6 +2357,22 @@ static void PaintPanel(HWND hwnd) {
         DrawText(mem, _T("M"), 1, &mr, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
 
+    // Visibility edit button (eye icon)
+    {
+        bool hasHidden = !g_hidden.empty();
+        COLORREF vbg = g_visEditMode ? kAccent : (g_hoverVisBtn ? kBtnHov : kBtnBg);
+        HBRUSH vb = CreateSolidBrush(vbg); FillRect(mem, &g_visBtnRect, vb); DeleteObject(vb);
+        HPEN vp = CreatePen(PS_SOLID, 1, kBorder);
+        HPEN vpo = (HPEN)SelectObject(mem, vp);
+        SelectObject(mem, GetStockObject(NULL_BRUSH));
+        Rectangle(mem, g_visBtnRect.left, g_visBtnRect.top, g_visBtnRect.right, g_visBtnRect.bottom);
+        SelectObject(mem, vpo); DeleteObject(vp);
+        // Show dot when there are hidden params (visual hint)
+        SetTextColor(mem, g_visEditMode ? RGB(255,255,255) : (hasHidden ? kAccent : kValueClr));
+        RECT vr = g_visBtnRect;
+        DrawText(mem, hasHidden ? _T("\u25C9") : _T("\u25CB"), 1, &vr, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    }
+
     // Close button
     if (g_hoverClose) {
         HBRUSH hov = CreateSolidBrush(kCloseHov); FillRect(mem, &g_closeRect, hov); DeleteObject(hov);
@@ -2449,25 +2472,36 @@ static void PaintPanel(HWND hwnd) {
                 bool isFav = g_favorites.count(ef.key) > 0;
                 bool isHover = (fi == g_hoverParam);
                 bool isEditing = (fi == g_editParam && g_editHwnd);
+                bool isHidden = g_visEditMode && g_hidden.count(ef.key) > 0;
+
+                // In vis edit mode: dim hidden params, show eye indicator
+                COLORREF lblClr = isHidden ? RGB(80, 80, 80) : kLabelClr;
+                COLORREF valClr = isHidden ? RGB(60, 60, 60) : kValueClr;
 
                 // Label
                 SelectObject(mem, g_font);
-                if (isFav) { SetTextColor(mem, kAccent); TextOut(mem, x, y + 3, _T("\u2605"), 1); }
-                SetTextColor(mem, kLabelClr);
-                TextOut(mem, x + (isFav ? 14 : 8), y + 3, ef.label.c_str(), (int)ef.label.length());
+                if (g_visEditMode) {
+                    // Eye icon: open for visible, closed for hidden
+                    SetTextColor(mem, isHidden ? RGB(100, 50, 50) : RGB(50, 100, 50));
+                    TextOut(mem, x, y + 3, isHidden ? _T("\u25CB") : _T("\u25C9"), 1);
+                } else if (isFav) {
+                    SetTextColor(mem, kAccent); TextOut(mem, x, y + 3, _T("\u2605"), 1);
+                }
+                SetTextColor(mem, lblClr);
+                TextOut(mem, x + ((g_visEditMode || isFav) ? 14 : 8), y + 3, ef.label.c_str(), (int)ef.label.length());
 
                 // Value box (painted, not a child window)
                 RECT vr = { editX, y + 1, rEdge, y + kEditH + 1 };
-                COLORREF vbg = isEditing ? kEditFocus : isHover ? kEditFocus : kEditBg;
+                COLORREF vbg = isHidden ? kBg : (isEditing ? kEditFocus : isHover ? kEditFocus : kEditBg);
                 HBRUSH vb = CreateSolidBrush(vbg); FillRect(mem, &vr, vb); DeleteObject(vb);
                 SelectObject(mem, isHover || isEditing ? penAccent : penBorder);
-                Rectangle(mem, vr.left - 1, vr.top - 1, vr.right + 1, vr.bottom + 1);
+                if (!isHidden) Rectangle(mem, vr.left - 1, vr.top - 1, vr.right + 1, vr.bottom + 1);
 
                 // Draw value text (skip if active edit control is on top)
-                if (!isEditing) {
+                if (!isEditing && !isHidden) {
                     TCHAR buf[64]; FormatValue(ef, tv, buf, 64);
                     SelectObject(mem, g_fontBold);
-                    SetTextColor(mem, kValueClr);
+                    SetTextColor(mem, valClr);
                     DrawText(mem, buf, -1, &vr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 }
                 y += kLineH;
@@ -2540,15 +2574,22 @@ static void KillActiveEdit(bool apply) {
             Interface* ip = GetCOREInterface();
             TimeValue t = ip ? ip->GetTime() : 0;
             theHold.Suspend();
-            // Apply typed value to all selected nodes
-            for (int ni = 0; ni < (ip ? ip->GetSelNodeCount() : 0); ni++) {
-                INode* nd = ip->GetSelNode(ni);
-                if (!nd) continue;
-                IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
-                if (!FindParam(nd, ef.key, pb, pid, pt2)) continue;
-                if (IsFloat(pt2))        pb->SetValue(pid, t, (float)_wtof(txt));
-                else if (pt2==TYPE_BOOL) pb->SetValue(pid, t, (_wcsicmp(txt,_T("On"))==0||_wcsicmp(txt,_T("1"))==0||_wcsicmp(txt,_T("true"))==0)?1:0);
-                else                     pb->SetValue(pid, t, _wtoi(txt));
+            if (g_epolyOp >= 0) {
+                // EPoly takeover — use cached PB directly (FindParam can't resolve op params)
+                if (IsFloat(ef.type))       ef.pb->SetValue(ef.id, t, (float)_wtof(txt));
+                else if (ef.type==TYPE_BOOL) ef.pb->SetValue(ef.id, t, (_wcsicmp(txt,_T("On"))==0||_wcsicmp(txt,_T("1"))==0||_wcsicmp(txt,_T("true"))==0)?1:0);
+                else                        ef.pb->SetValue(ef.id, t, _wtoi(txt));
+            } else {
+                // Normal params — apply to all selected nodes
+                for (int ni = 0; ni < (ip ? ip->GetSelNodeCount() : 0); ni++) {
+                    INode* nd = ip->GetSelNode(ni);
+                    if (!nd) continue;
+                    IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
+                    if (!FindParam(nd, ef.key, pb, pid, pt2)) continue;
+                    if (IsFloat(pt2))        pb->SetValue(pid, t, (float)_wtof(txt));
+                    else if (pt2==TYPE_BOOL) pb->SetValue(pid, t, (_wcsicmp(txt,_T("On"))==0||_wcsicmp(txt,_T("1"))==0||_wcsicmp(txt,_T("true"))==0)?1:0);
+                    else                     pb->SetValue(pid, t, _wtoi(txt));
+                }
             }
             theHold.Resume();
             if (g_epolyPreview) EPolyRefresh();
@@ -2641,6 +2682,7 @@ static void BuildLayout() {
 
     g_closeRect    = { panelW - kPad - 18, kPad, panelW - kPad, kPad + 18 };
     g_modStackRect = { panelW - kPad - 18 - 2 - 18, kPad, panelW - kPad - 18 - 2, kPad + 18 };
+    g_visBtnRect   = { panelW - kPad - 18 - 2 - 18 - 2 - 18, kPad, panelW - kPad - 18 - 2 - 18 - 2, kPad + 18 };
 
     // Fixed header area
     int y = 2 + kPad + kFontHdr + 4 + 1 + 4;
@@ -2657,6 +2699,10 @@ static void BuildLayout() {
                 g_edits[fi].logY = contentY;
                 contentY += kLineH;
             }
+        } else {
+            // Mark collapsed params as off-screen so they never hit-test
+            for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++)
+                g_edits[fi].logY = -99999;
         }
         if (gi + 1 < g_groups.size()) contentY += kGroupGap;
     }
@@ -2853,8 +2899,16 @@ static void BuildFavorites() {
             if (ptype & TYPE_TAB) continue;
             if (!IsFloat(ptype) && !IsInt(ptype) && ptype != TYPE_BOOL) continue;
             size_t sep = key.find(L':');
+            std::wstring cls = (sep != std::wstring::npos) ? key.substr(0, sep) : L"";
+            std::wstring raw = (sep != std::wstring::npos) ? key.substr(sep + 1) : key;
+            // Try to find a pretty label from g_edits first (already formatted)
+            std::wstring label;
+            for (auto& ge : g_edits) {
+                if (ge.key == key) { label = ge.label; break; }
+            }
+            if (label.empty()) label = PrettyLabel(raw, cls);
             EditField ef;
-            ef.label = (sep != std::wstring::npos) ? key.substr(sep + 1) : key;
+            ef.label = label;
             ef.key = key; ef.pb = pb; ef.id = pid; ef.type = ptype; ef.hwnd = nullptr;
             g_favEdits.push_back(std::move(ef));
         } else {
@@ -3060,7 +3114,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_modSearchEdit) {
                 RECT rc2; GetClientRect(hwnd, &rc2);
                 SetWindowPos(g_modSearchEdit, nullptr, kPad, kPad - 1,
-                    rc2.right - kPad * 2 - 42, kFontHdr + 2,
+                    rc2.right - kPad * 2 - 62, kFontHdr + 2,
                     SWP_NOZORDER | SWP_NOACTIVATE);
             }
         }
@@ -3077,6 +3131,12 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT wr; GetWindowRect(hwnd, &wr); int pw = wr.right - wr.left;
 
         if (PtInRect(&g_closeRect, pt)) { ClosePanel(); return 0; }
+        if (PtInRect(&g_visBtnRect, pt)) {
+            g_visEditMode = !g_visEditMode;
+            GatherParams(); BuildLayout();
+            BuildFavorites(); PositionFavStrip();
+            return 0;
+        }
         if (PtInRect(&g_modStackRect, pt)) { ModStack::Toggle(); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
 
         // Mod search: click on result = apply
@@ -3101,40 +3161,32 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RECT rc2; GetClientRect(hwnd, &rc2);
             int editX = rc2.right - kPad - kEditW;
             if (idx >= 0 && pt.x >= editX && pt.y >= g_contentStartY) {
-                // Start drag on value area — if user releases without moving, spawn edit instead
-                g_lmbDragging = true;
-                g_lmbDragIdx  = idx;
-                g_lmbDragStartX = pt.x;
-                g_lmbDragAccum  = 0;
-                g_lmbDragMoved  = false;
-                SetCapture(hwnd);
-                theHold.Begin();
+                if (g_epolyOp >= 0 || g_visEditMode) {
+                    // During EPoly takeover or vis edit — just spawn edit, no drag
+                    SpawnEditAt(idx);
+                } else {
+                    // Start drag on value area — if user releases without moving, spawn edit instead
+                    g_lmbDragging = true;
+                    g_lmbDragIdx  = idx;
+                    g_lmbDragStartX = pt.x;
+                    g_lmbDragAccum  = 0;
+                    g_lmbDragMoved  = false;
+                    SetCapture(hwnd);
+                    theHold.Begin();
+                }
                 return 0;
             }
         }
 
-        // Ctrl+click on param = hide it
-        if (GetKeyState(VK_CONTROL) & 0x8000) {
+        // Vis edit mode: click on param toggles its visibility
+        if (g_visEditMode) {
             int idx = FindParamAtY(pt.y);
-            if (idx >= 0) {
-                g_hidden.insert(g_edits[idx].key);
+            if (idx >= 0 && idx < (int)g_edits.size()) {
+                const std::wstring& key = g_edits[idx].key;
+                if (g_hidden.count(key)) g_hidden.erase(key);
+                else g_hidden.insert(key);
                 SaveSettings();
-                // Remove from edits and rebuild
-                g_edits.erase(g_edits.begin() + idx);
-                // Recalculate group indices
-                int pos = 0;
-                for (auto& gh : g_groups) { gh.startIdx = pos; pos += gh.count; }
-                // Find which group lost a param
-                for (auto& gh : g_groups) {
-                    int end = gh.startIdx + gh.count;
-                    if (idx >= gh.startIdx && idx < end) { gh.count--; break; }
-                }
-                // Fix startIdx for groups after the removed param
-                for (size_t gi = 0; gi < g_groups.size(); gi++) {
-                    if (g_groups[gi].startIdx > idx) g_groups[gi].startIdx--;
-                }
-                BuildLayout();
-                BuildFavorites(); PositionFavStrip();
+                InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
         }
@@ -3304,29 +3356,6 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_modSearch) return 0;
         POINT rpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
 
-        // Ctrl+Right-click anywhere → show all hidden params
-        if (GetKeyState(VK_CONTROL) & 0x8000) {
-            if (!g_hidden.empty()) {
-                g_hidden.clear();
-                SaveSettings(); GatherParams(); BuildLayout();
-                BuildFavorites(); PositionFavStrip();
-            }
-            return 0;
-        }
-
-        // Right-click on group header → unhide all hidden params for that group
-        int gIdx = FindGroupAtY(rpt.y);
-        if (gIdx >= 0) {
-            const auto& title = g_groups[gIdx].title;
-            std::wstring prefix = title + L":";
-            bool found = false;
-            for (auto it = g_hidden.begin(); it != g_hidden.end(); )
-                if (it->compare(0, prefix.size(), prefix) == 0) { it = g_hidden.erase(it); found = true; }
-                else ++it;
-            if (found) { SaveSettings(); GatherParams(); BuildLayout(); }
-            return 0;
-        }
-
         // Right-click on param → toggle favorite
         int idx = FindParamAtY(rpt.y);
         if (idx >= 0 && idx < (int)g_edits.size()) {
@@ -3483,6 +3512,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (over != g_hoverClose) { g_hoverClose = over; InvalidateRect(hwnd, &g_closeRect, FALSE); }
         bool overMs = PtInRect(&g_modStackRect, pt) != 0;
         if (overMs != g_hoverModStack) { g_hoverModStack = overMs; InvalidateRect(hwnd, &g_modStackRect, FALSE); }
+        bool overVis = PtInRect(&g_visBtnRect, pt) != 0;
+        if (overVis != g_hoverVisBtn) { g_hoverVisBtn = overVis; InvalidateRect(hwnd, &g_visBtnRect, FALSE); }
         // Track hovered param for highlight + wheel (not during search)
         if (!g_modSearch) {
             RECT rc2; GetClientRect(hwnd, &rc2);
@@ -3496,6 +3527,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSELEAVE:
         if (g_hoverClose) { g_hoverClose = false; InvalidateRect(hwnd, &g_closeRect, FALSE); }
         if (g_hoverModStack) { g_hoverModStack = false; InvalidateRect(hwnd, &g_modStackRect, FALSE); }
+        if (g_hoverVisBtn) { g_hoverVisBtn = false; InvalidateRect(hwnd, &g_visBtnRect, FALSE); }
         if (g_hoverParam >= 0) { g_hoverParam = -1; InvalidateRect(hwnd, nullptr, FALSE); }
         return 0;
 
@@ -3560,26 +3592,45 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             } else if (ef.pb && ip) {
                 theHold.Suspend();
-                // Apply to all selected nodes
-                for (int ni = 0; ni < ip->GetSelNodeCount(); ni++) {
-                    INode* nd = ip->GetSelNode(ni);
-                    if (!nd) continue;
-                    IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
-                    if (!FindParam(nd, ef.key, pb, pid, pt2)) continue;
-                    if (IsFloat(pt2)) {
-                        float cur = pb->GetFloat(pid, t);
+                if (g_epolyOp >= 0) {
+                    // EPoly takeover — use cached PB directly
+                    if (IsFloat(ef.type)) {
+                        float cur = ef.pb->GetFloat(ef.id, t);
                         float a = cur<0?-cur:cur;
                         float sc = a>100.f?10.f:a>10.f?1.f:a>1.f?0.1f:0.01f;
                         if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
-                        pb->SetValue(pid, t, cur + step * sc);
-                    } else if (pt2 == TYPE_BOOL) {
-                        pb->SetValue(pid, t, pb->GetInt(pid, t) ? 0 : 1);
+                        ef.pb->SetValue(ef.id, t, cur + step * sc);
+                    } else if (ef.type == TYPE_BOOL) {
+                        ef.pb->SetValue(ef.id, t, ef.pb->GetInt(ef.id, t) ? 0 : 1);
                     } else {
-                        int cur = pb->GetInt(pid, t);
+                        int cur = ef.pb->GetInt(ef.id, t);
                         int s = (int)step;
                         if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
                         if (s == 0) s = step>0?1:-1;
-                        pb->SetValue(pid, t, cur + s);
+                        ef.pb->SetValue(ef.id, t, cur + s);
+                    }
+                } else {
+                    // Normal params — apply to all selected nodes
+                    for (int ni = 0; ni < ip->GetSelNodeCount(); ni++) {
+                        INode* nd = ip->GetSelNode(ni);
+                        if (!nd) continue;
+                        IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
+                        if (!FindParam(nd, ef.key, pb, pid, pt2)) continue;
+                        if (IsFloat(pt2)) {
+                            float cur = pb->GetFloat(pid, t);
+                            float a = cur<0?-cur:cur;
+                            float sc = a>100.f?10.f:a>10.f?1.f:a>1.f?0.1f:0.01f;
+                            if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
+                            pb->SetValue(pid, t, cur + step * sc);
+                        } else if (pt2 == TYPE_BOOL) {
+                            pb->SetValue(pid, t, pb->GetInt(pid, t) ? 0 : 1);
+                        } else {
+                            int cur = pb->GetInt(pid, t);
+                            int s = (int)step;
+                            if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
+                            if (s == 0) s = step>0?1:-1;
+                            pb->SetValue(pid, t, cur + s);
+                        }
                     }
                 }
                 theHold.Resume();
@@ -3726,7 +3777,7 @@ static void OpenPanel() {
     if (!g_modSearchEdit) {
         RECT rc; GetClientRect(g_panel, &rc);
         int searchX = kPad;
-        int searchW = rc.right - kPad * 2 - 42;
+        int searchW = rc.right - kPad * 2 - 62;
         g_modSearchEdit = CreateWindowEx(0, _T("EDIT"), _T(""),
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             searchX, kPad - 1, searchW, kFontHdr + 2,
@@ -3769,6 +3820,7 @@ static void ClosePanel() {
     KillTimer(g_panel, 1);
     KillActiveEdit(false);
     if (g_lmbDragging) { g_lmbDragging = false; g_lmbDragIdx = -1; ReleaseCapture(); theHold.Cancel(); HideDragTip(); }
+    g_visEditMode = false;
     g_hoverParam = -1;
     g_edits.clear();
     g_groups.clear();
@@ -3843,7 +3895,7 @@ public:
         g_brEdit    = CreateSolidBrush(kEditBg);
         g_brEditFoc = CreateSolidBrush(kEditFocus);
 
-        g_panel = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_LAYERED|WS_EX_COMPOSITED,
+        g_panel = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_LAYERED,
             kWndClass, nullptr, WS_POPUP|WS_CLIPCHILDREN, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
         SetLayeredWindowAttributes(g_panel, 0, 255, LWA_ALPHA);
 

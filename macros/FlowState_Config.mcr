@@ -322,9 +322,7 @@ macroscript flowstate_Config
         "  + Ctrl  --  10x fine",
         "",
         "Right-click param  --  Pin/unpin",
-        "Ctrl + click param  --  Hide param",
-        "Ctrl + Right-click  --  Show all hidden",
-        "Right-click group  --  Unhide group",
+        "Eye button  --  Toggle visibility editor",
         "Middle-mouse  --  Drag panel"
     ) do (
         if s == "" then Y += 6
