@@ -1,6 +1,7 @@
 #include "powershader.h"
 #include <windows.h>
 #include <commctrl.h>
+#include <gdiplus.h>
 
 #include <algorithm>
 #include <cctype>
@@ -12,6 +13,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#pragma comment(lib, "gdiplus.lib")
 
 #include <max.h>
 #include <gup.h>
@@ -216,7 +219,7 @@ constexpr UINT_PTR kSearchTimerId = 1;
 constexpr UINT kSearchDebounceMs = 14;
 
 enum class TabMode { All, Materials, Maps };
-enum class ItemKind { ClassMaterial, ClassMap, SceneMaterial };
+enum class ItemKind { ClassMaterial, ClassMap, SceneMaterial, SceneMap };
 
 struct Item
 {
@@ -707,6 +710,7 @@ const wchar_t* TagForKind(ItemKind kind)
     switch (kind)
     {
     case ItemKind::SceneMaterial: return L"SCENE";
+    case ItemKind::SceneMap:      return L"SCENE";
     case ItemKind::ClassMap:      return L"MAP";
     default:                      return L"MAT";
     }
@@ -767,6 +771,120 @@ void EnableDarkTitleBar(HWND hwnd)
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  Texture Preview Popup
+// ═══════════════════════════════════════════════════════════════
+static ULONG_PTR     g_gdipToken = 0;
+static HWND          g_previewWnd = nullptr;
+static Gdiplus::Image* g_previewImg = nullptr;
+constexpr int kPreviewSize = 128;
+
+static void InitGdiPlus() {
+    if (!g_gdipToken) {
+        Gdiplus::GdiplusStartupInput si;
+        Gdiplus::GdiplusStartup(&g_gdipToken, &si, nullptr);
+    }
+}
+
+static std::wstring GetTexmapFilename(MtlBase* m) {
+    if (!m) return {};
+    // BitmapTex
+    if (m->ClassID() == Class_ID(BMTEX_CLASS_ID, 0)) {
+        BitmapTex* bt = static_cast<BitmapTex*>(m);
+        const MCHAR* fn = bt->GetMapName();
+        if (fn && fn[0]) return fn;
+    }
+    // Generic: try MaxScript .filename property
+    std::wstring name = m->GetName().data();
+    // Try first sub-texmap recursively
+    for (int i = 0; i < m->NumSubTexmaps(); i++) {
+        Texmap* sub = m->GetSubTexmap(i);
+        if (!sub) continue;
+        if (sub->ClassID() == Class_ID(BMTEX_CLASS_ID, 0)) {
+            const MCHAR* fn = static_cast<BitmapTex*>(sub)->GetMapName();
+            if (fn && fn[0]) return fn;
+        }
+    }
+    return {};
+}
+
+static LRESULT CALLBACK PreviewProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        // Background
+        HBRUSH bg = CreateSolidBrush(RGB(30, 30, 30));
+        FillRect(hdc, &rc, bg); DeleteObject(bg);
+        // Border
+        HPEN pen = CreatePen(PS_SOLID, 1, RGB(55, 55, 55));
+        HPEN op = (HPEN)SelectObject(hdc, pen);
+        SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, 0, 0, rc.right, rc.bottom);
+        SelectObject(hdc, op); DeleteObject(pen);
+        // Image
+        if (g_previewImg) {
+            Gdiplus::Graphics gfx(hdc);
+            gfx.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+            // Fit image in the box with aspect ratio
+            int iw = g_previewImg->GetWidth(), ih = g_previewImg->GetHeight();
+            int bw = rc.right - 4, bh = rc.bottom - 4;
+            float scale = (std::min)((float)bw / iw, (float)bh / ih);
+            int dw = (int)(iw * scale), dh = (int)(ih * scale);
+            int dx = 2 + (bw - dw) / 2, dy = 2 + (bh - dh) / 2;
+            gfx.DrawImage(g_previewImg, dx, dy, dw, dh);
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    if (msg == WM_ERASEBKGND) return 1;
+    return DefWindowProc(h, msg, w, l);
+}
+
+static void ShowPreview(const std::wstring& path, HWND paletteWnd) {
+    if (path.empty() || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        if (g_previewWnd) ShowWindow(g_previewWnd, SW_HIDE);
+        return;
+    }
+    InitGdiPlus();
+    // Load image
+    delete g_previewImg;
+    g_previewImg = Gdiplus::Image::FromFile(path.c_str());
+    if (!g_previewImg || g_previewImg->GetLastStatus() != Gdiplus::Ok) {
+        delete g_previewImg; g_previewImg = nullptr;
+        if (g_previewWnd) ShowWindow(g_previewWnd, SW_HIDE);
+        return;
+    }
+    // Create window if needed
+    if (!g_previewWnd) {
+        static bool regCls = false;
+        if (!regCls) {
+            WNDCLASSEXW wc{ sizeof(wc) };
+            wc.lpfnWndProc = PreviewProc;
+            wc.hInstance = hInstance;
+            wc.lpszClassName = L"FlowStatePreview";
+            RegisterClassExW(&wc);
+            regCls = true;
+        }
+        g_previewWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            L"FlowStatePreview", L"", WS_POPUP, 0, 0, kPreviewSize, kPreviewSize,
+            nullptr, nullptr, hInstance, nullptr);
+    }
+    // Position to the left of the palette
+    RECT pr; GetWindowRect(paletteWnd, &pr);
+    int x = pr.left - kPreviewSize - 4;
+    int y = pr.top;
+    // If it would go off-screen left, put it on the right
+    if (x < 0) x = pr.right + 4;
+    SetWindowPos(g_previewWnd, HWND_TOPMOST, x, y, kPreviewSize, kPreviewSize,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(g_previewWnd, nullptr, FALSE);
+}
+
+static void HidePreview() {
+    if (g_previewWnd) ShowWindow(g_previewWnd, SW_HIDE);
+    delete g_previewImg; g_previewImg = nullptr;
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Palette
 // ═══════════════════════════════════════════════════════════════
 class Palette
@@ -807,9 +925,12 @@ public:
     void Shutdown()
     {
         CancelPendingRebuild();
+        HidePreview();
+        if (g_previewWnd) { DestroyWindow(g_previewWnd); g_previewWnd = nullptr; }
         if (hotkeyWnd_) { DestroyWindow(hotkeyWnd_); hotkeyWnd_ = nullptr; }
         if (wnd_) { DestroyWindow(wnd_); wnd_ = nullptr; }
         Theme::Shutdown();
+        if (g_gdipToken) { Gdiplus::GdiplusShutdown(g_gdipToken); g_gdipToken = 0; }
     }
 
     void Toggle()
@@ -1260,8 +1381,8 @@ private:
         COLORREF tc = sel ? Theme::textBrt : Theme::text;
         if (!sel)
         {
-            if (item.kind == ItemKind::ClassMap) tc = Theme::mapClr;
-            if (item.kind == ItemKind::SceneMaterial) tc = Theme::sceneClr;
+            if (item.kind == ItemKind::ClassMap || item.kind == ItemKind::SceneMap) tc = Theme::mapClr;
+            if (item.kind == ItemKind::SceneMaterial || item.kind == ItemKind::SceneMap) tc = Theme::sceneClr;
         }
 
         SetBkMode(dis->hDC, TRANSPARENT);
@@ -1456,6 +1577,7 @@ private:
     void Hide()
     {
         CancelPendingRebuild();
+        HidePreview();
         // Fade & slide out — cubic ease-in, 50ms
         if (IsWindowVisible(wnd_)) {
             RECT r; GetWindowRect(wnd_, &r);
@@ -1516,6 +1638,19 @@ private:
                 if (HWND tw = GetDlgItem(wnd_, tid)) InvalidateRect(tw, nullptr, FALSE);
             CancelPendingRebuild();
             Rebuild(true);
+            return;
+        }
+        if (id == kListId && code == LBN_SELCHANGE) {
+            // Show texture preview for selected item
+            int sel = (int)SendMessage(list_, LB_GETCURSEL, 0, 0);
+            if (sel >= 0 && sel < (int)filtered_.size()) {
+                const Item& item = (*activeItems_)[filtered_[sel]];
+                if (item.live) {
+                    std::wstring fn = GetTexmapFilename(item.live);
+                    if (!fn.empty()) { ShowPreview(fn, wnd_); return; }
+                }
+            }
+            HidePreview();
             return;
         }
         if (id == kListId && code == LBN_DBLCLK)
@@ -1579,6 +1714,41 @@ private:
         classCacheReady_ = true;
     }
 
+    void CollectSceneItem(MtlBase* m, std::set<MtlBase*>& visited)
+    {
+        if (!m || visited.count(m)) return;
+        visited.insert(m);
+
+        Item item;
+        MSTR className = m->ClassName();
+        item.label = m->GetName().Length()
+            ? std::wstring(m->GetName().data())
+            : std::wstring(className.data());
+        item.normLabel = Normalize(item.label, true);
+        item.search = Normalize(
+            item.label + L" " + std::wstring(className.data()), true);
+        item.key = Normalize(item.label, false);
+        item.kind = (m->SuperClassID() == MATERIAL_CLASS_ID)
+            ? ItemKind::SceneMaterial : ItemKind::SceneMap;
+        item.category = std::wstring(className.data());
+        item.live = m;
+        sceneItems_.push_back(std::move(item));
+
+        // Recurse into sub-texmaps (child maps of materials/texmaps)
+        for (int s = 0; s < m->NumSubTexmaps(); s++) {
+            Texmap* sub = m->GetSubTexmap(s);
+            if (sub) CollectSceneItem(sub, visited);
+        }
+        // Recurse into sub-materials
+        if (m->SuperClassID() == MATERIAL_CLASS_ID) {
+            Mtl* mtl = static_cast<Mtl*>(m);
+            for (int s = 0; s < mtl->NumSubMtls(); s++) {
+                Mtl* sub = mtl->GetSubMtl(s);
+                if (sub) CollectSceneItem(sub, visited);
+            }
+        }
+    }
+
     void RefreshSceneCache()
     {
         sceneItems_.clear();
@@ -1586,24 +1756,10 @@ private:
         if (ip && ip->GetSceneMtls())
         {
             MtlBaseLib* lib = ip->GetSceneMtls();
-            sceneItems_.reserve(lib->Count());
-            for (int i = 0; i < lib->Count(); ++i)
-            {
+            std::set<MtlBase*> visited;
+            for (int i = 0; i < lib->Count(); ++i) {
                 MtlBase* m = (*lib)[i];
-                if (!m) continue;
-                Item item;
-                MSTR className = m->ClassName();
-                item.label = m->GetName().Length()
-                    ? std::wstring(m->GetName().data())
-                    : std::wstring(className.data());
-                item.normLabel = Normalize(item.label, true);
-                item.search = Normalize(
-                    item.label + L" " + std::wstring(className.data()), true);
-                item.key = Normalize(item.label, false);
-                item.kind = ItemKind::SceneMaterial;
-                item.category = std::wstring(className.data());
-                item.live = m;
-                sceneItems_.push_back(std::move(item));
+                if (m) CollectSceneItem(m, visited);
             }
         }
         std::sort(sceneItems_.begin(), sceneItems_.end(),
@@ -1676,15 +1832,12 @@ private:
 
         auto passesTab = [&](const Item& item) -> bool
         {
-            bool isScene = item.kind == ItemKind::SceneMaterial;
+            bool isScene = (item.kind == ItemKind::SceneMaterial || item.kind == ItemKind::SceneMap);
             if (sceneOnly != isScene) return false;
-            if (!sceneOnly)
-            {
-                if (tab_ == TabMode::Materials &&
-                    item.kind != ItemKind::ClassMaterial) return false;
-                if (tab_ == TabMode::Maps &&
-                    item.kind != ItemKind::ClassMap) return false;
-            }
+            if (tab_ == TabMode::Materials &&
+                item.kind != ItemKind::ClassMaterial && item.kind != ItemKind::SceneMaterial) return false;
+            if (tab_ == TabMode::Maps &&
+                item.kind != ItemKind::ClassMap && item.kind != ItemKind::SceneMap) return false;
             return true;
         };
 

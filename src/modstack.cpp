@@ -266,7 +266,7 @@ private:
             SetBkMode(hdc, TRANSPARENT);
             HFONT oldF = (HFONT)SelectObject(hdc, Theme::fontBold);
             SetTextColor(hdc, Theme::accent);
-            TextOutW(hdc, 10, 10, L"Mod Stack", 9);
+            TextOutW(hdc, 10, 10, L"Extended Search", 9);
 
             if (self->hoverClose_) {
                 HBRUSH hov = CreateSolidBrush(RGB(200, 60, 60));

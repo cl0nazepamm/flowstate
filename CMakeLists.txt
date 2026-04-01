@@ -78,6 +78,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
     Maxscrpt.lib
     # mesh.lib
     bmm.lib
+    gdiplus.lib
 )
 
 # ── MSVC settings ────────────────────────────────────────────────
