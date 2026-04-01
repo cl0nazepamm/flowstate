@@ -82,7 +82,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
 
 # ── MSVC settings ────────────────────────────────────────────────
 if(MSVC)
-    target_compile_options(${PLUGIN_NAME} PRIVATE /W3 /MP /EHsc)
+    target_compile_options(${PLUGIN_NAME} PRIVATE /W3 /MP /EHa)
     set_property(TARGET ${PLUGIN_NAME} PROPERTY MSVC_RUNTIME_LIBRARY
         "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endif()
