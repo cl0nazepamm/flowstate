@@ -2031,132 +2031,11 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return CallWindowProc(g_origEdit, h, msg, wp, lp);
 }
 
-// Fav edit drag state
+// Fav strip drag state (drag on label area, not on edit controls)
 static bool  g_favDragging = false;
+static int   g_favDragIdx  = -1;
 static int   g_favDragStartX = 0;
-static bool  g_favDragMoved = false;
 static int   g_favDragAccum = 0;
-static HWND  g_favDragHwnd = nullptr;
-
-static LRESULT CALLBACK FavEditDragProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    EditField* ef = (EditField*)GetProp(h, _T("WF"));
-    switch (msg) {
-    case WM_LBUTTONDOWN: {
-        if (!ef) break;
-        g_favDragging = true;
-        g_favDragMoved = false;
-        g_favDragStartX = GET_X_LPARAM(lp);
-        g_favDragAccum = 0;
-        g_favDragHwnd = h;
-        SetCapture(h);
-        theHold.Begin();
-        return 0;
-    }
-    case WM_MOUSEMOVE: {
-        if (!g_favDragging || !ef || h != g_favDragHwnd) break;
-        int dx = GET_X_LPARAM(lp) - g_favDragStartX;
-        if (!g_favDragMoved && (dx > -3 && dx < 3)) return 0;
-        if (!g_favDragMoved) g_favDragMoved = true;
-        g_favDragStartX = GET_X_LPARAM(lp);
-        if (dx != 0) {
-            Interface* ip = GetCOREInterface();
-            TimeValue t = ip ? ip->GetTime() : 0;
-            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-            bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-            if (ef->pb) {
-                for (int ni = 0; ni < (ip ? ip->GetSelNodeCount() : 0); ni++) {
-                    INode* nd = ip->GetSelNode(ni);
-                    if (!nd) continue;
-                    IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
-                    if (!FindParam(nd, ef->key, pb, pid, pt2)) continue;
-                    if (IsFloat(pt2)) {
-                        float cur = pb->GetFloat(pid, t);
-                        float a = cur < 0 ? -cur : cur;
-                        float sc = a > 0.001f ? a * 0.01f : 0.001f;
-                        if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
-                        pb->SetValue(pid, t, cur + (float)dx * sc);
-                    } else if (pt2 == TYPE_BOOL) {
-                        pb->SetValue(pid, t, pb->GetInt(pid, t) ? 0 : 1);
-                    } else {
-                        g_favDragAccum += dx;
-                        int s = g_favDragAccum / 3;
-                        if (s != 0) {
-                            g_favDragAccum -= s * 3;
-                            if (shift) s *= 10;
-                            pb->SetValue(pid, t, pb->GetInt(pid, t) + s);
-                        }
-                    }
-                }
-            } else if (!ef->msPath.empty()) {
-                size_t sep = ef->key.find(L':');
-                if (sep != std::wstring::npos) {
-                    std::wstring prop = ef->key.substr(sep + 1);
-                    std::wstring readS = L"try((getProperty " + ef->msPath + L" #" + prop + L") as float)catch(0.0)";
-                    FPValue rv; ExecuteMAXScriptScript(readS.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &rv);
-                    float cur = (rv.type == TYPE_FLOAT) ? rv.f : 0.0f;
-                    float a = cur < 0 ? -cur : cur;
-                    float sc = a > 0.001f ? a * 0.01f : 0.001f;
-                    if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
-                    float inc = (float)dx * sc;
-                    std::wstring objPath = ef->msPath;
-                    if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
-                    std::wstring s = L"for obj in selection do try(local o=obj" + objPath +
-                        L";local v=getProperty o #" + prop +
-                        L";setProperty o #" + prop + L" (v+" + std::to_wstring(inc) + L"))catch()";
-                    ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
-                }
-            }
-            if (ip) {
-                for (int ni = 0; ni < ip->GetSelNodeCount(); ni++) {
-                    INode* nd = ip->GetSelNode(ni);
-                    if (nd) nd->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
-                }
-                ip->RedrawViews(t);
-            }
-            // Refresh fav strip edits
-            InvalidateRect(GetParent(h), nullptr, FALSE);
-
-            POINT scr; GetCursorPos(&scr);
-            std::wstring tip = ef->label + L": ";
-            if (ef->pb && ip && ip->GetSelNodeCount() > 0) {
-                IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
-                if (FindParam(ip->GetSelNode(0), ef->key, pb, pid, pt2)) {
-                    if (IsFloat(pt2)) {
-                        wchar_t buf[64]; swprintf(buf, 64, L"%.3f", pb->GetFloat(pid, t));
-                        tip += buf;
-                    } else tip += std::to_wstring(pb->GetInt(pid, t));
-                }
-            } else if (!ef->msPath.empty()) {
-                size_t sep = ef->key.find(L':');
-                if (sep != std::wstring::npos) {
-                    std::wstring prop = ef->key.substr(sep + 1);
-                    std::wstring readS = L"try((getProperty " + ef->msPath + L" #" + prop + L") as string)catch(\"\")";
-                    FPValue rv; ExecuteMAXScriptScript(readS.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &rv);
-                    if (rv.type == TYPE_STRING && rv.s) tip += rv.s;
-                }
-            }
-            ShowDragTip(scr, tip);
-        }
-        return 0;
-    }
-    case WM_LBUTTONUP: {
-        if (!g_favDragging) break;
-        g_favDragging = false;
-        ReleaseCapture();
-        if (g_favDragMoved) {
-            theHold.Accept(_T("Pin Drag"));
-            HideDragTip();
-        } else {
-            theHold.Cancel();
-            // No drag — let the edit control get focus for typing
-            CallWindowProc(g_origEdit, h, WM_LBUTTONDOWN, MK_LBUTTON, lp);
-        }
-        g_favDragHwnd = nullptr;
-        return 0;
-    }
-    }
-    return FavEditProc(h, msg, wp, lp);
-}
 
 // ── Tool name overlay near cursor ────────────────────────────────
 static const TCHAR* GetCommandModeName(int mode) {
@@ -2983,7 +2862,7 @@ static void BuildFavorites() {
             style, cx, cy, kFavCellW, kEditH, g_favWnd, nullptr, hInstance, nullptr);
         SendMessage(ef.hwnd, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
         if (!g_origEdit) g_origEdit = (WNDPROC)GetWindowLongPtr(ef.hwnd, GWLP_WNDPROC);
-        SetWindowLongPtr(ef.hwnd, GWLP_WNDPROC, (LONG_PTR)FavEditDragProc);
+        SetWindowLongPtr(ef.hwnd, GWLP_WNDPROC, (LONG_PTR)FavEditProc);
         SetProp(ef.hwnd, _T("WF"), (HANDLE)&ef);
     }
 
@@ -3093,6 +2972,98 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     case WM_TIMER:
         RefreshFavEdits();
         return 0;
+
+    // ── Drag scrub on label area (above edit controls) ──────────
+    case WM_LBUTTONDOWN: {
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        RECT rc; GetClientRect(hwnd, &rc);
+        int cols = std::max(1, ((int)rc.right - 8) / (kFavCellW + kFavGap));
+        for (int i = 0; i < (int)g_favEdits.size(); i++) {
+            int col = i % cols, row = i / cols;
+            int cx = 4 + col * (kFavCellW + kFavGap);
+            int cy = 4 + row * (kFavCellH + kFavGap);
+            RECT lr = { cx, cy, cx + kFavCellW, cy + kFavLabelH };
+            if (PtInRect(&lr, pt)) {
+                g_favDragging = true;
+                g_favDragIdx  = i;
+                g_favDragStartX = pt.x;
+                g_favDragAccum  = 0;
+                SetCapture(hwnd);
+                theHold.Begin();
+                SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
+                return 0;
+            }
+        }
+        break;
+    }
+    case WM_MOUSEMOVE: {
+        if (!g_favDragging || g_favDragIdx < 0 || g_favDragIdx >= (int)g_favEdits.size()) break;
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int dx = pt.x - g_favDragStartX;
+        if (dx == 0) return 0;
+        g_favDragStartX = pt.x;
+        auto& ef = g_favEdits[g_favDragIdx];
+        Interface* ip = GetCOREInterface();
+        TimeValue t = ip ? ip->GetTime() : 0;
+        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (ef.pb) {
+            float cur = ef.pb->GetFloat(ef.id, t);
+            if (IsFloat(ef.type)) {
+                float a = cur < 0 ? -cur : cur;
+                float sc = a > 0.001f ? a * 0.01f : 0.001f;
+                if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
+                ef.pb->SetValue(ef.id, t, cur + (float)dx * sc);
+            } else if (ef.type == TYPE_BOOL) {
+                ef.pb->SetValue(ef.id, t, ef.pb->GetInt(ef.id, t) ? 0 : 1);
+            } else {
+                g_favDragAccum += dx;
+                int s = g_favDragAccum / 3;
+                if (s != 0) { g_favDragAccum -= s * 3; if (shift) s *= 10;
+                    ef.pb->SetValue(ef.id, t, ef.pb->GetInt(ef.id, t) + s); }
+            }
+        }
+        if (ip) {
+            for (int ni = 0; ni < ip->GetSelNodeCount(); ni++) {
+                INode* nd = ip->GetSelNode(ni);
+                if (nd) nd->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
+            }
+            ip->RedrawViews(t);
+        }
+        RefreshFavEdits();
+        // Tooltip
+        POINT scr; GetCursorPos(&scr);
+        TCHAR buf[64]; FormatValue(ef, t, buf, 64);
+        std::wstring tip = ef.label + L": " + buf;
+        ShowDragTip(scr, tip);
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        if (!g_favDragging) break;
+        g_favDragging = false;
+        g_favDragIdx  = -1;
+        ReleaseCapture();
+        theHold.Accept(_T("Pin Drag"));
+        HideDragTip();
+        SetCursor(LoadCursor(nullptr, IDC_ARROW));
+        return 0;
+    }
+    case WM_SETCURSOR: {
+        // Show resize cursor when hovering label areas
+        if (!g_favDragging) {
+            POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd, &pt);
+            RECT rc; GetClientRect(hwnd, &rc);
+            int cols = std::max(1, ((int)rc.right - 8) / (kFavCellW + kFavGap));
+            for (int i = 0; i < (int)g_favEdits.size(); i++) {
+                int col = i % cols, row = i / cols;
+                int cx = 4 + col * (kFavCellW + kFavGap);
+                int cy = 4 + row * (kFavCellH + kFavGap);
+                RECT lr = { cx, cy, cx + kFavCellW, cy + kFavLabelH };
+                if (PtInRect(&lr, pt)) { SetCursor(LoadCursor(nullptr, IDC_SIZEWE)); return TRUE; }
+            }
+        }
+        break;
+    }
     }
     return DefWindowProc(hwnd, msg, wp, lp);
 }

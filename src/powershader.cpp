@@ -474,47 +474,24 @@ static ClassDesc* FindClassByName(SClass_ID sid, const wchar_t* name) {
 }
 
 // Create a texture node for the preview — UberBitmap2 preferred, BitmapTex fallback
-static Texmap* CreatePreviewTexmap(const std::wstring& path, ClassDesc* oslCD, const std::wstring& oslShaderPath) {
-    // Try UberBitmap2 (OSLMap) first
-    if (oslCD) {
-        Texmap* osl = static_cast<Texmap*>(oslCD->Create(FALSE));
-        if (osl) {
-            // Set the OSL shader file
-            SetPB2Texmap(osl, L"OSLPath", nullptr); // clear first
-            for (int b = 0; b < osl->NumParamBlocks(); b++) {
-                IParamBlock2* pb = osl->GetParamBlock(b);
-                if (!pb) continue;
-                for (int i = 0; i < pb->NumParams(); i++) {
-                    ParamID pid = pb->IndextoID(i);
-                    const ParamDef& d = pb->GetParamDef(pid);
-                    if (d.type == TYPE_FILENAME) {
-                        // First filename param = OSL shader path, second = texture
-                        const MCHAR* cur = pb->GetStr(pid);
-                        if (!cur || !cur[0]) {
-                            // Set OSL shader file first time, texture file second time
-                            pb->SetValue(pid, 0, const_cast<MCHAR*>(oslShaderPath.c_str()));
-                        }
-                    }
-                }
-            }
-            // Now set the texture filename — it's typically named "filename"
-            for (int b = 0; b < osl->NumParamBlocks(); b++) {
-                IParamBlock2* pb = osl->GetParamBlock(b);
-                if (!pb) continue;
-                for (int i = 0; i < pb->NumParams(); i++) {
-                    ParamID pid = pb->IndextoID(i);
-                    const ParamDef& d = pb->GetParamDef(pid);
-                    if (d.int_name && _wcsicmp(d.int_name, L"filename") == 0) {
-                        pb->SetValue(pid, 0, const_cast<MCHAR*>(path.c_str()));
-                        return osl;
-                    }
-                }
-            }
-            // Fallback: if "filename" param not found, delete and use BitmapTex
-            osl->DeleteThis();
-        }
+static Texmap* CreatePreviewTexmap(const std::wstring& path) {
+    // Use OSL_uberBitmap2b — the native MaxScript constructor that handles
+    // all OSL shader loading internally. No manual OSLPath setup needed.
+    auto esc = [](std::wstring s) {
+        for (size_t p = s.find(L'\\'); p != std::wstring::npos; p = s.find(L'\\', p + 2))
+            s.insert(p, L"\\");
+        return s;
+    };
+    std::wstring script =
+        L"try(local m=OSL_uberBitmap2b();m.filename=\"" + esc(path) + L"\";m)catch(undefined)";
+    FPValue r;
+    if (ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &r)) {
+        if (r.type == TYPE_REFTARG && r.r)
+            return static_cast<Texmap*>(r.r);
+        if (r.type == TYPE_TEXMAP && r.tex)
+            return r.tex;
     }
-    // Fallback to BitmapTex
+    // Fallback to BitmapTex only if UberBitmap2 is not installed
     BitmapTex* bt = NewDefaultBitmapTex();
     if (bt) bt->SetMapName(path.c_str());
     return bt;
@@ -528,16 +505,6 @@ static void ExecuteShellCommand(int resolution) {
     MSTR tmpBase = ip->GetDir(APP_TEMP_DIR);
     std::wstring tmpDir = std::wstring(tmpBase.data()) + L"\\PowerShader_SHLL";
     CreateDirectoryW(tmpDir.c_str(), nullptr);
-
-    // Find OSLMap class for UberBitmap2
-    ClassDesc* oslCD = FindClassByName(TEXMAP_CLASS_ID, L"OSLMap");
-    std::wstring oslPath;
-    if (oslCD) {
-        MSTR maxRoot = ip->GetDir(APP_MAX_SYS_ROOT_DIR);
-        oslPath = std::wstring(maxRoot.data()) + L"\\OSL\\UberBitmap2.osl";
-        if (GetFileAttributesW(oslPath.c_str()) == INVALID_FILE_ATTRIBUTES)
-            oslCD = nullptr; // OSL file not found, fall back to BitmapTex
-    }
 
     // Find Normal Bump class for normal maps
     ClassDesc* normalBumpCD = FindClassByName(TEXMAP_CLASS_ID, L"Normal Bump");
@@ -575,7 +542,7 @@ static void ExecuteShellCommand(int resolution) {
             std::wstring resized = ResizeTexture(mp.path, tmpDir, resolution);
             if (resized.empty()) continue;
 
-            Texmap* tx = CreatePreviewTexmap(resized, oslCD, oslPath);
+            Texmap* tx = CreatePreviewTexmap(resized);
             if (!tx) continue;
 
             switch (mp.slot) {
