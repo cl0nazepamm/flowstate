@@ -381,15 +381,66 @@ static const BtnDef kSplineOps[] = {
 };
 static int g_hoverBtn  = -1;  // hovered button ID for strip windows
 static bool g_showSubObj = false; // sub-object toggles (off by default, configurable)
-static bool g_tabShader  = false; // Tab key opens PowerShader when SME focused
+static bool g_tabShader  = true;  // Tab key opens PowerShader when SME focused (on by default)
 static bool g_lightTheme = false; // light theme (brushed aluminium)
 static bool  g_mmDragging = false;  // middle-mouse panel drag
 static POINT g_mmStart = {};
 static RECT  g_mmPanelRect = {};
 
+// Left-click drag on param label to scrub value
+static bool  g_lmbDragging = false;
+static int   g_lmbDragIdx  = -1;
+static int   g_lmbDragStartX = 0;
+static int   g_lmbDragAccum  = 0;  // accumulated sub-threshold movement for ints
+static bool  g_lmbDragMoved  = false; // true once mouse moves enough to be a drag (not a click)
+
 // Module enable flags (read from FlowState.ini)
 static bool g_enablePowerParams = true;
 static bool g_enablePowerShader = true;
+
+struct QuickMod {
+    std::wstring internalName;
+    std::wstring label;
+    std::wstring shortLabel;
+};
+static std::vector<QuickMod> g_quickMods;
+
+static void PositionBtnStrips();
+
+void TogglePowerParamsQuickModifier(const wchar_t* internalName, const wchar_t* label) {
+    if (!internalName || !label) return;
+    std::wstring iname(internalName);
+    for (auto it = g_quickMods.begin(); it != g_quickMods.end(); ++it) {
+        if (it->internalName == iname) {
+            g_quickMods.erase(it);
+            if (g_open && g_btnRight) InvalidateRect(g_btnRight, nullptr, TRUE);
+            PositionBtnStrips();
+            return;
+        }
+    }
+    
+    std::wstring sl;
+    std::wstring lbl(label);
+    for (wchar_t c : lbl) if (iswupper(c)) sl += c;
+    if (sl.empty() || sl.length() == 1) {
+        sl = lbl.substr(0, std::min(size_t(3), lbl.size()));
+        for (auto& c : sl) c = towupper(c);
+    }
+    if (sl.length() > 4) sl = sl.substr(0, 4);
+
+    g_quickMods.push_back({iname, lbl, sl});
+    if (g_open && g_btnRight) InvalidateRect(g_btnRight, nullptr, TRUE);
+    PositionBtnStrips();
+}
+
+bool IsPowerParamsQuickModifier(const wchar_t* internalName) {
+    if (!internalName) return false;
+    std::wstring iname(internalName);
+    for (const auto& qm : g_quickMods) {
+        if (qm.internalName == iname) return true;
+    }
+    return false;
+}
 
 // XButton1 dynamic assignment — two slots: vertical (V) and horizontal (H)
 // Keyed per base-object class so each object type remembers its own assignments
@@ -414,39 +465,10 @@ static HWND         g_osdWnd = nullptr;
 static UINT_PTR     g_osdTimer = 0;
 static HWND         g_dragTip = nullptr; // cursor-following value tooltip
 
+// LoadModuleFlags is now handled by LoadSettings() — reads [config] section from FlowState.cfg
 static void LoadModuleFlags() {
-    Interface* ip = GetCOREInterface();
-    if (!ip) return;
-    MSTR dirStr = ip->GetDir(APP_PLUGCFG_DIR);
-    if (!dirStr.data() || !dirStr.data()[0]) return;
-    std::wstring ini = std::wstring(dirStr.data()) + L"\\FlowState.ini";
-    FILE* f = _wfopen(ini.c_str(), L"r");
-    if (!f) return;  // no ini = all enabled (defaults)
-    wchar_t line[256];
-    while (fgetws(line, 256, f)) {
-        if (wcsstr(line, L"PowerParams=0")) g_enablePowerParams = false;
-        if (wcsstr(line, L"PowerShader=0")) g_enablePowerShader = false;
-        if (wcsstr(line, L"SubObjToggles=1")) g_showSubObj = true;
-        if (wcsstr(line, L"TabShader=1"))    g_tabShader = true;
-        if (wcsstr(line, L"LightTheme=1")) g_lightTheme = true;
-        // Per-class XB1 assignments: XB1:ClassName=vKey|hKey
-        if (wcsncmp(line, L"XB1:", 4) == 0) {
-            std::wstring l(line);
-            while (!l.empty() && (l.back()==L'\n'||l.back()==L'\r')) l.pop_back();
-            size_t eq = l.find(L'=', 4);
-            if (eq != std::wstring::npos) {
-                std::wstring cls = l.substr(4, eq - 4);
-                std::wstring val = l.substr(eq + 1);
-                size_t pipe = val.find(L'|');
-                if (pipe != std::wstring::npos)
-                    g_xb1Map[cls] = { val.substr(0, pipe), val.substr(pipe + 1) };
-            }
-        }
-    }
-    fclose(f);
-    UpdateTheme(g_lightTheme);
-    PowerShader::ReloadTheme(g_lightTheme);
-    ModStack::ReloadTheme(g_lightTheme);
+    // No-op: LoadSettings() handles everything now.
+    // Kept as stub so call sites don't need to change yet.
 }
 
 static std::wstring GetSelBaseClass() {
@@ -497,36 +519,10 @@ static void SyncXB1ToSelection() {
     }
 }
 
+static void SaveSettings(); // forward declaration
 static void SaveXB1Assignment() {
     StashXB1();
-    Interface* ip = GetCOREInterface();
-    if (!ip) return;
-    MSTR dirStr = ip->GetDir(APP_PLUGCFG_DIR);
-    if (!dirStr.data() || !dirStr.data()[0]) return;
-    std::wstring ini = std::wstring(dirStr.data()) + L"\\FlowState.ini";
-
-    std::vector<std::wstring> lines;
-    FILE* f = _wfopen(ini.c_str(), L"r");
-    if (f) {
-        wchar_t buf[256];
-        while (fgetws(buf, 256, f)) {
-            std::wstring l(buf);
-            if (l.find(L"XB1:") == 0) continue; // remove old XB1 lines
-            if (l.find(L"XB1VKey=") != std::wstring::npos) continue;
-            if (l.find(L"XB1HKey=") != std::wstring::npos) continue;
-            if (l.find(L"XB1Key=") != std::wstring::npos) continue;
-            if (l.find(L"XB1Axis=") != std::wstring::npos) continue;
-            lines.push_back(l);
-        }
-        fclose(f);
-    }
-    // Write per-class assignments: XB1:ClassName=vKey|hKey
-    for (auto& [cls, pair] : g_xb1Map) {
-        if (pair.vKey.empty() && pair.hKey.empty()) continue;
-        lines.push_back(L"XB1:" + cls + L"=" + pair.vKey + L"|" + pair.hKey + L"\n");
-    }
-    f = _wfopen(ini.c_str(), L"w");
-    if (f) { for (auto& l : lines) fwprintf(f, L"%s", l.c_str()); fclose(f); }
+    SaveSettings(); // XB1 data is now in [config] section of FlowState.cfg
 }
 
 // ── Fade animation (non-blocking, ease-out curve) ───────────────
@@ -791,7 +787,7 @@ static std::wstring GetCfgPath() {
     MSTR dirStr = ip->GetDir(APP_PLUGCFG_DIR);
     const MCHAR* dir = dirStr.data();
     if (!dir || !dir[0]) return L"";
-    return std::wstring(dir) + L"\\PowerParams.cfg";
+    return std::wstring(dir) + L"\\FlowState.cfg";
 }
 
 static void SaveSettings() {
@@ -799,32 +795,124 @@ static void SaveSettings() {
     if (path.empty()) return;
     FILE* f = _wfopen(path.c_str(), L"w");
     if (!f) return;
+
+    // [config] — module flags & XB1 assignments
+    fwprintf(f, L"[config]\n");
+    if (!g_enablePowerParams) fwprintf(f, L"PowerParams=0\n");
+    if (!g_enablePowerShader) fwprintf(f, L"PowerShader=0\n");
+    if (g_showSubObj)         fwprintf(f, L"SubObjToggles=1\n");
+    if (!g_tabShader)         fwprintf(f, L"TabShader=0\n");
+    if (g_lightTheme)         fwprintf(f, L"LightTheme=1\n");
+    for (auto& [cls, pair] : g_xb1Map) {
+        if (pair.vKey.empty() && pair.hKey.empty()) continue;
+        fwprintf(f, L"XB1:%s=%s|%s\n", cls.c_str(), pair.vKey.c_str(), pair.hKey.c_str());
+    }
+
+    // [params] — collapsed, hidden, favorites, quick mods
+    fwprintf(f, L"[params]\n");
     for (auto& s : g_collapsed) fwprintf(f, L"C:%s\n", s.c_str());
     for (auto& s : g_hidden)    fwprintf(f, L"H:%s\n", s.c_str());
     for (auto& s : g_favorites) fwprintf(f, L"F:%s\n", s.c_str());
+    for (auto& qm : g_quickMods)
+        fwprintf(f, L"Q:%s|%s\n", qm.internalName.c_str(), qm.label.c_str());
+
+    // [pins] and [bricks] — PowerShader data
+    PowerShader::WritePinsSection(f);
+    PowerShader::WriteBricksSection(f);
+
     fclose(f);
 }
 
+// Non-static wrapper so powershader.cpp can trigger a full save
+void FlowState_SaveSettings() { SaveSettings(); }
+
 static void LoadSettings() {
-    g_collapsed.clear(); g_hidden.clear(); g_favorites.clear();
+    g_collapsed.clear(); g_hidden.clear(); g_favorites.clear(); g_quickMods.clear();
+    PowerShader::ClearPersistent();
+
     std::wstring path = GetCfgPath();
     if (path.empty()) return;
     FILE* f = _wfopen(path.c_str(), L"r");
-    if (!f) return;
+    if (!f) {
+        // Try legacy files for migration
+        std::wstring dir = path.substr(0, path.rfind(L'\\') + 1);
+        f = _wfopen((dir + L"PowerParams.cfg").c_str(), L"r");
+        if (f) {
+            // Legacy format: no sections, just prefixed lines
+            wchar_t line[512];
+            while (fgetws(line, 512, f)) {
+                size_t len = wcslen(line);
+                while (len > 0 && (line[len-1]==L'\n'||line[len-1]==L'\r')) line[--len]=0;
+                if (len < 3 || line[1] != L':') continue;
+                std::wstring val(line + 2);
+                switch (line[0]) {
+                case L'C': g_collapsed.insert(val); break;
+                case L'F': if (!val.empty() && val[0] != L':') g_favorites.insert(val); break;
+                case L'H': g_hidden.insert(val); break;
+                case L'Q': { size_t p = val.find(L'|'); if (p != std::wstring::npos) TogglePowerParamsQuickModifier(val.substr(0,p).c_str(), val.substr(p+1).c_str()); break; }
+                }
+            }
+            fclose(f);
+            SaveSettings(); // migrate to new unified file
+            return;
+        }
+        return;
+    }
+
+    enum Section { SEC_NONE, SEC_CONFIG, SEC_PARAMS, SEC_PINS, SEC_BRICKS };
+    Section sec = SEC_NONE;
     wchar_t line[512];
     while (fgetws(line, 512, f)) {
         size_t len = wcslen(line);
         while (len > 0 && (line[len-1]==L'\n'||line[len-1]==L'\r')) line[--len]=0;
-        if (len < 3 || line[1] != L':') continue;
-        std::wstring val(line + 2);
-        switch (line[0]) {
-        case L'C': g_collapsed.insert(val); break;
-        case L'P': break; // legacy
-        case L'F': if (!val.empty() && val[0] != L':') g_favorites.insert(val); break;
-        case L'H': g_hidden.insert(val);    break;
+        if (len == 0) continue;
+
+        // Section headers
+        if (wcscmp(line, L"[config]") == 0)  { sec = SEC_CONFIG; continue; }
+        if (wcscmp(line, L"[params]") == 0)  { sec = SEC_PARAMS; continue; }
+        if (wcscmp(line, L"[pins]") == 0)    { sec = SEC_PINS;   continue; }
+        if (wcscmp(line, L"[bricks]") == 0)  { sec = SEC_BRICKS; continue; }
+
+        std::wstring l(line);
+
+        if (sec == SEC_CONFIG) {
+            if (l == L"PowerParams=0")   g_enablePowerParams = false;
+            if (l == L"PowerShader=0")   g_enablePowerShader = false;
+            if (l == L"SubObjToggles=1") g_showSubObj = true;
+            if (l == L"TabShader=0")     g_tabShader = false;
+            if (l == L"LightTheme=1")    g_lightTheme = true;
+            if (l.compare(0, 4, L"XB1:") == 0) {
+                size_t eq = l.find(L'=', 4);
+                if (eq != std::wstring::npos) {
+                    std::wstring cls = l.substr(4, eq - 4);
+                    std::wstring val = l.substr(eq + 1);
+                    size_t pipe = val.find(L'|');
+                    if (pipe != std::wstring::npos)
+                        g_xb1Map[cls] = { val.substr(0, pipe), val.substr(pipe + 1) };
+                }
+            }
+        }
+        else if (sec == SEC_PARAMS) {
+            if (len < 3 || line[1] != L':') continue;
+            std::wstring val(line + 2);
+            switch (line[0]) {
+            case L'C': g_collapsed.insert(val); break;
+            case L'F': if (!val.empty() && val[0] != L':') g_favorites.insert(val); break;
+            case L'H': g_hidden.insert(val); break;
+            case L'Q': { size_t p = val.find(L'|'); if (p != std::wstring::npos) TogglePowerParamsQuickModifier(val.substr(0,p).c_str(), val.substr(p+1).c_str()); break; }
+            }
+        }
+        else if (sec == SEC_PINS) {
+            PowerShader::ReadPinsLine(l);
+        }
+        else if (sec == SEC_BRICKS) {
+            PowerShader::ReadBricksLine(l);
         }
     }
     fclose(f);
+    UpdateTheme(g_lightTheme);
+    PowerShader::ReloadTheme(g_lightTheme);
+    ModStack::ReloadTheme(g_lightTheme);
 }
 
 // ── Material Editor detection ────────────────────────────────────
@@ -1162,8 +1250,18 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             bool matEd = IsMaterialEditorFocused();
-            if (ctrl) {
-                // Clear XB1 slider assignments for current selection
+            if (ctrl && shift) {
+                // Ctrl+Shift+XButton2 → swap V/H slider assignments
+                SyncXB1ToSelection();
+                if (g_xb1V.Active() || g_xb1H.Active()) {
+                    std::swap(g_xb1V, g_xb1H);
+                    SaveXB1Assignment();
+                    ShowOSD(L"\u2195 " + (g_xb1V.Active() ? g_xb1V.label : L"OFF") +
+                            L"  \u2194 " + (g_xb1H.Active() ? g_xb1H.label : L"OFF"));
+                }
+                return 1;
+            } else if (ctrl) {
+                // Ctrl+XButton2 → clear XB1 slider assignments
                 SyncXB1ToSelection();
                 if (g_xb1V.Active() || g_xb1H.Active()) {
                     g_xb1V.Clear(); g_xb1H.Clear();
@@ -1926,6 +2024,133 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return CallWindowProc(g_origEdit, h, msg, wp, lp);
 }
 
+// Fav edit drag state
+static bool  g_favDragging = false;
+static int   g_favDragStartX = 0;
+static bool  g_favDragMoved = false;
+static int   g_favDragAccum = 0;
+static HWND  g_favDragHwnd = nullptr;
+
+static LRESULT CALLBACK FavEditDragProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    EditField* ef = (EditField*)GetProp(h, _T("WF"));
+    switch (msg) {
+    case WM_LBUTTONDOWN: {
+        if (!ef) break;
+        g_favDragging = true;
+        g_favDragMoved = false;
+        g_favDragStartX = GET_X_LPARAM(lp);
+        g_favDragAccum = 0;
+        g_favDragHwnd = h;
+        SetCapture(h);
+        theHold.Begin();
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (!g_favDragging || !ef || h != g_favDragHwnd) break;
+        int dx = GET_X_LPARAM(lp) - g_favDragStartX;
+        if (!g_favDragMoved && (dx > -3 && dx < 3)) return 0;
+        if (!g_favDragMoved) g_favDragMoved = true;
+        g_favDragStartX = GET_X_LPARAM(lp);
+        if (dx != 0) {
+            Interface* ip = GetCOREInterface();
+            TimeValue t = ip ? ip->GetTime() : 0;
+            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            if (ef->pb) {
+                for (int ni = 0; ni < (ip ? ip->GetSelNodeCount() : 0); ni++) {
+                    INode* nd = ip->GetSelNode(ni);
+                    if (!nd) continue;
+                    IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
+                    if (!FindParam(nd, ef->key, pb, pid, pt2)) continue;
+                    if (IsFloat(pt2)) {
+                        float cur = pb->GetFloat(pid, t);
+                        float a = cur < 0 ? -cur : cur;
+                        float sc = a > 0.001f ? a * 0.01f : 0.001f;
+                        if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
+                        pb->SetValue(pid, t, cur + (float)dx * sc);
+                    } else if (pt2 == TYPE_BOOL) {
+                        pb->SetValue(pid, t, pb->GetInt(pid, t) ? 0 : 1);
+                    } else {
+                        g_favDragAccum += dx;
+                        int s = g_favDragAccum / 3;
+                        if (s != 0) {
+                            g_favDragAccum -= s * 3;
+                            if (shift) s *= 10;
+                            pb->SetValue(pid, t, pb->GetInt(pid, t) + s);
+                        }
+                    }
+                }
+            } else if (!ef->msPath.empty()) {
+                size_t sep = ef->key.find(L':');
+                if (sep != std::wstring::npos) {
+                    std::wstring prop = ef->key.substr(sep + 1);
+                    std::wstring readS = L"try((getProperty " + ef->msPath + L" #" + prop + L") as float)catch(0.0)";
+                    FPValue rv; ExecuteMAXScriptScript(readS.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &rv);
+                    float cur = (rv.type == TYPE_FLOAT) ? rv.f : 0.0f;
+                    float a = cur < 0 ? -cur : cur;
+                    float sc = a > 0.001f ? a * 0.01f : 0.001f;
+                    if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
+                    float inc = (float)dx * sc;
+                    std::wstring objPath = ef->msPath;
+                    if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
+                    std::wstring s = L"for obj in selection do try(local o=obj" + objPath +
+                        L";local v=getProperty o #" + prop +
+                        L";setProperty o #" + prop + L" (v+" + std::to_wstring(inc) + L"))catch()";
+                    ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
+                }
+            }
+            if (ip) {
+                for (int ni = 0; ni < ip->GetSelNodeCount(); ni++) {
+                    INode* nd = ip->GetSelNode(ni);
+                    if (nd) nd->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
+                }
+                ip->RedrawViews(t);
+            }
+            // Refresh fav strip edits
+            InvalidateRect(GetParent(h), nullptr, FALSE);
+
+            POINT scr; GetCursorPos(&scr);
+            std::wstring tip = ef->label + L": ";
+            if (ef->pb && ip && ip->GetSelNodeCount() > 0) {
+                IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
+                if (FindParam(ip->GetSelNode(0), ef->key, pb, pid, pt2)) {
+                    if (IsFloat(pt2)) {
+                        wchar_t buf[64]; swprintf(buf, 64, L"%.3f", pb->GetFloat(pid, t));
+                        tip += buf;
+                    } else tip += std::to_wstring(pb->GetInt(pid, t));
+                }
+            } else if (!ef->msPath.empty()) {
+                size_t sep = ef->key.find(L':');
+                if (sep != std::wstring::npos) {
+                    std::wstring prop = ef->key.substr(sep + 1);
+                    std::wstring readS = L"try((getProperty " + ef->msPath + L" #" + prop + L") as string)catch(\"\")";
+                    FPValue rv; ExecuteMAXScriptScript(readS.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &rv);
+                    if (rv.type == TYPE_STRING && rv.s) tip += rv.s;
+                }
+            }
+            ShowDragTip(scr, tip);
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        if (!g_favDragging) break;
+        g_favDragging = false;
+        ReleaseCapture();
+        if (g_favDragMoved) {
+            theHold.Accept(_T("Pin Drag"));
+            HideDragTip();
+        } else {
+            theHold.Cancel();
+            // No drag — let the edit control get focus for typing
+            CallWindowProc(g_origEdit, h, WM_LBUTTONDOWN, MK_LBUTTON, lp);
+        }
+        g_favDragHwnd = nullptr;
+        return 0;
+    }
+    }
+    return FavEditProc(h, msg, wp, lp);
+}
+
 // ── Tool name overlay near cursor ────────────────────────────────
 static const TCHAR* GetCommandModeName(int mode) {
     switch (mode) {
@@ -2044,21 +2269,27 @@ static bool IsModifyMode() {
 }
 
 static void PositionBtnStrips() {
-    // Ops strip always hidden (hardcoded ops removed)
-    if (g_btnRight) ShowWindow(g_btnRight, SW_HIDE);
+    RECT pr; GetWindowRect(g_panel, &pr);
+    int sh = BtnStripH();
+    
+    // Quick Mods strip (right side)
+    if (!g_quickMods.empty() && g_open) {
+        int rw = BtnStripW((int)g_quickMods.size());
+        SetWindowPos(g_btnRight, HWND_TOPMOST, pr.right - rw, pr.top - sh - kSideGap, rw, sh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        InvalidateRect(g_btnRight, nullptr, FALSE);
+    } else {
+        if (g_btnRight) ShowWindow(g_btnRight, SW_HIDE);
+    }
 
     if (!g_panel || !g_open || g_ctx == CTX_NONE || !g_showSubObj || !IsModifyMode()) {
         if (g_btnLeft) ShowWindow(g_btnLeft, SW_HIDE);
         return;
     }
-    RECT pr; GetWindowRect(g_panel, &pr);
-    int sh = BtnStripH();
     int leftCount = (g_ctx == CTX_EPOLY) ? 5 : 3;
     int lw = BtnStripW(leftCount);
     int topY = pr.top - sh - kSideGap;
 
-    SetWindowPos(g_btnLeft, HWND_TOPMOST, pr.left, topY, lw, sh,
-        SWP_NOACTIVATE | SWP_NOZORDER);
+    SetWindowPos(g_btnLeft, HWND_TOPMOST, pr.left, topY, lw, sh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(g_btnLeft, nullptr, FALSE);
 }
 
@@ -2309,19 +2540,27 @@ static void KillActiveEdit(bool apply) {
             Interface* ip = GetCOREInterface();
             TimeValue t = ip ? ip->GetTime() : 0;
             theHold.Suspend();
-            if (IsFloat(ef.type))       ef.pb->SetValue(ef.id, t, (float)_wtof(txt));
-            else if (ef.type==TYPE_BOOL) ef.pb->SetValue(ef.id, t, (_wcsicmp(txt,_T("On"))==0||_wcsicmp(txt,_T("1"))==0||_wcsicmp(txt,_T("true"))==0)?1:0);
-            else                        ef.pb->SetValue(ef.id, t, _wtoi(txt));
+            // Apply typed value to all selected nodes
+            for (int ni = 0; ni < (ip ? ip->GetSelNodeCount() : 0); ni++) {
+                INode* nd = ip->GetSelNode(ni);
+                if (!nd) continue;
+                IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
+                if (!FindParam(nd, ef.key, pb, pid, pt2)) continue;
+                if (IsFloat(pt2))        pb->SetValue(pid, t, (float)_wtof(txt));
+                else if (pt2==TYPE_BOOL) pb->SetValue(pid, t, (_wcsicmp(txt,_T("On"))==0||_wcsicmp(txt,_T("1"))==0||_wcsicmp(txt,_T("true"))==0)?1:0);
+                else                     pb->SetValue(pid, t, _wtoi(txt));
+            }
             theHold.Resume();
             if (g_epolyPreview) EPolyRefresh();
             else                NotifyParamChanged();
         } else {
-            // MaxScript-based params (legacy PB1 objects)
+            // MaxScript-based params — apply to all selected
             std::wstring prop = PropFromKey(ef);
             std::wstring val(txt);
-            // Convert 0/1 to false/true for MaxScript bools
             if (ef.type == (ParamType2)TYPE_BOOL) val = (_wcsicmp(txt,L"On")==0||_wcsicmp(txt,L"1")==0||_wcsicmp(txt,L"true")==0) ? L"true" : L"false";
-            std::wstring script = L"try(setProperty " + MsObjPath(ef) + L" #" + prop + L" " + val + L")catch()";
+            std::wstring objPath = MsObjPath(ef);
+            if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
+            std::wstring script = L"for obj in selection do try(setProperty (obj" + objPath + L") #" + prop + L" " + val + L")catch()";
             ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
             NotifyParamChanged();
         }
@@ -2507,10 +2746,19 @@ static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         Interface* ip = GetCOREInterface();
         if (ip) curLevel = ip->GetSubObjectLevel();
 
-        // Only left strip (sub-object toggles) — ops strip removed
+        // Only left strip (sub-object toggles)
         if (isLeft) {
             if (g_ctx == CTX_EPOLY)  DrawBtnStrip(mem, kEPolySubObj, 5, curLevel, g_font, rc.right, rc.bottom);
             if (g_ctx == CTX_SPLINE) DrawBtnStrip(mem, kSplineSubObj, 3, curLevel, g_font, rc.right, rc.bottom);
+        } else {
+            // Right strip (quick access modifiers)
+            if (!g_quickMods.empty()) {
+                std::vector<BtnDef> qBtns;
+                for (int i = 0; i < (int)g_quickMods.size(); ++i) {
+                    qBtns.push_back({g_quickMods[i].shortLabel.c_str(), i});
+                }
+                DrawBtnStrip(mem, qBtns.data(), (int)qBtns.size(), -1, g_font, rc.right, rc.bottom);
+            }
         }
 
         BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
@@ -2521,16 +2769,32 @@ static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     case WM_ERASEBKGND: return 1;
 
     case WM_LBUTTONDOWN: {
-        if (!isLeft) break; // ops strip removed
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        int hit = -1;
-        if (g_ctx == CTX_EPOLY)  hit = HitBtnStrip(kEPolySubObj, 5, BtnStripW(5), pt);
-        if (g_ctx == CTX_SPLINE) hit = HitBtnStrip(kSplineSubObj, 3, BtnStripW(3), pt);
-        if (hit >= 0 && IsModifyMode()) {
-            Interface* ip = GetCOREInterface();
-            if (ip) ip->SetSubObjectLevel(ip->GetSubObjectLevel() == hit ? 0 : hit);
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return 0;
+        if (isLeft) {
+            int hit = -1;
+            if (g_ctx == CTX_EPOLY)  hit = HitBtnStrip(kEPolySubObj, 5, BtnStripW(5), pt);
+            if (g_ctx == CTX_SPLINE) hit = HitBtnStrip(kSplineSubObj, 3, BtnStripW(3), pt);
+            if (hit >= 0 && IsModifyMode()) {
+                Interface* ip = GetCOREInterface();
+                if (ip) ip->SetSubObjectLevel(ip->GetSubObjectLevel() == hit ? 0 : hit);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+        } else {
+            int count = (int)g_quickMods.size();
+            if (count > 0) {
+                int hit = -1;
+                std::vector<BtnDef> qBtns;
+                for (int i = 0; i < count; ++i) qBtns.push_back({g_quickMods[i].shortLabel.c_str(), i});
+                hit = HitBtnStrip(qBtns.data(), count, BtnStripW(count), pt);
+                if (hit >= 0 && hit < count) {
+                    std::wstring name = g_quickMods[hit].internalName;
+                    std::wstring s = L"try(addModifier $ (" + name + L"()))catch()";
+                    ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
+                    if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
+                    return 0;
+                }
+            }
         }
         break;
     }
@@ -2540,6 +2804,13 @@ static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         if (isLeft) {
             if (g_ctx == CTX_EPOLY)  hit = HitBtnStrip(kEPolySubObj, 5, BtnStripW(5), pt);
             if (g_ctx == CTX_SPLINE) hit = HitBtnStrip(kSplineSubObj, 3, BtnStripW(3), pt);
+        } else {
+            int count = (int)g_quickMods.size();
+            if (count > 0) {
+                std::vector<BtnDef> qBtns;
+                for (int i = 0; i < count; ++i) qBtns.push_back({g_quickMods[i].shortLabel.c_str(), i});
+                hit = HitBtnStrip(qBtns.data(), count, BtnStripW(count), pt);
+            }
         }
         if (hit != g_hoverBtn) { g_hoverBtn = hit; InvalidateRect(hwnd, nullptr, FALSE); }
         TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
@@ -2658,7 +2929,7 @@ static void BuildFavorites() {
             style, cx, cy, kFavCellW, kEditH, g_favWnd, nullptr, hInstance, nullptr);
         SendMessage(ef.hwnd, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
         if (!g_origEdit) g_origEdit = (WNDPROC)GetWindowLongPtr(ef.hwnd, GWLP_WNDPROC);
-        SetWindowLongPtr(ef.hwnd, GWLP_WNDPROC, (LONG_PTR)FavEditProc);
+        SetWindowLongPtr(ef.hwnd, GWLP_WNDPROC, (LONG_PTR)FavEditDragProc);
         SetProp(ef.hwnd, _T("WF"), (HANDLE)&ef);
     }
 
@@ -2701,7 +2972,8 @@ static void PositionFavStrip() {
     int h = 8 + rows * (kFavCellH + kFavGap);
     SetWindowPos(g_favWnd, HWND_TOPMOST,
         pr.left + (panelW - w) / 2, pr.bottom + kSideGap,
-        w, h, SWP_NOACTIVATE | SWP_NOZORDER);
+        w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(g_favWnd, nullptr, FALSE);
 }
 
 static HFONT g_fontTiny = nullptr;
@@ -2823,13 +3095,20 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Click anywhere kills active edit
         if (g_editHwnd) { KillActiveEdit(true); InvalidateRect(hwnd, nullptr, FALSE); }
 
-        // Click on value area → spawn edit (skip if on a group header row)
+        // Click/drag on value area (skip if on a group header row)
         if (FindGroupAtY(pt.y) < 0) {
             int idx = FindParamAtY(pt.y);
             RECT rc2; GetClientRect(hwnd, &rc2);
             int editX = rc2.right - kPad - kEditW;
             if (idx >= 0 && pt.x >= editX && pt.y >= g_contentStartY) {
-                SpawnEditAt(idx);
+                // Start drag on value area — if user releases without moving, spawn edit instead
+                g_lmbDragging = true;
+                g_lmbDragIdx  = idx;
+                g_lmbDragStartX = pt.x;
+                g_lmbDragAccum  = 0;
+                g_lmbDragMoved  = false;
+                SetCapture(hwnd);
+                theHold.Begin();
                 return 0;
             }
         }
@@ -2859,7 +3138,6 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
         }
-
 
         // Click on group header
         { int gIdx = FindGroupAtY(pt.y);
@@ -3026,6 +3304,16 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_modSearch) return 0;
         POINT rpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
 
+        // Ctrl+Right-click anywhere → show all hidden params
+        if (GetKeyState(VK_CONTROL) & 0x8000) {
+            if (!g_hidden.empty()) {
+                g_hidden.clear();
+                SaveSettings(); GatherParams(); BuildLayout();
+                BuildFavorites(); PositionFavStrip();
+            }
+            return 0;
+        }
+
         // Right-click on group header → unhide all hidden params for that group
         int gIdx = FindGroupAtY(rpt.y);
         if (gIdx >= 0) {
@@ -3055,7 +3343,130 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    case WM_LBUTTONUP: {
+        if (g_lmbDragging) {
+            int idx = g_lmbDragIdx;
+            bool moved = g_lmbDragMoved;
+            g_lmbDragging = false;
+            g_lmbDragIdx  = -1;
+            ReleaseCapture();
+            if (moved) {
+                theHold.Accept(_T("Param Drag"));
+                HideDragTip();
+                GatherParams(); BuildLayout();
+                BuildFavorites(); PositionFavStrip();
+            } else {
+                // No drag — treat as click, spawn edit box
+                theHold.Cancel();
+                if (idx >= 0 && idx < (int)g_edits.size())
+                    SpawnEditAt(idx);
+            }
+        }
+        return 0;
+    }
+
     case WM_MOUSEMOVE: {
+        // Left-click param drag → scrub value
+        if (g_lmbDragging && g_lmbDragIdx >= 0 && g_lmbDragIdx < (int)g_edits.size()) {
+            POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            int dx = pt.x - g_lmbDragStartX;
+            // Deadzone: 3px before committing to drag (prevents accidental scrub on click)
+            if (!g_lmbDragMoved && (dx > -3 && dx < 3)) return 0;
+            if (!g_lmbDragMoved) g_lmbDragMoved = true;
+            g_lmbDragStartX = pt.x;
+            if (dx != 0) {
+                Interface* ip = GetCOREInterface();
+                TimeValue t = ip ? ip->GetTime() : 0;
+                bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                EditField& ef = g_edits[g_lmbDragIdx];
+                int selCount = ip ? ip->GetSelNodeCount() : 0;
+
+                if (ef.pb) {
+                    // PB2 — adjust on all selected nodes
+                    for (int ni = 0; ni < selCount; ni++) {
+                        INode* nd = ip->GetSelNode(ni);
+                        if (!nd) continue;
+                        IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
+                        if (!FindParam(nd, ef.key, pb, pid, pt2)) continue;
+                        if (IsFloat(pt2)) {
+                            float cur = pb->GetFloat(pid, t);
+                            float a = cur < 0 ? -cur : cur;
+                            float sc = a > 0.001f ? a * 0.01f : 0.001f;
+                            if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
+                            pb->SetValue(pid, t, cur + (float)dx * sc);
+                        } else if (pt2 == TYPE_BOOL) {
+                            pb->SetValue(pid, t, pb->GetInt(pid, t) ? 0 : 1);
+                        } else {
+                            g_lmbDragAccum += dx;
+                            int s = g_lmbDragAccum / 3;
+                            if (s != 0) {
+                                g_lmbDragAccum -= s * 3;
+                                if (shift) s *= 10;
+                                pb->SetValue(pid, t, pb->GetInt(pid, t) + s);
+                            }
+                        }
+                    }
+                } else if (!ef.msPath.empty()) {
+                    // PB1 fallback via MaxScript
+                    size_t sep = ef.key.find(L':');
+                    if (sep != std::wstring::npos) {
+                        std::wstring prop = ef.key.substr(sep + 1);
+                        // Read current value to compute proportional step
+                        std::wstring readS = L"try((getProperty " + ef.msPath + L" #" + prop + L") as float)catch(0.0)";
+                        FPValue rv; ExecuteMAXScriptScript(readS.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &rv);
+                        float cur = (rv.type == TYPE_FLOAT) ? rv.f : 0.0f;
+                        float a = cur < 0 ? -cur : cur;
+                        float sc = a > 0.001f ? a * 0.01f : 0.001f;
+                        if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
+                        float inc = (float)dx * sc;
+                        std::wstring objPath = ef.msPath;
+                        if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
+                        std::wstring s = L"for obj in selection do try(local o=obj" + objPath +
+                            L";local v=getProperty o #" + prop +
+                            L";setProperty o #" + prop + L" (v+" + std::to_wstring(inc) + L"))catch()";
+                        ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
+                    }
+                }
+
+                if (ip) {
+                    for (int ni = 0; ni < selCount; ni++) {
+                        INode* nd = ip->GetSelNode(ni);
+                        if (nd) nd->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
+                    }
+                    ip->RedrawViews(t);
+                }
+
+                // Refresh panel display
+                InvalidateRect(hwnd, nullptr, FALSE);
+
+                // Show drag tooltip with current value
+                POINT scr; GetCursorPos(&scr);
+                std::wstring tip = ef.label + L": ";
+                if (ef.pb) {
+                    IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
+                    if (selCount > 0 && FindParam(ip->GetSelNode(0), ef.key, pb, pid, pt2)) {
+                        if (IsFloat(pt2)) {
+                            wchar_t buf[64]; swprintf(buf, 64, L"%.3f", pb->GetFloat(pid, t));
+                            tip += buf;
+                        } else {
+                            tip += std::to_wstring(pb->GetInt(pid, t));
+                        }
+                    }
+                } else if (!ef.msPath.empty()) {
+                    size_t sep = ef.key.find(L':');
+                    if (sep != std::wstring::npos) {
+                        std::wstring prop = ef.key.substr(sep + 1);
+                        std::wstring readS = L"try((getProperty " + ef.msPath + L" #" + prop + L") as string)catch(\"\")";
+                        FPValue rv; ExecuteMAXScriptScript(readS.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &rv);
+                        if (rv.type == TYPE_STRING && rv.s) tip += rv.s;
+                    }
+                }
+                ShowDragTip(scr, tip);
+            }
+            return 0;
+        }
+
         // Middle-mouse panel drag
         if (g_mmDragging) {
             POINT cur; GetCursorPos(&cur);
@@ -3149,34 +3560,44 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             } else if (ef.pb && ip) {
                 theHold.Suspend();
-                if (IsFloat(ef.type)) {
-                    float cur = ef.pb->GetFloat(ef.id, t);
-                    float a = cur<0?-cur:cur;
-                    float sc = a>100.f?10.f:a>10.f?1.f:a>1.f?0.1f:0.01f;
-                    if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
-                    ef.pb->SetValue(ef.id, t, cur + step * sc);
-                } else if (ef.type == TYPE_BOOL) {
-                    ef.pb->SetValue(ef.id, t, ef.pb->GetInt(ef.id, t) ? 0 : 1);
-                } else {
-                    int cur = ef.pb->GetInt(ef.id, t);
-                    int s = (int)step;
-                    if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
-                    if (s == 0) s = step>0?1:-1;
-                    ef.pb->SetValue(ef.id, t, cur + s);
+                // Apply to all selected nodes
+                for (int ni = 0; ni < ip->GetSelNodeCount(); ni++) {
+                    INode* nd = ip->GetSelNode(ni);
+                    if (!nd) continue;
+                    IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
+                    if (!FindParam(nd, ef.key, pb, pid, pt2)) continue;
+                    if (IsFloat(pt2)) {
+                        float cur = pb->GetFloat(pid, t);
+                        float a = cur<0?-cur:cur;
+                        float sc = a>100.f?10.f:a>10.f?1.f:a>1.f?0.1f:0.01f;
+                        if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
+                        pb->SetValue(pid, t, cur + step * sc);
+                    } else if (pt2 == TYPE_BOOL) {
+                        pb->SetValue(pid, t, pb->GetInt(pid, t) ? 0 : 1);
+                    } else {
+                        int cur = pb->GetInt(pid, t);
+                        int s = (int)step;
+                        if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
+                        if (s == 0) s = step>0?1:-1;
+                        pb->SetValue(pid, t, cur + s);
+                    }
                 }
                 theHold.Resume();
                 if (g_epolyPreview) EPolyRefresh();
                 else                NotifyParamChanged();
             } else if (!ef.pb) {
-                // MaxScript-based params (legacy PB1 objects)
+                // MaxScript-based params (legacy PB1 objects) — apply to all selected
                 std::wstring prop = PropFromKey(ef);
+                std::wstring objPath = MsObjPath(ef);
+                if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
                 if (ef.type == (ParamType2)TYPE_BOOL) {
-                    std::wstring script = L"try(setProperty " + MsObjPath(ef) + L" #" + prop +
-                        L" (not (getProperty " + MsObjPath(ef) + L" #" + prop + L")))catch()";
+                    std::wstring script = L"for obj in selection do try(local o=obj" + objPath +
+                        L";setProperty o #" + prop + L" (not (getProperty o #" + prop + L")))catch()";
                     ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
                 } else if (IsFloat(ef.type)) {
-                    std::wstring script = L"try(local v=getProperty " + MsObjPath(ef) + L" #" + prop +
-                        L"; setProperty " + MsObjPath(ef) + L" #" + prop + L" (v+" +
+                    std::wstring script = L"for obj in selection do try(local o=obj" + objPath +
+                        L";local v=getProperty o #" + prop +
+                        L";setProperty o #" + prop + L" (v+" +
                         std::to_wstring(step) + L"*" +
                         L"(if (abs v)>100 then 10 else if (abs v)>10 then 1 else if (abs v)>1 then 0.1 else 0.01)" +
                         (shift ? L"*10" : L"") + (ctrl ? L"*0.1" : L"") +
@@ -3186,8 +3607,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     int s = (int)step;
                     if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
                     if (s == 0) s = step>0?1:-1;
-                    std::wstring script = L"try(local v=getProperty " + MsObjPath(ef) + L" #" + prop +
-                        L"; setProperty " + MsObjPath(ef) + L" #" + prop + L" (v+" +
+                    std::wstring script = L"for obj in selection do try(local o=obj" + objPath +
+                        L";local v=getProperty o #" + prop +
+                        L";setProperty o #" + prop + L" (v+" +
                         std::to_wstring(s) + L"))catch()";
                     ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
                 }
@@ -3294,8 +3716,8 @@ static void OpenPanel() {
     PositionFavStrip();
 
     // Fade in panel with companions (button strips, fav strip)
-    HWND fadeComps[] = { g_btnLeft, g_favWnd };
-    FadeIn(g_panel, fadeComps, 2);
+    HWND fadeComps[] = { g_btnLeft, g_favWnd, g_btnRight };
+    FadeIn(g_panel, fadeComps, 3);
     SetTimer(g_panel, 1, kRefreshMs, nullptr);
     if (g_favWnd && !g_favEdits.empty())
         SetTimer(g_favWnd, 1, kRefreshMs, nullptr);
@@ -3346,6 +3768,7 @@ static void ClosePanel() {
 
     KillTimer(g_panel, 1);
     KillActiveEdit(false);
+    if (g_lmbDragging) { g_lmbDragging = false; g_lmbDragIdx = -1; ReleaseCapture(); theHold.Cancel(); HideDragTip(); }
     g_hoverParam = -1;
     g_edits.clear();
     g_groups.clear();
@@ -3420,8 +3843,8 @@ public:
         g_brEdit    = CreateSolidBrush(kEditBg);
         g_brEditFoc = CreateSolidBrush(kEditFocus);
 
-        g_panel = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_LAYERED,
-            kWndClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
+        g_panel = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_LAYERED|WS_EX_COMPOSITED,
+            kWndClass, nullptr, WS_POPUP|WS_CLIPCHILDREN, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
         SetLayeredWindowAttributes(g_panel, 0, 255, LWA_ALPHA);
 
         // Button strip windows (separate floating windows for side buttons)

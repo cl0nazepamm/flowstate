@@ -208,6 +208,7 @@ constexpr int kShllId    = 1008;
 constexpr int kSceneId   = 1004;
 constexpr int kTabMatId  = 1006;
 constexpr int kTabMapId  = 1007;
+constexpr int kApplyId   = 1009;
 constexpr int kWindowWidth  = 380;
 constexpr int kWindowHeight = 540;
 constexpr int kHeaderH      = 34;
@@ -806,6 +807,10 @@ class Palette
 public:
     static Palette& Get() { static Palette p; return p; }
 
+    // Exposed for unified config persistence
+    std::vector<std::wstring> filePins_;     // file-local pins
+    std::vector<BrickFav> brickFavs_;        // persistent brick favorites
+
     bool Init(bool light)
     {
         if (hotkeyWnd_) return true;
@@ -1064,7 +1069,7 @@ private:
                 { self->DrawListItem(dis); return TRUE; }
             if (dis->CtlID == kTabMatId || dis->CtlID == kTabMapId ||
                 dis->CtlID == kLinkId || dis->CtlID == kShllId ||
-                dis->CtlID == kSceneId ||
+                dis->CtlID == kSceneId || dis->CtlID == kApplyId ||
                 (dis->CtlID >= kBrickBase && dis->CtlID < kBrickBase + kBrickMax))
                 { self->DrawButton(dis); return TRUE; }
             break;
@@ -1224,21 +1229,25 @@ private:
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTabMapId)), hInstance, nullptr);
         y += 26;
 
-        // Command row: LINK | SHLL | Scene
+        // Command row: LINK | SHLL | Scene | Apply
         const int gap = 3;
-        int btnW3 = (cw - 2 * gap) / 3;
+        int btnW4 = (cw - 3 * gap) / 4;
         link_ = CreateWindowExW(0, L"BUTTON", L"LINK",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            pad, y, btnW3, 22, h,
+            pad, y, btnW4, 22, h,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLinkId)), hInstance, nullptr);
         shll_ = CreateWindowExW(0, L"BUTTON", L"SHLL",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            pad + btnW3 + gap, y, btnW3, 22, h,
+            pad + btnW4 + gap, y, btnW4, 22, h,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kShllId)), hInstance, nullptr);
         scene_ = CreateWindowExW(0, L"BUTTON", L"Scene",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            pad + 2 * (btnW3 + gap), y, cw - 2 * (btnW3 + gap), 22, h,
+            pad + 2 * (btnW4 + gap), y, btnW4, 22, h,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSceneId)), hInstance, nullptr);
+        apply_ = CreateWindowExW(0, L"BUTTON", L"Apply",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            pad + 3 * (btnW4 + gap), y, cw - 3 * (btnW4 + gap), 22, h,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kApplyId)), hInstance, nullptr);
         y += 26;
 
         // Results list (owner-drawn)
@@ -1341,6 +1350,7 @@ private:
         if (id == kTabMatId)      active = (tab_ == TabMode::Materials);
         else if (id == kTabMapId) active = (tab_ == TabMode::Maps);
         else if (id == kSceneId)  active = sceneOnly_;
+        else if (id == kApplyId)  active = applyToSel_;
         else                      active = (dis->itemState & ODS_SELECTED) != 0;
 
         COLORREF bgc = active ? Theme::accent : Theme::panelLt;
@@ -1513,6 +1523,12 @@ private:
         }
         if (id == kShllId) {
             ExecuteShellCommand(shllRes_);
+            return;
+        }
+        if (id == kApplyId)
+        {
+            applyToSel_ = !applyToSel_;
+            InvalidateRect(apply_, nullptr, FALSE);
             return;
         }
         if (id == kSceneId)
@@ -1862,11 +1878,17 @@ private:
             bool smeOpen = smeOk && smeResult.type == TYPE_BOOL && smeResult.b;
 
             if (smeOpen) {
-                // SME is open — drop into it (don't open it, it's already open)
+                // SME is open — drop into it
                 ip->PutMtlToMtlEditor(mb, slot);
                 ExecuteMAXScriptScript(kSmeAtSpawnScript, MAXScript::ScriptSource::Dynamic);
-            } else if (isMat && ip->GetSelNodeCount() > 0) {
-                // Has selection + it's a material — assign to selected objects
+                // Also assign to selection if Apply is on
+                if (applyToSel_ && isMat && ip->GetSelNodeCount() > 0) {
+                    Mtl* mtl = static_cast<Mtl*>(mb);
+                    for (int i = 0; i < ip->GetSelNodeCount(); ++i)
+                        if (INode* n = ip->GetSelNode(i)) n->SetMtl(mtl);
+                }
+            } else if (isMat && applyToSel_ && ip->GetSelNodeCount() > 0) {
+                // Apply on + has selection — assign to selected objects
                 Mtl* mtl = static_cast<Mtl*>(mb);
                 for (int i = 0; i < ip->GetSelNodeCount(); ++i)
                     if (INode* n = ip->GetSelNode(i)) n->SetMtl(mtl);
@@ -1932,43 +1954,15 @@ private:
         SetStatus(it != filePins_.end() ? L"Unpinned." : L"Pinned to file.");
     }
 
-    std::wstring GetPinCfgPath()
-    {
-        std::wstring s;
-        FPValue result;
-        BOOL ok = ExecuteMAXScriptScript(
-            L"(getDir #plugcfg)+\"\\\\PowerShader_Pins.cfg\"",
-            MAXScript::ScriptSource::Dynamic, TRUE, &result);
-        if (ok && result.type == TYPE_STRING && result.s)
-            s = result.s;
-        return s;
-    }
-
     void SaveFilePins()
     {
-        std::wstring path = GetPinCfgPath();
-        if (path.empty()) return;
-        FILE* f = _wfopen(path.c_str(), L"w");
-        if (!f) return;
-        for (auto& pin : filePins_)
-            fwprintf(f, L"%s\n", pin.c_str());
-        fclose(f);
+        FlowState_SaveSettings(); // unified save
     }
 
     void LoadFilePins()
     {
-        filePins_.clear();
-        std::wstring path = GetPinCfgPath();
-        if (path.empty()) return;
-        FILE* f = _wfopen(path.c_str(), L"r");
-        if (!f) return;
-        wchar_t line[256];
-        while (fgetws(line, 256, f)) {
-            std::wstring l(line);
-            while (!l.empty() && (l.back() == L'\n' || l.back() == L'\r')) l.pop_back();
-            if (!l.empty()) filePins_.push_back(l);
-        }
-        fclose(f);
+        // Data is already loaded by LoadSettings() at startup.
+        // No-op — kept so call sites don't need to change.
     }
 
     // ─── Persistent brick favorites (saved in PowerShader.cfg) ──
@@ -2008,45 +2002,15 @@ private:
         SetStatus(L"Removed from favorites.");
     }
 
-    std::wstring GetBrickCfgPath()
-    {
-        std::wstring s;
-        FPValue result;
-        BOOL ok = ExecuteMAXScriptScript(
-            L"(getDir #plugcfg)+\"\\\\PowerShader.cfg\"",
-            MAXScript::ScriptSource::Dynamic, TRUE, &result);
-        if (ok && result.type == TYPE_STRING && result.s)
-            s = result.s;
-        return s;
-    }
-
     void SaveBrickFavs()
     {
-        std::wstring path = GetBrickCfgPath();
-        if (path.empty()) return;
-        FILE* f = _wfopen(path.c_str(), L"w");
-        if (!f) return;
-        for (auto& bf : brickFavs_)
-            fwprintf(f, L"%s|%s\n", bf.alias.c_str(), bf.label.c_str());
-        fclose(f);
+        FlowState_SaveSettings(); // unified save
     }
 
     void LoadBrickFavs()
     {
-        brickFavs_.clear();
-        std::wstring path = GetBrickCfgPath();
-        if (path.empty()) return;
-        FILE* f = _wfopen(path.c_str(), L"r");
-        if (!f) return;
-        wchar_t line[256];
-        while (fgetws(line, 256, f)) {
-            std::wstring l(line);
-            while (!l.empty() && (l.back() == L'\n' || l.back() == L'\r')) l.pop_back();
-            size_t sep = l.find(L'|');
-            if (sep == std::wstring::npos) continue;
-            brickFavs_.push_back({l.substr(0, sep), l.substr(sep + 1)});
-        }
-        fclose(f);
+        // Data is already loaded by LoadSettings() at startup.
+        // No-op — kept so call sites don't need to change.
     }
 
     void RebuildBrickUI()
@@ -2139,6 +2103,7 @@ private:
     HWND link_      = nullptr;
     HWND shll_      = nullptr;
     HWND scene_     = nullptr;
+    HWND apply_     = nullptr;
     HWND status_    = nullptr;
     TabMode tab_    = TabMode::All;
     std::vector<Item> classItems_;
@@ -2159,10 +2124,9 @@ private:
     bool  hoverClose_ = false;
     bool  trackingMouse_ = false;
     bool  sceneOnly_  = false;
+    bool  applyToSel_ = false;  // Apply material to selection (off by default — just creates in SME)
     int   listBaseY_  = 0;
     // Dual favorites
-    std::vector<std::wstring> filePins_;     // file-local (per max file)
-    std::vector<BrickFav> brickFavs_;        // persistent (config file)
     std::vector<HWND> brickBtns_;            // brick button HWNDs
     HWND  renameEdit_ = nullptr;
     int   renameIdx_  = -1;
@@ -2170,6 +2134,37 @@ private:
     bool  brickDragging_ = false;
     int   shllRes_       = 256; // SHLL preview resolution
 };
+
+// ── Internal helpers for unified config (accessible from Exported API below) ──
+static void WritePinsSectionImpl(FILE* f) {
+    fwprintf(f, L"[pins]\n");
+    auto& p = Palette::Get();
+    for (auto& pin : p.filePins_)
+        fwprintf(f, L"%s\n", pin.c_str());
+}
+
+static void WriteBricksSectionImpl(FILE* f) {
+    fwprintf(f, L"[bricks]\n");
+    auto& p = Palette::Get();
+    for (auto& bf : p.brickFavs_)
+        fwprintf(f, L"%s|%s\n", bf.alias.c_str(), bf.label.c_str());
+}
+
+static void ReadPinsLineImpl(const std::wstring& line) {
+    if (!line.empty())
+        Palette::Get().filePins_.push_back(line);
+}
+
+static void ReadBricksLineImpl(const std::wstring& line) {
+    size_t sep = line.find(L'|');
+    if (sep != std::wstring::npos)
+        Palette::Get().brickFavs_.push_back({line.substr(0, sep), line.substr(sep + 1)});
+}
+
+static void ClearPersistentImpl() {
+    Palette::Get().filePins_.clear();
+    Palette::Get().brickFavs_.clear();
+}
 
 } // anonymous namespace
 
@@ -2179,5 +2174,11 @@ void Shutdown()      { Palette::Get().Shutdown(); }
 void Toggle()        { Palette::Get().Toggle(); }
 bool IsOpen()        { return false; } // TODO: add accessor to Palette
 void ReloadTheme(bool lightTheme) { Theme::Update(lightTheme); }
+
+void WritePinsSection(FILE* f)                  { WritePinsSectionImpl(f); }
+void WriteBricksSection(FILE* f)                { WriteBricksSectionImpl(f); }
+void ReadPinsLine(const std::wstring& line)     { ReadPinsLineImpl(line); }
+void ReadBricksLine(const std::wstring& line)   { ReadBricksLineImpl(line); }
+void ClearPersistent()                          { ClearPersistentImpl(); }
 
 } // namespace PowerShader

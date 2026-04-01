@@ -379,6 +379,36 @@ private:
         return DefSubclassProc(h, m, w, l);
     }
 
+    static LRESULT CALLBACK ListProc(HWND h, UINT m, WPARAM w, LPARAM l,
+                                     UINT_PTR, DWORD_PTR ref)
+    {
+        auto* self = reinterpret_cast<Palette*>(ref);
+        if (m == WM_MBUTTONDOWN)
+        {
+            LRESULT hit = SendMessageW(h, LB_ITEMFROMPOINT, 0, l);
+            if (!HIWORD(hit)) {
+                int sel = LOWORD(hit);
+                if (sel >= 0 && sel < static_cast<int>(self->filtered_.size())) {
+                    int si = self->filtered_[sel];
+                    if (si >= 0 && si < static_cast<int>(self->cache_.size())) {
+                        const ModItem& item = self->cache_[si];
+                        if (item.kind == ModKind::Macro) {
+                            self->SetStatus(L"Cannot quick-access macros yet");
+                        } else {
+                            extern void TogglePowerParamsQuickModifier(const wchar_t*, const wchar_t*);
+                            std::wstring internalName = item.internalName.empty() ? item.label : item.internalName;
+                            TogglePowerParamsQuickModifier(internalName.c_str(), item.label.c_str());
+                            self->SetStatus(L"Quick Access toggled: " + item.label);
+                            InvalidateRect(h, nullptr, FALSE);
+                        }
+                    }
+                }
+            }
+            return 0;
+        }
+        return DefSubclassProc(h, m, w, l);
+    }
+
     // ─── Window management ──────────────────────────────────────
     bool EnsureWindow()
     {
@@ -420,6 +450,7 @@ private:
             pad, y, cw, listH, h,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kListId)),
             hInstance, nullptr);
+        SetWindowSubclass(list_, ListProc, 1, reinterpret_cast<DWORD_PTR>(this));
 
         status_ = CreateWindowExW(0, L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
@@ -468,12 +499,22 @@ private:
             GetTextExtentPoint32W(dis->hDC, item.category.c_str(),
                 static_cast<int>(item.category.size()), &catSz);
 
+        extern bool IsPowerParamsQuickModifier(const wchar_t*);
+        std::wstring iname = item.internalName.empty() ? item.label : item.internalName;
+        bool isQuickAccess = (item.kind != ModKind::Macro) && IsPowerParamsQuickModifier(iname.c_str());
+
+        std::wstring drawLabel = item.label;
+        if (isQuickAccess) {
+            drawLabel += L"  \u2605";
+            if (!sel) tc = RGB(220, 180, 50); // Gold color for star items
+        }
+
         // Left: name
         RECT lr = dis->rcItem;
         lr.left += 8;
         lr.right -= catSz.cx + 12;
         SetTextColor(dis->hDC, tc);
-        DrawTextW(dis->hDC, item.label.c_str(), -1, &lr,
+        DrawTextW(dis->hDC, drawLabel.c_str(), -1, &lr,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         SelectObject(dis->hDC, oldF);
