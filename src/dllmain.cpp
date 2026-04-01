@@ -180,6 +180,7 @@ static int      g_hoverParam = -1;    // param index under cursor
 static int      g_editParam  = -1;    // param being edited (-1 = none)
 static HWND     g_editHwnd   = nullptr; // single active edit control
 static HHOOK    g_mouseHook  = nullptr;
+static HHOOK    g_kbHook     = nullptr;
 
 // Modifier search (embedded in header)
 static bool     g_modSearch      = false;  // search mode active
@@ -380,6 +381,7 @@ static const BtnDef kSplineOps[] = {
 };
 static int g_hoverBtn  = -1;  // hovered button ID for strip windows
 static bool g_showSubObj = false; // sub-object toggles (off by default, configurable)
+static bool g_tabShader  = false; // Tab key opens PowerShader when SME focused
 static bool g_lightTheme = false; // light theme (brushed aluminium)
 static bool  g_mmDragging = false;  // middle-mouse panel drag
 static POINT g_mmStart = {};
@@ -425,6 +427,7 @@ static void LoadModuleFlags() {
         if (wcsstr(line, L"PowerParams=0")) g_enablePowerParams = false;
         if (wcsstr(line, L"PowerShader=0")) g_enablePowerShader = false;
         if (wcsstr(line, L"SubObjToggles=1")) g_showSubObj = true;
+        if (wcsstr(line, L"TabShader=1"))    g_tabShader = true;
         if (wcsstr(line, L"LightTheme=1")) g_lightTheme = true;
         // Per-class XB1 assignments: XB1:ClassName=vKey|hKey
         if (wcsncmp(line, L"XB1:", 4) == 0) {
@@ -1157,8 +1160,18 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
 
         if (xbutton == XBUTTON2 && wp == WM_XBUTTONDOWN) {
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             bool matEd = IsMaterialEditorFocused();
-            if ((shift || matEd) && g_enablePowerShader) {
+            if (ctrl) {
+                // Clear XB1 slider assignments for current selection
+                SyncXB1ToSelection();
+                if (g_xb1V.Active() || g_xb1H.Active()) {
+                    g_xb1V.Clear(); g_xb1H.Clear();
+                    SaveXB1Assignment();
+                    ShowOSD(L"Sliders cleared");
+                }
+                return 1;
+            } else if ((shift || matEd) && g_enablePowerShader) {
                 PostMessage(g_panel, WM_PP_SHADER, 0, 0);
             } else if (g_enablePowerParams) {
                 PostMessage(g_panel, WM_PP_TOGGLE, 0, 0);
@@ -1168,6 +1181,18 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     }
 
     return CallNextHookEx(g_mouseHook, nCode, wp, lp);
+}
+
+// ── Keyboard hook — Tab opens PowerShader when SME focused ──────
+static LRESULT CALLBACK KbHookProc(int nCode, WPARAM wp, LPARAM lp) {
+    if (nCode >= 0 && g_tabShader && wp == VK_TAB && !(lp & (1 << 31))) {
+        // Key-down only (bit 31 = 0), ignore repeats (bit 30)
+        if (!(lp & (1 << 30)) && IsMaterialEditorFocused()) {
+            PostMessage(g_panel, WM_PP_SHADER, 0, 0);
+            return 1; // eat the Tab
+        }
+    }
+    return CallNextHookEx(g_kbHook, nCode, wp, lp);
 }
 
 // ── Param helpers ───────────────────────────────────────────────
@@ -3439,6 +3464,7 @@ public:
         IActionManager* am = GetCOREInterface()->GetActionManager();
         if (am) am->ActivateActionTable(&g_actionCB, kTableId);
         g_mouseHook = SetWindowsHookEx(WH_MOUSE, MouseHookProc, nullptr, GetCurrentThreadId());
+        g_kbHook    = SetWindowsHookEx(WH_KEYBOARD, KbHookProc, nullptr, GetCurrentThreadId());
 
         PowerShader::Init(hInstance, g_lightTheme);
         ModStack::Init(hInstance, g_lightTheme);
@@ -3449,6 +3475,7 @@ public:
     void Stop() override {
         ModStack::Shutdown();
         PowerShader::Shutdown();
+        if (g_kbHook)    { UnhookWindowsHookEx(g_kbHook);    g_kbHook = nullptr; }
         if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
         ClosePanel();
         if (g_btnLeft)  { DestroyWindow(g_btnLeft);  g_btnLeft = nullptr; }

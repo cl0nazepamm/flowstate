@@ -1054,7 +1054,7 @@ private:
         case WM_MEASUREITEM:
         {
             auto* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(l);
-            mis->itemHeight = 24;
+            mis->itemHeight = 30;
             return TRUE;
         }
         case WM_DRAWITEM:
