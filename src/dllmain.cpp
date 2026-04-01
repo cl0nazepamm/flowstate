@@ -3915,6 +3915,9 @@ public:
         PowerShader::Init(hInstance, g_lightTheme);
         ModStack::Init(hInstance, g_lightTheme);
 
+        // Register macroscripts inline (no separate .mcr file needed)
+        #include "inline_mcr.inc"
+
         return GUPRESULT_KEEP;
     }
 

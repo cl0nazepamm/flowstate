@@ -1,0 +1,508 @@
+// ── Inline MCR registration ──────────────────────────────────
+        // Registers FlowState_Config macroscript so it appears in
+        // Customize UI without needing a separate .mcr file.
+        {
+            static const wchar_t* kMcrScript = LR"FLOWMCR(
+-- flowstate Configuration - .NET UI
+-- Category: CloneTools
+
+macroscript flowstate_Config
+    category:"CloneTools"
+    buttonText:"flowstate Config"
+    tooltip:"flowstate Configuration"
+(
+    -- Close existing instance
+    try(flowstate_ConfigForm.Close())catch()
+    try(flowstate_ConfigForm.Dispose())catch()
+
+    local iniPath = (getDir #plugcfg) + "\\FlowState.cfg"
+
+    -- Read flag from FlowState.cfg (scans all lines, section-agnostic)
+    fn readFlag path key default:true = (
+        local f = openFile path mode:"r"
+        if f == undefined do return default
+        local result = default
+        while not eof f do (
+            local ln = readLine f
+            if findString ln (key + "=0") != undefined do result = false
+            if findString ln (key + "=1") != undefined do result = true
+        )
+        close f
+        result
+    )
+
+    -- .NET shorthand
+    local clr     = dotNetClass "System.Drawing.Color"
+    local fntC    = dotNetClass "System.Drawing.Font"
+    local fntS    = dotNetClass "System.Drawing.FontStyle"
+    local szC     = dotNetClass "System.Drawing.Size"
+    local ptC     = dotNetClass "System.Drawing.Point"
+    local flatC   = dotNetClass "System.Windows.Forms.FlatStyle"
+    local smC     = dotNetClass "System.Windows.Forms.PictureBoxSizeMode"
+    local alC     = dotNetClass "System.Drawing.ContentAlignment"
+    local curC    = dotNetClass "System.Windows.Forms.Cursors"
+    local keysC   = dotNetClass "System.Windows.Forms.Keys"
+    local mbC     = dotNetClass "System.Windows.Forms.MouseButtons"
+
+    -- Palette
+    local cBg     = clr.FromArgb 30 30 30
+    local cSep    = clr.FromArgb 55 55 55
+    local cText   = clr.FromArgb 200 200 200
+    local cDim    = clr.FromArgb 120 120 120
+    local cHead   = clr.FromArgb 150 150 150
+    local cBtnBg  = clr.FromArgb 50 50 50
+    local cBtnBd  = clr.FromArgb 70 70 70
+    local cBtnHov = clr.FromArgb 65 65 65
+    local cNone   = clr.Transparent
+
+    -- Fonts
+    local fBold   = dotNetObject fntC "Segoe UI" 8.5 fntS.Bold
+    local fNorm   = dotNetObject fntC "Segoe UI" 8.5 fntS.Regular
+    local fSmall  = dotNetObject fntC "Segoe UI" 7.5 fntS.Regular
+
+    -- Layout
+    local W = 340
+    local pad = 16
+    local iW = W - pad * 2
+
+    ---------------------------------------------------------------------------
+    -- Helpers
+    ---------------------------------------------------------------------------
+    fn mkLabel txt x y w h fObj:undefined cObj:undefined = (
+        local l = dotNetObject "System.Windows.Forms.Label"
+        l.Text = txt; l.AutoSize = false
+        l.Location = dotNetObject ptC x y
+        l.Size     = dotNetObject szC w h
+        l.ForeColor = if cObj != undefined then cObj else (dotNetClass "System.Drawing.Color").FromArgb 200 200 200
+        l.BackColor = (dotNetClass "System.Drawing.Color").Transparent
+        if fObj != undefined do l.Font = fObj
+        l
+    )
+    fn mkCheck txt x y w chk:true = (
+        local c = dotNetObject "System.Windows.Forms.CheckBox"
+        c.Text = txt
+        c.Location  = dotNetObject ptC x y
+        c.Size      = dotNetObject szC w 22
+        c.ForeColor = (dotNetClass "System.Drawing.Color").FromArgb 200 200 200
+        c.BackColor = (dotNetClass "System.Drawing.Color").Transparent
+        c.Checked   = chk
+        c
+    )
+    fn mkBtn txt x y w h = (
+        local b = dotNetObject "System.Windows.Forms.Button"
+        b.Text = txt
+        b.Location = dotNetObject ptC x y
+        b.Size     = dotNetObject szC w h
+        b.FlatStyle = (dotNetClass "System.Windows.Forms.FlatStyle").Flat
+        b.FlatAppearance.BorderColor       = (dotNetClass "System.Drawing.Color").FromArgb 70 70 70
+        b.FlatAppearance.BorderSize        = 1
+        b.FlatAppearance.MouseOverBackColor = (dotNetClass "System.Drawing.Color").FromArgb 65 65 65
+        b.BackColor = (dotNetClass "System.Drawing.Color").FromArgb 50 50 50
+        b.ForeColor = (dotNetClass "System.Drawing.Color").FromArgb 200 200 200
+        b.Cursor    = (dotNetClass "System.Windows.Forms.Cursors").Hand
+        b
+    )
+    fn mkSep x y w = (
+        local p = dotNetObject "System.Windows.Forms.Panel"
+        p.Location = dotNetObject ptC x y
+        p.Size     = dotNetObject szC w 1
+        p.BackColor = (dotNetClass "System.Drawing.Color").FromArgb 55 55 55
+        p
+    )
+
+    ---------------------------------------------------------------------------
+    -- Form
+    ---------------------------------------------------------------------------
+    global flowstate_ConfigForm = dotNetObject "System.Windows.Forms.Form"
+    local frm = flowstate_ConfigForm
+    frm.Text = "flowstate"
+    frm.FormBorderStyle = (dotNetClass "System.Windows.Forms.FormBorderStyle").None
+    frm.StartPosition   = (dotNetClass "System.Windows.Forms.FormStartPosition").CenterScreen
+    frm.BackColor       = cBg
+    frm.ForeColor       = cText
+    frm.ShowInTaskbar   = true
+    frm.TopMost         = true
+    frm.Opacity         = 0.96
+    frm.Font            = fNorm
+    frm.KeyPreview      = true
+    frm.Size            = dotNetObject szC W 600
+
+    -- Drag globals
+    global flowstate_drag   = false
+    global flowstate_dragPt = undefined
+
+    ---------------------------------------------------------------------------
+    -- Build UI
+    ---------------------------------------------------------------------------
+    local Y = 0
+
+    -- ── Logo area ──
+    local logoP = dotNetObject "System.Windows.Forms.Panel"
+    logoP.Location = dotNetObject ptC 0 0
+    logoP.Size     = dotNetObject szC W 200
+    logoP.BackColor = cBg
+
+    -- Inline base64 logo (no external file needed)
+    local logoB64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0d"
+    logoB64 += "Hx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4e"
+    logoB64 += "Hh4eHh4eHh7/wAARCAELAZADASIAAhEBAxEB/8QAHAABAAIDAQEBAAAAAAAAAAAAAAUGAwQHAgEI/8QAQBAAAQQBAgMGAwYEAwcF"
+    logoB64 += "AAAAAQACAwQFBhESITEHEyJBUWEycYEUI0JSYpEVcoKhJDOxFlNjg5LB0QhDRHPh/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAH/xAAV"
+    logoB64 += "EQEBAAAAAAAAAAAAAAAAAAAAAf/aAAwDAQACEQMRAD8A/MSIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiA"
+    logoB64 += "iIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiA"
+    logoB64 += "iIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiA"
+    logoB64 += "iIgIiICIiAiIgIiICIiAiIgIiICIiAiLYx9R9uZzWkNYxpfLIejGDqT/AKe5ICDXRe5ix0jjG3hZ+Eey8ICIiAiIgIiICIiAiIgI"
+    logoB64 += "iICIiAiIgIiICIiAiIgIt27TNGJsdkbWngOMfnE08xxfqPXbyC0kBERAREQEREBERAREQEREBERAREQEREBERARF9Y1z3hjGlznH"
+    logoB64 += "YADckoM+OpWsjfgoUYH2LViQRxRMG7nuJ2ACldRPr4yN2nqErJ+5k3vWmHds8w5cLT/u2cwPzHc+m1sy9I9mOl460h4db5ytxPH4"
+    logoB64 += "sRSeP7TSjl6tbv5lc2AAGw6BAREQEREBERAREQEREBERAREQEREBERAREQERe4IpZ52QQRvllkcGsYxu7nE9AAOpQeFbxi4dJ4mL"
+    logoB64 += "JZdjH520wPx+PeN/s7D0sTD1/Iw9ep5bA2mTT+O7J8VDlNSw18hrazGJKGGk2dFjmnpPYH4n+bY/qVy7I3bmRvz38hZltW7Dy+aa"
+    logoB64 += "Q7ue4+ZQYpZJJZXyyvdJI9xc5zjuXE9SSvKIgIiICIiAiIgIiICIiAiIgIiICIiAi26eNv3InzVqkskUY3fLw7Mb83HkP3WJ8cMb"
+    logoB64 += "i11hkrh1EPiH/V0/bdBhRfdxsfD/AHV+7NOyPV2uXMs06zMfii7x5C4e7iA8+EdXn5fugolWCa1Yjr1onzTSODWMYN3OPoAuh6cr"
+    logoB64 += "Vezuu/VWerxT5GvJ3ePpP2Iksgb7EflZuC4/JvU8uhMsdn2hftendCSMymZr13S53VM7WyR46BvJ/dAbt7w/C1o/EQCSeQ4FqTNz"
+    logoB64 += "akzjr74nQU4W91RrufxGGLcnmfxPcSXOd5uJQY8pkcjmcrbzGXtSWshdlM1iV53LnH/t7eS10RAREQEREBERAREQEREBERAREQER"
+    logoB64 += "EBERARfQCTsBuT5K46E7P8tqW65gidFDC3vJ3uIY2Fn5pHu8MTfd3P0BQV/TmDyuoctDi8PSlt2pnBrWMbv19fQLuV+PTP8A6f8A"
+    logoB64 += "HCGE1M/2mWIt+NwD4MQHD4tvN/pvzPsOsNku0XTnZtiptP8AZo6PI56RpZazoj2ir7jYiuHc3H/iO5+gAXF7E9i1ZltXJ5LFmZ5f"
+    logoB64 += "LLI4uc9x5kknqiM2Uv3cpkrGSyVqW3csyGSeeV3E+Rx6klayIiiIiAiIgIiICIiAiIgIiICIiAi+taXODWgkk7AAcyus9lWmNF4q"
+    logoB64 += "tNqjtCm+1QUwHtxsZ2YOfIzPHqeQjbuSfqgo+nNF6hztcW6WPlFQkgWHjhYduuxPXbzPQeZClL1jRmloW1cfXGqc8G/fWJ3bUKzv"
+    logoB64 += "ysaOcpHqTw+x6re7Uu1PM6+vPxmKrnE4JoEUFKuBHxRt6ce3ID9O+w8yTzWLs40zgclnIcabda/cLHPdI+Xu6NchpPiPxzHl0bs3"
+    logoB64 += "3IQV0Qan1jYMkzprrIhybyjrwgeQaNmtACh52QRvMcMwn4eReweAn9J8x7q/dsGq7MMFfs+xpirsrxh2YkgaG95I48QgGwAaxg23"
+    logoB64 += "aAAXb777Bc8AAAAGwHIIRsQ2GwR7xQsM/wDvJBxhvyb0/fdZMrYyWWwN21PlrrrNDuiYjO4xvie4t3a0nwkO4Rt08S1Gtc5wa0Ek"
+    logoB64 += "8gB5qf0PXhguZbUOTY2TE4mBrnxnm2zM14MUPuHSAb/pa70QYc4TpvSFPRVfwX7pjyGcI6hxG8FY/wArTxuH5n7H4VCMaGt2CxNl"
+    logoB64 += "tXr1rJ35XTW7MrpZZHdXPcSXH9ysyAiL2yKV43ZG9w9mkoPCLZNG21vE+B0beu7/AA/6rx3Hh3M8A9uPf/RBhREHM7BAREQERZK8"
+    logoB64 += "E1iQRwRvkeTsA0boMa2XUrDKDb0jO7hkcWxF3LvCOvD6geZXQMbpDA6UxEeoteTG0ZATSxFWTnYeNuT5B0Hrw7+5HQ0fUOYt5vJP"
+    logoB64 += "vWxHHyDIoIm8MUEY+GNjfJo//eqCORNl9DXHbYE7+yD4i38fib12ZkUMEhe87NaGEucfZo5ldN0f2c5XFSPyd/GWBYrRPmZBJHtI"
+    logoB64 += "4taT+LwReWxceLnyCCi2MM7T+Khv5lgZfux8dGk8eNrOnfyD8I/KDzJ59Bzrqs2cpW7uWs5TU+ocTVtWHcUjXWxO9o8mhsfEdgOW"
+    logoB64 += "xWrFPoym4nfLZt7ejY4hXiJ/mcSdvoghoYpZpBHDG+R56Na3cn6KxYzRmVsxOnsNbVgZze57h4fmSeFv9RC3MRldU5h5qaR0vRoR"
+    logoB64 += "AbF8NczvA9Xvf4R+wW7ldDZT7A3M691M6vQBP3luYuaSOrYoxzkd7NGw8yERqUnaVxU7YYDa1BfJ4WVcZudz6OnI2A9o2n+YLBqr"
+    logoB64 += "XGXyNAYMOqVKcLt247H8qdd3q87kzy/qcXAe/lC5HPQPhkx2lacmLxj2d3NZeR9qtt8w4j4GH8jeXqXKLijZEwMYNgEHyKMRg7bk"
+    logoB64 += "k7knqV7REUREQEREBERAREQEREBERAREQEA3Ow5orPoS7FiMpXvw4h2Zy4kH2Oq6Ivja7ycWjm879B0+aCYwHZln20mZzUDTgMUG"
+    logoB64 += "GUTWgWvdGBu54b1DQNufmSAOZCqmp89HmZ21MZFJWwtVx+ywvPieehmk9ZD+zRyHTn0XtyzGrNQzU9J3b7J8nMxlnMS96BFG8846"
+    logoB64 += "rAOojB3cGg7vJ/KFRotC5mnG5lr7PWaz/wByeTuuIeoa/ZxH0VRXmNLeIBx4XADh8tletBMr4Oe3qa6wmvhaZne09Jp38ooffd22"
+    logoB64 += "/wClr1HYzE4GtL3uTzlcFh/yo43zOPyawbfu4Kb11mtNY3G1tPjEZbINdwXrTZbDKokmkbvFxBoe7lGR4eLlxHzJUHNa89i9Ys5G"
+    logoB64 += "498lqzK6SWR3V7nHcn6krfqUrNoOdFEe7b8cjjwsZ83HkFMO1bbjhbDicPh8RE1uze7hdO8D+aVzh/ZRdm7k8pNGy1asXJC7aNrj"
+    logoB64 += "uNz5NaOQ+gRXqCEzTx4/G/e2J3iMzkbBo8y0ddgNySf7ecz2lPhxNahofHEiOoW2bxPV07m+FrvdjSdx5Oe8Ka0hTraZr5PUeXi3"
+    logoB64 += "/hkQbHG4f5k7j4WfUgD+VryqG7vruSmsWZeOxI8vsTPO/FI47vcT8zt9ERjhjLi2OJpcegAG5U1jcDaP+Iu0bQqs5vdxNhaB7vfy"
+    logoB64 += "H910jS+rtG6A0ZLeraZF+1L4RkL4Aksy7b8ELNjwRjlu7meY8yAuTZ7UuodUZY5bJWg1vGXwwMG0UX8reg+Z5orreC1Vo3SembOQ"
+    logoB64 += "ZoDC2p43NjimsuksSyPIJ6yDgAAG5LW+Y267jnGW1Hm9RWHWRFBBE9+7GVW+FvoNzvsdvIbKxYP+EZ7QOcgzONmq2cbjjcqZOGd5"
+    logoB64 += "DphK1nDI1xIdxl+3LmobsMtY6nrexey1WO5hY6Fs3qrh4ZmCJzmj2PGGbHyKqK1Kx4PHJuS78RO5Ox26rYxGPuZXIwY+hA+ezO7h"
+    logoB64 += "Yxo6+/yHUlfchcly+UmumCGA2HlzIYW8EcTfJrR5ABdQ03ksRoXs/wA+YI+PUd7Fhv2lw8deKZwYA0fh4gSR5kDfptvFcnlZwSuY"
+    logoB64 += "DxcLiAR5qdr41mM0/LmMg3aec9zj4j+J345PkwHb+Zw9Ct/s0safbayGZzmMbPjKTd5DI52zCegbsRxPJ5Bv1PIFTfZzXwnaJ2gO"
+    logoB64 += "y+s8lFh9PQMkcyFrtmw14+bYgfIc+Z6k7nqUFP05prI5smSHua1RrtpLVl/BG3/u4+zQSrJldLaTwbBBks9YluEDdjYuAt/5Y3eP"
+    logoB64 += "6+BWHtvzMGC1bNp7QtGSlQpRRxxWS3iml7yPjErN/hZsdgW8+p33K5HJXfBYc21HKyUu3k7wEPJ8yd+e/wA0R0luJ7Lcdj62Ss5H"
+    logoB64 += "UmXjlcW9zRqxRFrxzLXue9xZy8y3n5KxdneV7LbU1yz/ALG5HH46nC6aXK3bpt8AaQNuEtbGHEkAeF/MjkuK3RDcdwui7qBg3DGE"
+    logoB64 += "9B5n1J9fddD7bNUwnT+ndMUa0WPpCnDafWg+GOLh3jafVzncUhJ6gs9EFc1RlMTk87PkZ7ORy73OIia1grxRs3OzWlxe4j6AlZsZ"
+    logoB64 += "i8nMBPDiKVCAeIyTxGUgepDyRt7kALBp7NUtO41ttmPq5DNznijE+7mVGeRcPzH06+qjr8+f1HK+xcfdyDeLiLI4z3LD7NaOEIro"
+    logoB64 += "Wksdp3LZqpVzmuqVWWeVsbXSVHyxh2+wHCwNjH1cQrn2t4TC6FtNhfi7+etMdwCxkbDalZx9I4o9pHj12IAXOuzzQrJ7cM2fuQ4u"
+    logoB64 += "B5PBA8/fOaBxOeGDnsACdzs0bbk8tjC9o2rP9rNUZvLCzbniszGCh3x5xVATyA8idgPlxb9VUW3Sestb6jr5ZukstiNNsx1fv5mY"
+    logoB64 += "um2CR7N9iBLzkcfm5QPa1qHN2H4rSF/OX8i/FwmfIyzWHvc+1Lz4CSekbdm7eTuNafZ5HBpajktXXgPs+OiayvA7pZtP3MTCPNoI"
+    logoB64 += "Lz+lm3movQdClmtRsdqfKy1K88hsX7QZ3krtzuQ0ebj78h1QiKqUzNKWwxcTurjtvt7kq2VsdgsNXbPm3uE5AdHFIOJzx+mIcyPd"
+    logoB64 += "5A+atnapq7B4KOvhND4WHF8UYLA8B8zWEbiWZx6yuGx2/C0jzPh5pRx9/LT2Lr5C/h8Vq7Zk2Yz3c4/2A3J8gVB1LQWqMtnbxwWj"
+    logoB64 += "sFCbz2H7NJkpdoYgAS5xjaOAbAE+LcclzbWUWQu5N9/U+edm8juWsDZOKJjQfwnpw+gaNlkmzTMfjp8Rp2zOK1pvDduOHA+0PNjQ"
+    logoB64 += "ObIuXTfd3n6KKqV7V+5FVqwSWLErgyOKNpc5x8gAEVgAAGw6IpXN4+HEONCSaOfINP8AiO7cHRwn8gI5OcPMjkOg35qKQEREBERA"
+    logoB64 += "REQEREBERAREQEREBS2Gwc15gs2bVbG0d+dm0/hafUMb8Tz7NB99lFMdwuDgAdvUbhe7E81iTvJ5HSOA2Bcd9h6D0HsgvdPWejtG"
+    logoB64 += "wAad0rDnsh0flMx42tP/AA4G+FvzcSVLaK7VtT2sjfyd51ShiasXf231azWvkHRkLHHc8T3EADfkOI+RXKRRvXclFSqxF73s2dv0"
+    logoB64 += "G+3X+37rdylhrasOEpSB1Os4ySyN/wDkTHkX/IDk323PVxVG/k9b6kyU0xr2Y8NBK4l8WMjEBdufNzdnEfMlQDIyJHSOe573Hcue"
+    logoB64 += "eJxPzKyABo2AVh7OsBFqPVtPH3JxWocYfcnJ2EcIPi+p6D3IUG72fRWP4sG5V8x0/FCb1+I/C6OI8QA9C7bhH8yqmYydjPamv5i3"
+    logoB64 += "w95NM6RwaNmh7juQB6NGzR7BdZ7YM1pvEXRhMNJH9hyVhglmA5MqxnhAG3VpeCffuwfNcyq4KWJje/sQ143ku7yU8PFueoHUj5BV"
+    logoB64 += "Gguq9k/Zxqe1jXayhp1IoIH8Nd12URgHbnLsfwt9fr5KmUMxicFcbPjMYzJWo9uGe94ow71bG3b6bkre1P2h6mOGORtXT/Eb/wB3"
+    logoB64 += "X4GBohY3bjkaB0J5NB6jxeY3UH3teyNmzbgxlY7YikTMbkp4Bdsu+KfY8y0bcLBtvwjfbdxVq7AJdI1KUrJalfManyThBjWWY+KK"
+    logoB64 += "Dc/5haeXIbuJPkFxiWnNkrsEglsTsma3v5Xgvc1++7t9/wB11+vV7PdHY61cwOYzGT1XJQ4qRmqthgic7YeHYkkjnsN/Lny33oqP"
+    logoB64 += "a3VLta2obttll1ZxijgjPhrsBJAdty4zvxOaOhPP0UTp/EWsveFOow7NaXyv28MUY6uPsP8AwFIae0dnMpRN6SKSCDiJmnstLOe+"
+    logoB64 += "5cS7l59SQpKXUdbT+ItYXTMhc+1s23cB+LY8g0+fP05D3OxEWNntBzdOLBVtKYuuyvHGGG6W9XFm/AwnzIJLnfqdt+FV/D4+87DX"
+    logoB64 += "BjKk09m6GUoYom7ule9wdsAOvJgH1WDS+Ev6hzsGLoRPmsTkk7cyGgFznH5AEq0Z/Uz9OxjT+lbIjdC1zLeSiP3j3u+JsTvwtAAa"
+    logoB64 += "XDm7Y89upHzO6fw2h4aVSfK1MvrCQBs9BpDquOeSOESvHJ7x+Qct+vIbH3mdIWGYibHT5qGeae4LOcysh+6i4GkkF3U8PGNgOp5A"
+    logoB64 += "b7KB0Fh6uRzT7GQeyHHUmGzclc7h3A+Fu/q52w+pPkst+LL6xdJisLD3eJqF1qd7vA0nzlkP9mt8uQ5kneiB1NO2/VfSwMMtfT2O"
+    logoB64 += "cDGJXbSTvd4e9f8Ard5N/COXqTmqz4uPERU30cg9zWgP/wAa1jCdyfhDOf1JVv1Roirp/SGBxOPuQXc7duGXJU2vHe1PBtC2T0J3"
+    logoB64 += "cT6HYHmoHK6Q1BhsqzG5zHTYqw/Y7Whw7NP4vcfJRXi1ZoClXsQvyG8JEbIZrHexjbnsDs10fttuFcNdYrEz6Vw2qcrrOyZ7lUx1"
+    logoB64 += "6FmsH2IhG5zSwkOG7QQQHEDl+y1s5i9CaTxtF38cZqfMk99PUqsIrxuHwMc88iAebttyenLqqJnLV7UN8WchKSeENbGxoa1jRvyA"
+    logoB64 += "HQdT9SepKI652F9lNnWumbWaLB9jfaFdr9+bowRxlo8jtvzPLcLn2usJkct2hzY9uQxt/Iz2jvHjp++jjA5MbxbBoDGgN67clK4H"
+    logoB64 += "VeawOkLGnaFiZkuTZ3basZO8cPmQBz4n9APQO9Qq23C5DT8nFl5zip7MrHOjMobOY+LfbhB4gem24VFyn7PrOk6VbM6otVcXUlBM"
+    logoB64 += "XecFiWyfSGIEh/8AMSGj1UVnddZrKQx4rFSWKVBp4Y4y5pled+p4QGtJ9Gj9+qkcvpW5nLFrMz6hwrMfEGxUX/b2GOOFu+zODfvG"
+    logoB64 += "OA25Fu5O+/PmsOhM3pfSWd+2imzUeTYCK32hhjqwP5+Mt5uefTfYc1BD2hfweFtPfLK/K5Jj6sT3vLnMh3++k3Prtwb+YL/RbPYl"
+    logoB64 += "pmvqbXWLxF6eNlZ0oMvGduLbmGD3O2y189nKmfkjy2VoSU5GVxBG2vPt3rWk7bNLTsOfN3Ib7nmSsul9VXMHA7L4VsWPr1i0tjjZ"
+    logoB64 += "95JKT4GmQ8z0LjtsNmn1VFj7f9N3MRqWPBZC5j6GNrPNhrI52yyySybcR7pp3HCA1g4uEbM3810Ds7q6Rx2kJoMjhKeOrfZvtVq1"
+    logoB64 += "ln8Vp8TSC57Ix4tncgNxsd9ue64A4ZPPTG1I2zYnnvGS7Z4S8ni58R+R3P1V/t6WrQXpcG7tDxeSjvY19dtpneExlr43sjeNierP"
+    logoB64 += "LcAIKhPkdOsz16/HVvZ+SWVz2zXpRAxxLid3MYC4/LiatHM5W7lntFp0bK8Z3iqwRiOCL+Vg5b+55qdxGnK9C7D/ABrN6dsUItmm"
+    logoB64 += "Rt1hLmg9AGvB8yr7ns92RGsyjo7STLdmvGDcuz2HNqx/qe5wJ29ADueg5qDnWh9GZnVt6SDGwtZDCwyT2ZTwxQsHm5x5AfMhSuYz"
+    logoB64 += "mI0vSnwOi7P2q3KwxZHONGxf+aKudt2s9X8i7oOXWL1XqizkA7G46cVcQOsFaLuIpnfm4BzI9OMk/Loq2OQ2HRFEREBERAREQERE"
+    logoB64 += "BERAREQEREBERAVz7HtPYnO6wrnUVttTB1XCW5ITtxgcxGPd223y3VNAJOwG5UzBJ3Vs1Xue3HYpne3iw7GWV3LuwfUnZg9AHO8k"
+    logoB64 += "HSu0BmHyWTmxuiaccAsbuiLpGiWZriRxOJ24WnnsPJoJ8wVyzIU6mIkdUgvsyVxrj39iIfcMP5Yvzbfm6eg8zhflbtiSzZMndyWi"
+    logoB64 += "e8LOXh6Bg9GgAAD0AWohH0AucAASSdgB5q24rGOpGavdstpVYAHZKdzttndRC3lzf5bDfbmTyC3tEwYnS1Mar1HEZrbmE4fH/ie/"
+    logoB64 += "oLD/AEY3q0H4iN+g51DNZKxlJw+w77tri6OIfAwk7k7eZPmTuT5lBt5jOMsX5bGMrNie/Zv2uVgMoYBs1kQ5iJoGwG27vVyh9iXu"
+    logoB64 += "e9znved3Pcdy4+5RbuHpNuWCZ5e4qRDjnm2+Bvt6uPQD1QXvsk0BPn6FzP2hFFRr8UcL53hkZcBvJISeQaxu25/M5oURqK7pajkX"
+    logoB64 += "T0a8eob7AGRSTgijWYOjWs5GZ3mSdmkknYhaOp9WXcrUjxNXelha7BHBTjceHhB38X5iTu4k9SSflBVmwE8ViR7WD8LBu4/vyCDZ"
+    logoB64 += "s2stnb7GyyzWpnHaOCFgYxvs2NgDR9ApoZoae0df0/3sEuVvWGPc4QNmfRY1u20bvwyPPXY8gB5nlDzZWRtZ1WhGKMDhs/uz95IP"
+    logoB64 += "1P6kew2Hso1rWtGzQB8kHs27ttrI8ndyd+Fh5Rz3HBo+Q57LPw/a5mQ1KbWEnwsjLnE/UkrWWRk8jInRsdwNfydtyLh6H29kFioZ"
+    logoB64 += "06axN2jhZR/EshF3Fy+w/wCVCT4oYT+rYcT/AE5DluTWo27kNGw9z5LYx9C5kJhDTrSTvJ22Y3dTzsLVwJ77P2K8Mreba8gLnn/l"
+    logoB64 += "DxH+rhb7oNjGYDKZLTk88YFLTtNwls3JvCJ5Og23+I9Q0DpzJ5krE/OW6GJbUgtsw2La/vYpHt++ncOj2sHiefRztmjyO60tQ62z"
+    logoB64 += "GXayCAvbBC3hhfOG+Afojb4I/oCfdVgVC+V09mV88rju5zzuT8yUG3QvGPI/acVJYgl4iTfsP4pufUgDkCfqfdSV7JmR5eLF69O5"
+    logoB64 += "uz7F6YvJ+TN9gPnuotrWtGzQAFkhikmkEcTHPeegAQeDzJceZPmui6Z0zQwWAj1FquzHSfdZvSglZxOER5GUs6nfo0ct+u4HNVXG"
+    logoB64 += "y4zCyNtTxw5W+w7x19968Z8jI78ZH5Ry9T5LRzmUyGbykmSy1qS3akO5e89PYDyCCVt6qfUnnGlK78X3u7ZMjKQ+9MOnx9Iht+Fm"
+    logoB64 += "3LluVAU3mvcbdLnTWWO42vkO+z/Jx9TvzXhEH2pBNJJ3Ub3vc93EQXbDc9Sf/JUpLNTx1V1ei4T3JAW2LPVjR+SMefu49egG3MxS"
+    logoB64 += "kcNjBcJnt2G0sfGfvrL2k7fpa3q958gPrsOaCf7NtE29XT3bcszK2NoMDrNqZ2zS93JkYPm5x8vQFZNRf7MY+ZsEjxl3VpHGKpAe"
+    logoB64 += "CAO5AvleDu88gAxpAAHxE7qNzWp5p8VHgsUJKOGhJLYQ7xSuPV8hHVx5f2A5BV0DoAPkAglszqHJ5SNkEsjK9SPlHVrNEcTPk1vL"
+    logoB64 += "f36+qneyyOlV1BTyeoMi+rhoJhYMTeb5nRni3G/wtG2xd77Dc9GL0RJUxH8f1ZYGIx2wdDBJysWt/wArD8Lf1O29t1AZrLi3M5mO"
+    logoB64 += "rMq1dg0FwDnuA6bkj+wACDX1M6LPapyOoLzfsVS3YfLXrQtAkewuOwa3oxu34j9AVjs25J60dNkcdWjE7iiqxfCD+Zx6vf8AqP02"
+    logoB64 += "HJa+3iLiS5zju5zjuSfcogIiICIiAiIgIiICIiAiIgIiICIiAiIg3MW17Hm1HE6WSNzWwRtG5kmcdmNA8+fP6L5mO7h4cNWlEsVa"
+    logoB64 += "QvuTA7ixZ6OIPm1vwj5E/iUm+Q4XGMfEeG+4OZXPnG9w2kl+bGEMb6Oc4/hUBGxsbAxo2A6IPoHkFI03V8dw2Z447Noc44HjeNh8"
+    logoB64 += "jIPP+X9/Qx4JB3B2IXxBnv3LV+5LcuzyWLEp3fI87kn/ALD28lgREHuFgkfwl4Y3qXHyCy2bHHG2vECyuw7hvm4/md6n/Ra6ICIi"
+    logoB64 += "As8dSzI3ibC/h/MRsP3PJYWOcx3ExxafUFfXve87ve559XHdBv1sfU34r2VrV2DqIwZn/QN5fuQpinktGYvxQ4C7nJx8L8jY7mHf"
+    logoB64 += "/wCqLxH6vVWRBZctrnUV6t9jgtRYqgOlTGRCtH9eDZzv6iVWAxnEXcILidyTzJK9IgIiICyuneWd23ZjCNiG8t/n6rEiAiIgIi9M"
+    logoB64 += "Ac4AuDR6lB9ic1j+JzA/boCeX1WSzZsW3MEjy4N8MbANmtHo0Dos8QxcWzpnWbTvyR7Rt/6juf7Ldi1Jbps4MNXrYnlt3sDN5z/z"
+    logoB64 += "XbuH9PCgzV9KXY67bmcnhwdMjia62dpZB+iIeN3z2A91u43VWL01N3mlcNHNdb8GUysbZZGn1jh+Bh9zxH3VUnllnmdNPLJNK87u"
+    logoB64 += "kkcXOd8yeZXhBu53LZPO5J+SzN+xftvO5lnfxH6eQ+i0kRAREQEREBERAREQEREBERAREQEREBERAUlpumLeSBk4RDA0zSud8IaP"
+    logoB64 += "X232/uo1TU5bjdMxVgP8Vkz30h/JA0kMH9R4j8gPVBG5O2b1+SyQQw+GJp6tYCdt/c7lx9yVroiAiIgIiICIiAiIgIiICIiAiIgI"
+    logoB64 += "iICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiINjG1vtd6KuX8DXO8b/ytHNzvoASvWWuG/kJbPDwsOzY2fkY0"
+    logoB64 += "bNb9AAF7qHucdZn/ABy7QM+R5uP7AD+paSAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIi"
+    logoB64 += "ICIiAiIgIiICIiD0ZHGNsZPhaSQPn1/0XlEQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREB"
+    logoB64 += "ERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREB"
+    logoB64 += "ERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREB"
+    logoB64 += "ERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREH/9k="
+
+    -- Decode base64 to Image
+    local pic = dotNetObject "System.Windows.Forms.PictureBox"
+    pic.Location = dotNetObject ptC 0 5
+    pic.Size     = dotNetObject szC W 175
+    pic.SizeMode = smC.Zoom
+    pic.BackColor = cBg
+    try (
+        local bytes = (dotNetClass "System.Convert").FromBase64String logoB64
+        local ms = dotNetObject "System.IO.MemoryStream" bytes
+        pic.Image = (dotNetClass "System.Drawing.Image").FromStream ms
+    ) catch()
+    logoP.controls.add pic
+
+    local vLbl = mkLabel "v1.1" 0 180 W 18 fObj:fSmall cObj:cDim
+    vLbl.TextAlign = alC.MiddleCenter
+    logoP.controls.add vLbl
+    frm.controls.add logoP
+    Y = 205
+
+    -- ── Close X ──
+    local xBtn = mkLabel "X" (W - 30) 5 24 24 cObj:cDim
+    xBtn.Font = dotNetObject fntC "Segoe UI" 10 fntS.Bold
+    xBtn.TextAlign = alC.MiddleCenter
+    xBtn.Cursor = curC.Hand
+    frm.controls.add xBtn
+    xBtn.BringToFront()
+
+    -- ── Modules ──
+    frm.controls.add (mkSep pad Y iW); Y += 12
+    frm.controls.add (mkLabel "MODULES" pad Y iW 18 fObj:fBold cObj:cHead); Y += 24
+
+    global flowstate_chkPP = mkCheck "Parameters (XButton2)" (pad+4) Y (iW-8) chk:true
+    frm.controls.add flowstate_chkPP; Y += 26
+    global flowstate_chkPS = mkCheck "Shader Search Utility (Shift+XButton2)" (pad+4) Y (iW-8) chk:true
+    frm.controls.add flowstate_chkPS; Y += 34
+
+    -- ── Options ──
+    frm.controls.add (mkSep pad Y iW); Y += 12
+    frm.controls.add (mkLabel "OPTIONS" pad Y iW 18 fObj:fBold cObj:cHead); Y += 24
+
+    global flowstate_chkSubObj = mkCheck "Sub-Object Toggles (V/E/B/F/El)" (pad+4) Y (iW-8) chk:false
+    frm.controls.add flowstate_chkSubObj; Y += 26
+    global flowstate_chkTab = mkCheck "TAB key override for search." (pad+4) Y (iW-8) chk:false
+    frm.controls.add flowstate_chkTab; Y += 26
+    global flowstate_chkLight = mkCheck "Light Theme" (pad+4) Y (iW-8) chk:false
+    frm.controls.add flowstate_chkLight; Y += 34
+
+    -- ── Shortcuts ──
+    frm.controls.add (mkSep pad Y iW); Y += 12
+    frm.controls.add (mkLabel "SHORTCUTS" pad Y iW 18 fObj:fBold cObj:cHead); Y += 24
+
+    for s in #(
+        "XButton2  --  Parameter panel",
+        "Shift + XButton2  --  Shader search",
+        "Tab (in SME)  --  Shader search",
+        "Ctrl + XButton2  --  Clear sliders",
+        "Ctrl+Shift + XButton2  --  Swap V/H sliders",
+        "",
+        "Shift + XButton1  --  Time slider",
+        "Ctrl + XButton1  --  Opacity slider",
+        "XButton1 on pin  --  Assign drag axis",
+        "",
+        "Click value  --  Type value",
+        "Drag value  --  Scrub value",
+        "Scroll value  --  Adjust value",
+        "  + Shift  --  10x coarse",
+        "  + Ctrl  --  10x fine",
+        "",
+        "Right-click param  --  Pin/unpin",
+        "Eye button  --  Toggle visibility editor",
+        "Middle-mouse  --  Drag panel"
+    ) do (
+        if s == "" then Y += 6
+        else (
+            frm.controls.add (mkLabel s (pad+4) Y (iW-8) 17 fObj:fSmall cObj:cDim)
+            Y += 17
+        )
+    )
+    Y += 16
+
+    -- ── Buttons ──
+    frm.controls.add (mkSep pad Y iW); Y += 16
+    local bW = 94; local bH = 30; local bG = 8
+    local bX = (W - (bW * 3 + bG * 2)) / 2
+
+    global flowstate_btnSave  = mkBtn "Save"  bX Y bW bH
+    global flowstate_btnReset = mkBtn "Reset" (bX + bW + bG) Y bW bH
+    local  btnClose2          = mkBtn "Close" (bX + (bW + bG) * 2) Y bW bH
+    frm.controls.add flowstate_btnSave
+    frm.controls.add flowstate_btnReset
+    frm.controls.add btnClose2
+    Y += bH + 16
+
+    -- ── Credit ──
+    local crLbl = mkLabel "clone" 0 Y W 16 fObj:fSmall cObj:(clr.FromArgb 55 55 55)
+    crLbl.TextAlign = alC.MiddleCenter
+    frm.controls.add crLbl
+    Y += 22
+
+    -- Fit form to content
+    frm.Size = dotNetObject szC W Y
+
+    -- Gradient background + 1px border via Paint
+    fn onPaint s e = (
+        local clrC = dotNetClass "System.Drawing.Color"
+        local c1 = clrC.FromArgb 35 35 40
+        local c2 = clrC.FromArgb 20 20 22
+        local rect = dotNetObject "System.Drawing.Rectangle" 0 0 s.Width s.Height
+        local brush = dotNetObject "System.Drawing.Drawing2D.LinearGradientBrush" rect c1 c2 (dotNetClass "System.Drawing.Drawing2D.LinearGradientMode").Vertical
+        e.Graphics.FillRectangle brush rect
+        brush.Dispose()
+        local pen = dotNetObject "System.Drawing.Pen" (clrC.FromArgb 55 55 55) 1.0
+        e.Graphics.DrawRectangle pen 0 0 (s.Width - 1) (s.Height - 1)
+        pen.Dispose()
+    )
+    dotNet.addEventHandler frm "Paint" onPaint
+
+    ---------------------------------------------------------------------------
+    -- Load saved state
+    ---------------------------------------------------------------------------
+    flowstate_chkPP.Checked     = readFlag iniPath "PowerParams"
+    flowstate_chkPS.Checked     = readFlag iniPath "PowerShader"
+    flowstate_chkSubObj.Checked = readFlag iniPath "SubObjToggles" default:false
+    flowstate_chkTab.Checked    = readFlag iniPath "TabShader" default:true
+    flowstate_chkLight.Checked  = readFlag iniPath "LightTheme" default:false
+
+    ---------------------------------------------------------------------------
+    -- Events
+    ---------------------------------------------------------------------------
+
+    -- Close
+    fn onClose s e = (try(flowstate_ConfigForm.Close())catch())
+    dotNet.addEventHandler xBtn     "Click" onClose
+    dotNet.addEventHandler btnClose2 "Click" onClose
+
+    -- X hover (red on hover)
+    fn onXEnter s e = (s.ForeColor = (dotNetClass "System.Drawing.Color").FromArgb 255 80 80)
+    fn onXLeave s e = (s.ForeColor = (dotNetClass "System.Drawing.Color").FromArgb 120 120 120)
+    dotNet.addEventHandler xBtn "MouseEnter" onXEnter
+    dotNet.addEventHandler xBtn "MouseLeave" onXLeave
+
+    -- Drag (logo area + form background)
+    fn onDragDown s e = (
+        if e.Button == (dotNetClass "System.Windows.Forms.MouseButtons").Left do (
+            global flowstate_drag   = true
+            global flowstate_dragPt = dotNetObject "System.Drawing.Point" e.X e.Y
+        )
+    )
+    fn onDragMove s e = (
+        if flowstate_drag and flowstate_dragPt != undefined do (
+            if e.Button != (dotNetClass "System.Windows.Forms.MouseButtons").Left do (
+                global flowstate_drag = false
+                return undefined
+            )
+            local f = flowstate_ConfigForm
+            local p = f.Location
+            f.Location = dotNetObject "System.Drawing.Point" \
+                (p.X + e.X - flowstate_dragPt.X) (p.Y + e.Y - flowstate_dragPt.Y)
+        )
+    )
+    fn onDragUp s e = (global flowstate_drag = false)
+    fn onDeactivate s e = (global flowstate_drag = false)
+
+    -- Add drag to form, logo panel, and all labels/separators
+    fn addDragToControl ctrl = (
+        dotNet.addEventHandler ctrl "MouseDown" onDragDown
+        dotNet.addEventHandler ctrl "MouseMove" onDragMove
+        dotNet.addEventHandler ctrl "MouseUp"   onDragUp
+    )
+    addDragToControl frm
+    addDragToControl logoP
+    for i = 0 to (frm.controls.count - 1) do (
+        local c = frm.controls.item[i]
+        local t = c.GetType()
+        local tn = t.Name
+        if tn == "Label" or tn == "Panel" do addDragToControl c
+    )
+    -- Also logo panel children (PictureBox, version label)
+    for i = 0 to (logoP.controls.count - 1) do
+        addDragToControl (logoP.controls.item[i])
+
+    -- Save
+    fn onSave s e = (
+        local cfg = (getDir #plugcfg) + "\\FlowState.cfg"
+        -- Read existing lines, keep everything except the flags we manage
+        local keep = #()
+        local f = openFile cfg mode:"r"
+        if f != undefined do (
+            while not eof f do (
+                local ln = readLine f
+                if findString ln "PowerParams=" != undefined then ()
+                else if findString ln "PowerShader=" != undefined then ()
+                else if findString ln "SubObjToggles=" != undefined then ()
+                else if findString ln "TabShader=" != undefined then ()
+                else if findString ln "LightTheme=" != undefined then ()
+                else append keep ln
+            )
+            close f
+        )
+        f = createFile cfg
+        if f == undefined do return()
+        -- Write preserved lines first
+        for ln in keep do format "%\n" ln to:f
+        -- Write our flags (only non-defaults)
+        if not flowstate_chkPP.Checked     do format "PowerParams=0\n" to:f
+        if not flowstate_chkPS.Checked     do format "PowerShader=0\n" to:f
+        if flowstate_chkSubObj.Checked      do format "SubObjToggles=1\n" to:f
+        if not flowstate_chkTab.Checked     do format "TabShader=0\n" to:f
+        if flowstate_chkLight.Checked       do format "LightTheme=1\n" to:f
+        close f
+        messageBox "Configuration saved.\nRestart 3ds Max for changes to take effect." title:"flowstate"
+    )
+    dotNet.addEventHandler flowstate_btnSave "Click" onSave
+
+    -- Reset
+    fn onReset s e = (
+        if queryBox "Clear all flowstate settings?\n\nThis will reset collapsed groups, hidden params,\nfavorites, and XB1 assignments." title:"flowstate" then (
+            try(deleteFile ((getDir #plugcfg) + "\\FlowState.cfg"))catch()
+            -- Clean up legacy files if they exist
+            try(deleteFile ((getDir #plugcfg) + "\\PowerParams.cfg"))catch()
+            try(deleteFile ((getDir #plugcfg) + "\\PowerShader.cfg"))catch()
+            try(deleteFile ((getDir #plugcfg) + "\\PowerShader_Pins.cfg"))catch()
+            try(deleteFile ((getDir #plugcfg) + "\\flowstate.ini"))catch()
+            messageBox "Settings cleared.\nRestart 3ds Max to apply." title:"flowstate"
+        )
+    )
+    dotNet.addEventHandler flowstate_btnReset "Click" onReset
+
+    -- ESC to close
+    fn onKey s e = (
+        if e.KeyCode == (dotNetClass "System.Windows.Forms.Keys").Escape do
+            try(flowstate_ConfigForm.Close())catch()
+    )
+    dotNet.addEventHandler frm "KeyDown" onKey
+
+    -- Cancel drag on focus loss
+    dotNet.addEventHandler frm "Deactivate" onDeactivate
+
+    -- Cleanup global on close
+    fn onClosed s e = (global flowstate_ConfigForm = undefined)
+    dotNet.addEventHandler frm "FormClosed" onClosed
+
+    -- Show
+    frm.Show()
+)
+)FLOWMCR";
+            ExecuteMAXScriptScript(kMcrScript, MAXScript::ScriptSource::Dynamic);
+        }
