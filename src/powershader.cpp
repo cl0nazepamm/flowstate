@@ -1385,6 +1385,69 @@ private:
                            wa.left, wa.right - static_cast<long>(kWindowWidth));
         int y = std::clamp(static_cast<long>(p.y + 20),
                            wa.top, wa.bottom - static_cast<long>(kWindowHeight));
+
+        HWND mainMax = GetCOREInterface() ? GetCOREInterface()->GetMAXHWnd() : nullptr;
+        
+        HWND testHwnds[] = { WindowFromPoint(p), GetForegroundWindow() };
+        bool isPalette = false;
+        bool isSme = false;
+        HWND dlg = nullptr;
+
+        for (HWND h : testHwnds) {
+            if (!h) continue;
+            HWND curr = h;
+            while (curr && curr != mainMax) {
+                wchar_t title[256] = {};
+                GetWindowTextW(curr, title, 256);
+                std::wstring t = title;
+                for (auto& c : t) c = towlower(c);
+                
+                if (t.find(L"slate") != std::wstring::npos || t.find(L"sme") != std::wstring::npos) {
+                    isSme = true;
+                    break;
+                }
+                
+                if (t.find(L"material editor") != std::wstring::npos ||
+                    t.find(L"material/map browser") != std::wstring::npos ||
+                    t.find(L"material browser") != std::wstring::npos ||
+                    t.find(L"material palette") != std::wstring::npos) {
+                    isPalette = true;
+                    dlg = curr;
+                    break;
+                }
+                curr = GetParent(curr);
+            }
+            if (isPalette || isSme) break;
+        }
+        
+        if (isPalette && !isSme && dlg) {
+            RECT sr; GetWindowRect(dlg, &sr);
+            long distR = p.x > sr.right ? p.x - sr.right : sr.right - p.x;
+            long distL = p.x > sr.left ? p.x - sr.left : sr.left - p.x;
+            
+            if (distR <= distL) {
+                x = sr.right + 8;
+                if (x + kWindowWidth > wa.right) x = sr.left - kWindowWidth - 8;
+            } else {
+                x = sr.left - kWindowWidth - 8;
+                if (x < wa.left) x = sr.right + 8;
+            }
+            
+            x = std::clamp(static_cast<long>(x), wa.left, wa.right - static_cast<long>(kWindowWidth));
+            
+            // Vertical detection (thirds matching)
+            long paletteH = sr.bottom - sr.top;
+            if (p.y < sr.top + paletteH / 3) {
+                y = sr.top;
+            } else if (p.y > sr.bottom - paletteH / 3) {
+                y = sr.bottom - kWindowHeight;
+            } else {
+                y = sr.top + paletteH / 2 - kWindowHeight / 2;
+            }
+            
+            y = std::clamp(static_cast<long>(y), wa.top, wa.bottom - static_cast<long>(kWindowHeight));
+        }
+
         int startY = y + 15;
         SetLayeredWindowAttributes(wnd_, 0, 0, LWA_ALPHA);
         ShowWindow(wnd_, SW_SHOW);
