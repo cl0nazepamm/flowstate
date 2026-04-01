@@ -2111,7 +2111,7 @@ private:
 } // anonymous namespace
 
 // ── Exported API ────────────────────────────────────────────────
-void Init(HINSTANCE) { Palette::Get().Init(false); }
+void Init(HINSTANCE, bool lightTheme) { Palette::Get().Init(lightTheme); }
 void Shutdown()      { Palette::Get().Shutdown(); }
 void Toggle()        { Palette::Get().Toggle(); }
 bool IsOpen()        { return false; } // TODO: add accessor to Palette

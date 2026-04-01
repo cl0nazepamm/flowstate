@@ -188,8 +188,10 @@ static std::vector<int> g_modSearchResults; // indices into ModStack cache
 static int      g_modSearchSel   = 0;      // selected result index
 static int      g_modSearchScrollY = 0;
 static bool     g_open       = false;
-static bool     g_hoverClose = false;
-static RECT     g_closeRect  = {};
+static bool     g_hoverClose    = false;
+static RECT     g_closeRect     = {};
+static bool     g_hoverModStack = false;
+static RECT     g_modStackRect  = {};
 
 static const UINT WM_PP_TOGGLE   = WM_USER + 100;
 
@@ -306,7 +308,7 @@ static void UpdateModSearch() {
             if (g_modSearchEdit) {
                 RECT rc2; GetClientRect(g_panel, &rc2);
                 SetWindowPos(g_modSearchEdit, nullptr, kPad, kPad - 1,
-                    rc2.right - kPad * 2 - 20, kFontHdr + 2, SWP_NOZORDER | SWP_NOACTIVATE);
+                    rc2.right - kPad * 2 - 42, kFontHdr + 2, SWP_NOZORDER | SWP_NOACTIVATE);
             }
         }
     }
@@ -386,7 +388,6 @@ static RECT  g_mmPanelRect = {};
 // Module enable flags (read from FlowState.ini)
 static bool g_enablePowerParams = true;
 static bool g_enablePowerShader = true;
-static bool g_enableModStack    = true;
 
 // XButton1 dynamic assignment — two slots: vertical (V) and horizontal (H)
 // Keyed per base-object class so each object type remembers its own assignments
@@ -423,7 +424,6 @@ static void LoadModuleFlags() {
     while (fgetws(line, 256, f)) {
         if (wcsstr(line, L"PowerParams=0")) g_enablePowerParams = false;
         if (wcsstr(line, L"PowerShader=0")) g_enablePowerShader = false;
-        if (wcsstr(line, L"ModStack=0"))    g_enableModStack = false;
         if (wcsstr(line, L"SubObjToggles=1")) g_showSubObj = true;
         if (wcsstr(line, L"LightTheme=1")) g_lightTheme = true;
         // Per-class XB1 assignments: XB1:ClassName=vKey|hKey
@@ -1157,11 +1157,8 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
 
         if (xbutton == XBUTTON2 && wp == WM_XBUTTONDOWN) {
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-            bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             bool matEd = IsMaterialEditorFocused();
-            if (ctrl && g_enableModStack) {
-                PostMessage(g_panel, WM_PP_MODSTACK, 0, 0);
-            } else if ((shift || matEd) && g_enablePowerShader) {
+            if ((shift || matEd) && g_enablePowerShader) {
                 PostMessage(g_panel, WM_PP_SHADER, 0, 0);
             } else if (g_enablePowerParams) {
                 PostMessage(g_panel, WM_PP_TOGGLE, 0, 0);
@@ -2082,6 +2079,21 @@ static void PaintPanel(HWND hwnd) {
     int y = kPad + 2;
     // Header text is replaced by the search bar EDIT control
 
+    // ModStack button
+    {
+        bool msOpen = ModStack::IsOpen();
+        COLORREF mbg = msOpen ? kAccent : (g_hoverModStack ? kBtnHov : kBtnBg);
+        HBRUSH mb = CreateSolidBrush(mbg); FillRect(mem, &g_modStackRect, mb); DeleteObject(mb);
+        HPEN mp = CreatePen(PS_SOLID, 1, kBorder);
+        HPEN mpo = (HPEN)SelectObject(mem, mp);
+        SelectObject(mem, GetStockObject(NULL_BRUSH));
+        Rectangle(mem, g_modStackRect.left, g_modStackRect.top, g_modStackRect.right, g_modStackRect.bottom);
+        SelectObject(mem, mpo); DeleteObject(mp);
+        SetTextColor(mem, msOpen ? RGB(255,255,255) : kValueClr);
+        RECT mr = g_modStackRect;
+        DrawText(mem, _T("M"), 1, &mr, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    }
+
     // Close button
     if (g_hoverClose) {
         HBRUSH hov = CreateSolidBrush(kCloseHov); FillRect(mem, &g_closeRect, hov); DeleteObject(hov);
@@ -2363,7 +2375,8 @@ static void BuildLayout() {
     if (panelW > 500) panelW = 500;  // cap to prevent layout breakage
     int editX = panelW - kPad - kEditW;
 
-    g_closeRect = { panelW - kPad - 18, kPad, panelW - kPad, kPad + 18 };
+    g_closeRect    = { panelW - kPad - 18, kPad, panelW - kPad, kPad + 18 };
+    g_modStackRect = { panelW - kPad - 18 - 2 - 18, kPad, panelW - kPad - 18 - 2, kPad + 18 };
 
     // Fixed header area
     int y = 2 + kPad + kFontHdr + 4 + 1 + 4;
@@ -2750,7 +2763,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_modSearchEdit) {
                 RECT rc2; GetClientRect(hwnd, &rc2);
                 SetWindowPos(g_modSearchEdit, nullptr, kPad, kPad - 1,
-                    rc2.right - kPad * 2 - 20, kFontHdr + 2,
+                    rc2.right - kPad * 2 - 42, kFontHdr + 2,
                     SWP_NOZORDER | SWP_NOACTIVATE);
             }
         }
@@ -2767,6 +2780,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT wr; GetWindowRect(hwnd, &wr); int pw = wr.right - wr.left;
 
         if (PtInRect(&g_closeRect, pt)) { ClosePanel(); return 0; }
+        if (PtInRect(&g_modStackRect, pt)) { ModStack::Toggle(); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
 
         // Mod search: click on result = apply
         if (g_modSearch && pt.y >= g_contentStartY) {
@@ -3031,6 +3045,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         bool over = PtInRect(&g_closeRect, pt) != 0;
         if (over != g_hoverClose) { g_hoverClose = over; InvalidateRect(hwnd, &g_closeRect, FALSE); }
+        bool overMs = PtInRect(&g_modStackRect, pt) != 0;
+        if (overMs != g_hoverModStack) { g_hoverModStack = overMs; InvalidateRect(hwnd, &g_modStackRect, FALSE); }
         // Track hovered param for highlight + wheel (not during search)
         if (!g_modSearch) {
             RECT rc2; GetClientRect(hwnd, &rc2);
@@ -3043,6 +3059,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_MOUSELEAVE:
         if (g_hoverClose) { g_hoverClose = false; InvalidateRect(hwnd, &g_closeRect, FALSE); }
+        if (g_hoverModStack) { g_hoverModStack = false; InvalidateRect(hwnd, &g_modStackRect, FALSE); }
         if (g_hoverParam >= 0) { g_hoverParam = -1; InvalidateRect(hwnd, nullptr, FALSE); }
         return 0;
 
@@ -3262,7 +3279,7 @@ static void OpenPanel() {
     if (!g_modSearchEdit) {
         RECT rc; GetClientRect(g_panel, &rc);
         int searchX = kPad;
-        int searchW = rc.right - kPad * 2 - 20;
+        int searchW = rc.right - kPad * 2 - 42;
         g_modSearchEdit = CreateWindowEx(0, _T("EDIT"), _T(""),
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             searchX, kPad - 1, searchW, kFontHdr + 2,
@@ -3314,6 +3331,7 @@ static void ClosePanel() {
     if (g_toolTip) ShowWindow(g_toolTip, SW_HIDE);
     g_open = false;
     g_hoverClose = false;
+    g_hoverModStack = false;
     g_nodeHandle = 0;
     g_nodeName.clear();
     EnableAccelerators();
@@ -3422,8 +3440,8 @@ public:
         if (am) am->ActivateActionTable(&g_actionCB, kTableId);
         g_mouseHook = SetWindowsHookEx(WH_MOUSE, MouseHookProc, nullptr, GetCurrentThreadId());
 
-        PowerShader::Init(hInstance);
-        ModStack::Init(hInstance);
+        PowerShader::Init(hInstance, g_lightTheme);
+        ModStack::Init(hInstance, g_lightTheme);
 
         return GUPRESULT_KEEP;
     }
