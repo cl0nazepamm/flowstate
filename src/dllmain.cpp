@@ -838,7 +838,7 @@ static void LoadSettings() {
     PowerShader::ClearPersistent();
 
     std::wstring path = GetCfgPath();
-    if (path.empty()) return;
+    if (path.empty()) { UpdateTheme(false); PowerShader::ReloadTheme(false); ModStack::ReloadTheme(false); return; }
     FILE* f = _wfopen(path.c_str(), L"r");
     if (!f) {
         // Try legacy files for migration
@@ -861,8 +861,10 @@ static void LoadSettings() {
             }
             fclose(f);
             SaveSettings(); // migrate to new unified file
+            UpdateTheme(false); PowerShader::ReloadTheme(false); ModStack::ReloadTheme(false);
             return;
         }
+        UpdateTheme(false); PowerShader::ReloadTheme(false); ModStack::ReloadTheme(false);
         return;
     }
 
@@ -3928,6 +3930,9 @@ public:
                     // Always overwrite to keep in sync with plugin version
                     FILE* f = _wfopen(outPath.c_str(), L"wb");
                     if (f) { fwrite(data, 1, sz, f); fclose(f); }
+                    // Force Max to load it now (GUPs load after macroscript scan)
+                    std::wstring loadScript = L"macros.load \"" + std::wstring(macroDir.data()) + L"\" \"CloneTools-FlowState_Config.mcr\"";
+                    ExecuteMAXScriptScript(loadScript.c_str(), MAXScript::ScriptSource::NotSpecified);
                 }
             }
         }
