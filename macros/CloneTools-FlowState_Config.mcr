@@ -79,7 +79,7 @@ macroscript flowstate_Config
         c.Location  = dotNetObject ptC x y
         c.Size      = dotNetObject szC w 22
         c.ForeColor = (dotNetClass "System.Drawing.Color").FromArgb 200 200 200
-        c.BackColor = (dotNetClass "System.Drawing.Color").Transparent
+        c.BackColor = (dotNetClass "System.Drawing.Color").FromArgb 30 30 30 -- Fix Transparent Checkbox bug
         c.Checked   = chk
         c
     )
@@ -398,7 +398,9 @@ macroscript flowstate_Config
     fn onDragDown s e = (
         if e.Button == (dotNetClass "System.Windows.Forms.MouseButtons").Left do (
             global flowstate_drag   = true
-            global flowstate_dragPt = dotNetObject "System.Drawing.Point" e.X e.Y
+            local mPos = (dotNetClass "System.Windows.Forms.Control").MousePosition
+            local fLoc = flowstate_ConfigForm.Location
+            global flowstate_dragPt = dotNetObject "System.Drawing.Point" (fLoc.X - mPos.X) (fLoc.Y - mPos.Y)
         )
     )
     fn onDragMove s e = (
@@ -407,10 +409,8 @@ macroscript flowstate_Config
                 global flowstate_drag = false
                 return undefined
             )
-            local f = flowstate_ConfigForm
-            local p = f.Location
-            f.Location = dotNetObject "System.Drawing.Point" \
-                (p.X + e.X - flowstate_dragPt.X) (p.Y + e.Y - flowstate_dragPt.Y)
+            local mPos = (dotNetClass "System.Windows.Forms.Control").MousePosition
+            flowstate_ConfigForm.Location = dotNetObject "System.Drawing.Point" (mPos.X + flowstate_dragPt.X) (mPos.Y + flowstate_dragPt.Y)
         )
     )
     fn onDragUp s e = (global flowstate_drag = false)
@@ -457,6 +457,7 @@ macroscript flowstate_Config
         -- Write preserved lines first
         for ln in keep do format "%\n" ln to:f
         -- Write our flags (only non-defaults)
+        format "\n[config]\n" to:f
         if not flowstate_chkPP.Checked     do format "PowerParams=0\n" to:f
         if not flowstate_chkPS.Checked     do format "PowerShader=0\n" to:f
         if flowstate_chkSubObj.Checked      do format "SubObjToggles=1\n" to:f
