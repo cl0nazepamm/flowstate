@@ -979,6 +979,10 @@ private:
             self->OnTimer(static_cast<UINT_PTR>(w));
             return 0;
 
+        case WM_USER + 50:
+            self->UpdatePreviewForSelection();
+            return 0;
+
         case WM_ACTIVATE:
             if (LOWORD(w) == WA_INACTIVE && !self->dragging_) self->Hide();
             return 0;
@@ -1053,6 +1057,15 @@ private:
 
         case WM_PARENTNOTIFY:
         {
+            // Left-click on list → update preview (LBN_SELCHANGE doesn't always fire on click)
+            if (LOWORD(w) == WM_LBUTTONDOWN) {
+                POINT cp = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+                HWND child = ChildWindowFromPoint(h, cp);
+                if (child == self->list_) {
+                    // Post a delayed update — selection isn't set yet during PARENTNOTIFY
+                    PostMessage(h, WM_USER + 50, 0, 0);
+                }
+            }
             // Middle-click on brick button → remove it
             if (LOWORD(w) == WM_MBUTTONDOWN) {
                 POINT cp = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
@@ -1641,16 +1654,7 @@ private:
             return;
         }
         if (id == kListId && code == LBN_SELCHANGE) {
-            // Show texture preview for selected item
-            int sel = (int)SendMessage(list_, LB_GETCURSEL, 0, 0);
-            if (sel >= 0 && sel < (int)filtered_.size()) {
-                const Item& item = (*activeItems_)[filtered_[sel]];
-                if (item.live) {
-                    std::wstring fn = GetTexmapFilename(item.live);
-                    if (!fn.empty()) { ShowPreview(fn, wnd_); return; }
-                }
-            }
-            HidePreview();
+            UpdatePreviewForSelection();
             return;
         }
         if (id == kListId && code == LBN_DBLCLK)
@@ -1662,6 +1666,19 @@ private:
                 ActivateAlias(brickFavs_[bi].alias);
             return;
         }
+    }
+
+    void UpdatePreviewForSelection()
+    {
+        int sel = (int)SendMessage(list_, LB_GETCURSEL, 0, 0);
+        if (sel >= 0 && sel < (int)filtered_.size() && activeItems_) {
+            const Item& item = (*activeItems_)[filtered_[sel]];
+            if (item.live) {
+                std::wstring fn = GetTexmapFilename(item.live);
+                if (!fn.empty()) { ShowPreview(fn, wnd_); return; }
+            }
+        }
+        HidePreview();
     }
 
     void OnTimer(UINT_PTR id)
