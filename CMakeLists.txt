@@ -31,10 +31,8 @@ set_target_properties(${PLUGIN_NAME} PROPERTIES
     OUTPUT_NAME "${PLUGIN_NAME}"
 )
 
-# Module definition (optional — create src/${PLUGIN_NAME}.def if needed)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/${PLUGIN_NAME}.def")
-    target_sources(${PLUGIN_NAME} PRIVATE "src/${PLUGIN_NAME}.def")
-endif()
+# Module definition — exports LibVersion, LibDescription, etc.
+target_sources(${PLUGIN_NAME} PRIVATE "src/FlowState.def")
 
 # ── Includes ─────────────────────────────────────────────────────
 target_include_directories(${PLUGIN_NAME} PRIVATE
