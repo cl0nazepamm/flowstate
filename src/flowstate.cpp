@@ -1272,22 +1272,22 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             bool matEd = IsMaterialEditorFocused();
             if (ctrl && shift) {
-                // Ctrl+Shift+XButton2 → swap V/H slider assignments
+                // Ctrl+Shift+XButton2 → clear XB1 slider assignments (destructive)
+                SyncXB1ToSelection();
+                if (g_xb1V.Active() || g_xb1H.Active()) {
+                    g_xb1V.Clear(); g_xb1H.Clear();
+                    SaveXB1Assignment();
+                    ShowOSD(L"Sliders cleared");
+                }
+                return 1;
+            } else if (ctrl) {
+                // Ctrl+XButton2 → swap V/H slider assignments
                 SyncXB1ToSelection();
                 if (g_xb1V.Active() || g_xb1H.Active()) {
                     std::swap(g_xb1V, g_xb1H);
                     SaveXB1Assignment();
                     ShowOSD(L"\u2195 " + (g_xb1V.Active() ? g_xb1V.label : L"OFF") +
                             L"  \u2194 " + (g_xb1H.Active() ? g_xb1H.label : L"OFF"));
-                }
-                return 1;
-            } else if (ctrl) {
-                // Ctrl+XButton2 → clear XB1 slider assignments
-                SyncXB1ToSelection();
-                if (g_xb1V.Active() || g_xb1H.Active()) {
-                    g_xb1V.Clear(); g_xb1H.Clear();
-                    SaveXB1Assignment();
-                    ShowOSD(L"Sliders cleared");
                 }
                 return 1;
             } else if ((shift || matEd) && g_enablePowerShader) {
