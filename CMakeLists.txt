@@ -72,7 +72,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
     gup.lib
     Paramblk2.lib
     comctl32.lib
-    # Geom.lib
+    Geom.lib
     Maxscrpt.lib
     # mesh.lib
     bmm.lib

@@ -987,7 +987,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     }
 
     // ── XButton1 hold-drag tools ──────────────────────────────
-    enum DragMode { DRAG_NONE, DRAG_TIME, DRAG_OPACITY };
+    enum DragMode { DRAG_NONE, DRAG_TIME, DRAG_OPACITY, DRAG_SCREEN };
     static DragMode s_dragMode = DRAG_NONE;
     static int   s_lastMouseX  = 0;
     static int   s_lastMouseY  = 0;
@@ -1094,30 +1094,51 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     if (s_dragMode != DRAG_NONE && wp == WM_MOUSEMOVE) {
         MOUSEHOOKSTRUCT* ms2 = (MOUSEHOOKSTRUCT*)lp;
         int dx = ms2->pt.x - s_lastMouseX;
+        int dy = ms2->pt.y - s_lastMouseY;
         s_lastMouseX = ms2->pt.x;
-        if (dx != 0) {
-            Interface* ip = GetCOREInterface();
-            if (s_dragMode == DRAG_TIME && ip) {
-                float speed = 1.0f;
-                if (GetKeyState(VK_MENU) & 0x8000) speed = 0.2f;
-                s_dragFloat += (float)dx / 10.0f * speed;
-                Interval range = ip->GetAnimRange();
-                float minF = (float)range.Start() / GetTicksPerFrame();
-                float maxF = (float)range.End() / GetTicksPerFrame();
-                if (s_dragFloat < minF) s_dragFloat = minF;
-                if (s_dragFloat > maxF) s_dragFloat = maxF;
-                ip->SetTime((TimeValue)(s_dragFloat * GetTicksPerFrame()), TRUE);
+        s_lastMouseY = ms2->pt.y;
+
+        Interface* ip = GetCOREInterface();
+
+        if (s_dragMode == DRAG_SCREEN && ip && ip->GetSelNodeCount() > 0 && (dx != 0 || dy != 0)) {
+            // Screen-space grab via MaxScript — handles perspective, ortho,
+            // object mode, and sub-object mode (verts/edges/faces) correctly
+            ViewExp& vpt = ip->GetActiveViewExp();
+            float screenH = (float)vpt.getGW()->getWinSizeY();
+            float dist = vpt.GetFocalDist();
+            float fov = vpt.GetFOV();
+            // For ortho views FOV encodes zoom, for perspective it's the angle
+            float worldPerPixel = (fov > 0.001f)
+                ? (2.0f * dist * tanf(fov * 0.5f)) / screenH
+                : dist / screenH;  // fallback for near-zero FOV
+            float wx = (float)dx * worldPerPixel;
+            float wy = (float)(-dy) * worldPerPixel;
+            wchar_t script[256];
+            swprintf(script, 256,
+                L"in coordsys screen move selection [%f, %f, 0]", wx, wy);
+            ExecuteMAXScriptScript(script, MAXScript::ScriptSource::Dynamic);
+            ip->RedrawViews(ip->GetTime());
+        }
+        else if (s_dragMode == DRAG_TIME && ip && dx != 0) {
+            float speed = 1.0f;
+            if (GetKeyState(VK_MENU) & 0x8000) speed = 0.2f;
+            s_dragFloat += (float)dx / 10.0f * speed;
+            Interval range = ip->GetAnimRange();
+            float minF = (float)range.Start() / GetTicksPerFrame();
+            float maxF = (float)range.End() / GetTicksPerFrame();
+            if (s_dragFloat < minF) s_dragFloat = minF;
+            if (s_dragFloat > maxF) s_dragFloat = maxF;
+            ip->SetTime((TimeValue)(s_dragFloat * GetTicksPerFrame()), TRUE);
+        }
+        else if (s_dragMode == DRAG_OPACITY && ip && ip->GetSelNodeCount() > 0 && dx != 0) {
+            s_dragFloat += (float)dx * 0.005f;
+            if (s_dragFloat < 0.0f) s_dragFloat = 0.0f;
+            if (s_dragFloat > 1.0f) s_dragFloat = 1.0f;
+            for (int i = 0; i < ip->GetSelNodeCount(); i++) {
+                INode* nd = ip->GetSelNode(i);
+                if (nd) nd->SetVisibility(ip->GetTime(), s_dragFloat);
             }
-            else if (s_dragMode == DRAG_OPACITY && ip && ip->GetSelNodeCount() > 0) {
-                s_dragFloat += (float)dx * 0.005f;
-                if (s_dragFloat < 0.0f) s_dragFloat = 0.0f;
-                if (s_dragFloat > 1.0f) s_dragFloat = 1.0f;
-                for (int i = 0; i < ip->GetSelNodeCount(); i++) {
-                    INode* nd = ip->GetSelNode(i);
-                    if (nd) nd->SetVisibility(ip->GetTime(), s_dragFloat);
-                }
-                ip->RedrawViews(ip->GetTime());
-            }
+            ip->RedrawViews(ip->GetTime());
         }
         return 1;
     }
@@ -1125,27 +1146,51 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     if (wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP) {
         WORD xbutton = HIWORD(reinterpret_cast<MOUSEHOOKSTRUCTEX*>(lp)->mouseData);
 
-        // XButton1: Shift=time slider, Ctrl=opacity slider
+        // XButton1 combos:
+        //   bare        = screen space grab
+        //   Shift       = time slider
+        //   Ctrl        = param slider drag (assigned fav)
+        //   Ctrl+Shift  = opacity slider
+        //   Ctrl+Alt+Shift = clear all slider assignments
         if (xbutton == XBUTTON1) {
             if (wp == WM_XBUTTONDOWN) {
                 bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
                 bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                bool alt   = (GetKeyState(VK_MENU) & 0x8000) != 0;
                 Interface* ip = GetCOREInterface();
-                if (shift && ip) {
+
+                // Ctrl+Alt+Shift+XButton1 = clear all slider assignments
+                if (ctrl && alt && shift) {
+                    SyncXB1ToSelection();
+                    if (g_xb1V.Active() || g_xb1H.Active()) {
+                        g_xb1V.Clear(); g_xb1H.Clear();
+                        SaveXB1Assignment();
+                        ShowOSD(L"Sliders cleared");
+                    }
+                    return 1;
+                }
+
+                // Shift+XButton1 = time slider
+                if (shift && !ctrl && ip) {
                     s_dragMode = DRAG_TIME;
                     s_lastMouseX = ((MOUSEHOOKSTRUCT*)lp)->pt.x;
                     s_dragFloat = (float)ip->GetTime() / GetTicksPerFrame();
                     return 1;
                 }
-                if (ctrl && ip && ip->GetSelNodeCount() > 0) {
+
+                // Ctrl+Shift+XButton1 = opacity slider
+                if (ctrl && shift && ip && ip->GetSelNodeCount() > 0) {
                     s_dragMode = DRAG_OPACITY;
                     s_lastMouseX = ((MOUSEHOOKSTRUCT*)lp)->pt.x;
                     s_dragFloat = ip->GetSelNode(0)->GetVisibility(ip->GetTime());
                     if (s_dragFloat < 0) s_dragFloat = 1.0f;
                     return 1;
                 }
-                // No modifier = dynamic assignment or drag assigned param
-                if (g_open && g_favWnd && IsWindowVisible(g_favWnd)) {
+
+                // Ctrl+XButton1 = assigned param drag (fav sliders)
+                if (ctrl && !shift) {
+                    // Dynamic assignment or drag assigned param
+                    if (g_open && g_favWnd && IsWindowVisible(g_favWnd)) {
                     // Check if cursor is over a favorite edit
                     POINT cp = ((MOUSEHOOKSTRUCT*)lp)->pt;
                     for (int fi = 0; fi < (int)g_favEdits.size(); fi++) {
@@ -1259,11 +1304,32 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                         return 1;
                     }
                 }
+                    return 0;
+                } // end ctrl+XB1 param drag
+
+                // Bare XButton1 = screen space grab
+                if (!ctrl && !shift && !alt && ip && ip->GetSelNodeCount() > 0) {
+                    s_dragMode = DRAG_SCREEN;
+                    s_lastMouseX = ((MOUSEHOOKSTRUCT*)lp)->pt.x;
+                    s_lastMouseY = ((MOUSEHOOKSTRUCT*)lp)->pt.y;
+                    theHold.Begin();
+                    return 1;
+                }
+
                 return 0;
             }
-            if (wp == WM_XBUTTONUP && s_dragMode != DRAG_NONE) {
-                s_dragMode = DRAG_NONE;
-                return 1;
+            if (wp == WM_XBUTTONUP) {
+                if (s_dragMode == DRAG_SCREEN) {
+                    s_dragMode = DRAG_NONE;
+                    theHold.Accept(_T("Screen Grab"));
+                    Interface* ip2 = GetCOREInterface();
+                    if (ip2) ip2->RedrawViews(ip2->GetTime());
+                    return 1;
+                }
+                if (s_dragMode != DRAG_NONE) {
+                    s_dragMode = DRAG_NONE;
+                    return 1;
+                }
             }
         }
 
@@ -1271,16 +1337,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
             bool matEd = IsMaterialEditorFocused();
-            if (ctrl && shift) {
-                // Ctrl+Shift+XButton2 → clear XB1 slider assignments (destructive)
-                SyncXB1ToSelection();
-                if (g_xb1V.Active() || g_xb1H.Active()) {
-                    g_xb1V.Clear(); g_xb1H.Clear();
-                    SaveXB1Assignment();
-                    ShowOSD(L"Sliders cleared");
-                }
-                return 1;
-            } else if (ctrl) {
+            if (ctrl) {
                 // Ctrl+XButton2 → swap V/H slider assignments
                 SyncXB1ToSelection();
                 if (g_xb1V.Active() || g_xb1H.Active()) {
