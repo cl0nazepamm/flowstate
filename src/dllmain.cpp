@@ -602,17 +602,29 @@ static void FadeIn(HWND hwnd, HWND* companions = nullptr, int numComp = 0) {
     g_fade.fadingIn = true; g_fade.fadingOut = false;
     g_fade.startTime = GetTickCount();
     g_fade.numCompanions = std::min(numComp, 4);
+
+    // Set alpha to 0 BEFORE showing anything — prevents flash
+    SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+    for (int i = 0; i < numComp && i < 4; i++) {
+        g_fade.companions[i] = companions[i];
+        if (companions[i])
+            SetLayeredWindowAttributes(companions[i], 0, 0, LWA_ALPHA);
+    }
+
+    // Now show windows (invisible at alpha 0)
+    ShowWindow(hwnd, SW_SHOWNA);
     RECT r; GetWindowRect(hwnd, &r); g_fade.basePos = {r.left, r.top};
     for (int i = 0; i < g_fade.numCompanions; i++) {
-        g_fade.companions[i] = companions[i];
-        if (companions[i]) {
-            RECT cr; GetWindowRect(companions[i], &cr);
+        if (g_fade.companions[i]) {
+            ShowWindow(g_fade.companions[i], SW_SHOWNA);
+            RECT cr; GetWindowRect(g_fade.companions[i], &cr);
             g_fade.compPos[i] = {cr.left, cr.top};
-            ShowWindow(companions[i], SW_SHOWNA);
         }
     }
-    FadeSetAlpha(0);
-    ShowWindow(hwnd, SW_SHOWNA);
+
+    // Apply initial offset position
+    FadeSetPos(0.0f);
+
     SetTimer(hwnd, kFadeTimerId, kFadeIntervalMs, FadeTimerProc);
 }
 
@@ -2159,12 +2171,14 @@ static bool IsModifyMode() {
 static void PositionBtnStrips() {
     RECT pr; GetWindowRect(g_panel, &pr);
     int sh = BtnStripH();
-    
+    // During fresh open, position only — FadeIn handles showing
+    UINT showFlag = g_freshOpen ? 0 : SWP_SHOWWINDOW;
+
     // Quick Mods strip (right side)
     if (!g_quickMods.empty() && g_open) {
         int rw = BtnStripW((int)g_quickMods.size());
-        SetWindowPos(g_btnRight, HWND_TOPMOST, pr.right - rw, pr.top - sh - kSideGap, rw, sh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        InvalidateRect(g_btnRight, nullptr, FALSE);
+        SetWindowPos(g_btnRight, HWND_TOPMOST, pr.right - rw, pr.top - sh - kSideGap, rw, sh, SWP_NOACTIVATE | showFlag);
+        if (!g_freshOpen) InvalidateRect(g_btnRight, nullptr, FALSE);
     } else {
         if (g_btnRight) ShowWindow(g_btnRight, SW_HIDE);
     }
@@ -2177,8 +2191,8 @@ static void PositionBtnStrips() {
     int lw = BtnStripW(leftCount);
     int topY = pr.top - sh - kSideGap;
 
-    SetWindowPos(g_btnLeft, HWND_TOPMOST, pr.left, topY, lw, sh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    InvalidateRect(g_btnLeft, nullptr, FALSE);
+    SetWindowPos(g_btnLeft, HWND_TOPMOST, pr.left, topY, lw, sh, SWP_NOACTIVATE | showFlag);
+    if (!g_freshOpen) InvalidateRect(g_btnLeft, nullptr, FALSE);
 }
 
 // ── Paint helper: draw a button row ─────────────────────────────
@@ -2534,7 +2548,8 @@ static int FindParamAtY(int clickY) {
 }
 
 static void BuildLayout() {
-    SendMessage(g_panel, WM_SETREDRAW, FALSE, 0);
+    bool isVisible = IsWindowVisible(g_panel) && !g_freshOpen;
+    if (isVisible) SendMessage(g_panel, WM_SETREDRAW, FALSE, 0);
 
     HDC hdc = GetDC(g_panel);
     SelectObject(hdc, g_font);
@@ -2623,9 +2638,13 @@ static void BuildLayout() {
     }
     g_freshOpen = false;
 
-    SetWindowPos(g_panel, HWND_TOPMOST, g_panelPos.x, g_panelPos.y, panelW, panelH, SWP_NOACTIVATE);
-    SendMessage(g_panel, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(g_panel, nullptr, FALSE);
+    UINT swpFlags = SWP_NOACTIVATE;
+    if (!isVisible) swpFlags |= SWP_NOREDRAW;  // don't paint yet — fade handles it
+    SetWindowPos(g_panel, HWND_TOPMOST, g_panelPos.x, g_panelPos.y, panelW, panelH, swpFlags);
+    if (isVisible) {
+        SendMessage(g_panel, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(g_panel, nullptr, FALSE);
+    }
     PositionBtnStrips();
 }
 
@@ -2905,10 +2924,11 @@ static void PositionFavStrip() {
     int rows = ((int)g_favEdits.size() + cols - 1) / cols;
     int w = 8 + cols * (kFavCellW + kFavGap);
     int h = 8 + rows * (kFavCellH + kFavGap);
+    UINT showFlag = g_freshOpen ? 0 : SWP_SHOWWINDOW;
     SetWindowPos(g_favWnd, HWND_TOPMOST,
         pr.left + (panelW - w) / 2, pr.bottom + kSideGap,
-        w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    InvalidateRect(g_favWnd, nullptr, FALSE);
+        w, h, SWP_NOACTIVATE | showFlag);
+    if (!g_freshOpen) InvalidateRect(g_favWnd, nullptr, FALSE);
 }
 
 static HFONT g_fontTiny = nullptr;
