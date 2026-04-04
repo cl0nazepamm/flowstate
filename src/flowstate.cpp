@@ -15,6 +15,7 @@
 #include <windowsx.h>
 #include "powershader.h"
 #include "modstack.h"
+#include <cmath>
 #include <string>
 #include <vector>
 #include <set>
@@ -101,6 +102,40 @@ static std::wstring MakeParamLabel(const MCHAR* rawName) {
         if (ch == L'_') ch = L' ';
     }
     return label;
+}
+
+static Point3 NormalizeSafe(const Point3& v) {
+    float len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    if (len <= 1.0e-6f) return Point3(0.0f, 0.0f, 1.0f);
+    return v / len;
+}
+
+static bool IntersectRayPlane(const Ray& ray, const Point3& planePoint, const Point3& planeNormal, Point3& hit) {
+    float denom = DotProd(ray.dir, planeNormal);
+    if (std::fabs(denom) <= 1.0e-6f) return false;
+    float t = DotProd(planePoint - ray.p, planeNormal) / denom;
+    if (t < 0.0f) return false;
+    hit = ray.p + ray.dir * t;
+    return true;
+}
+
+static bool GetSelectionAnchor(Interface* ip, Point3& anchor) {
+    if (!ip) return false;
+    int selCount = ip->GetSelNodeCount();
+    if (selCount <= 0) return false;
+
+    anchor = Point3(0.0f, 0.0f, 0.0f);
+    int validCount = 0;
+    TimeValue t = ip->GetTime();
+    for (int i = 0; i < selCount; ++i) {
+        INode* nd = ip->GetSelNode(i);
+        if (!nd) continue;
+        anchor += nd->GetNodeTM(t).GetTrans();
+        ++validCount;
+    }
+    if (validCount <= 0) return false;
+    anchor /= (float)validCount;
+    return true;
 }
 
 // Compatibility fallback for operation settings when live rollout controls are unavailable.
@@ -447,6 +482,12 @@ bool IsPowerParamsQuickModifier(const wchar_t* internalName) {
 
 // XButton1 dynamic assignment — two slots: vertical (V) and horizontal (H)
 // Keyed per base-object class so each object type remembers its own assignments
+struct XB1ParamTarget {
+    IParamBlock2* pb = nullptr;
+    ParamID pid = 0;
+    ParamType2 type = (ParamType2)0;
+};
+
 struct XB1Slot {
     std::wstring key;
     std::wstring label;
@@ -455,8 +496,9 @@ struct XB1Slot {
     ParamType2 type = (ParamType2)0;
     std::wstring msPath;
     int spIdx = -1;
+    std::vector<XB1ParamTarget> targets;
     float displayVal = 0.f; // tracked value for OSD display
-    void Clear() { key.clear(); label.clear(); pb=nullptr; pid=0; type=(ParamType2)0; msPath.clear(); spIdx=-1; displayVal=0.f; }
+    void Clear() { key.clear(); label.clear(); pb=nullptr; pid=0; type=(ParamType2)0; msPath.clear(); spIdx=-1; targets.clear(); displayVal=0.f; }
     bool Active() const { return !key.empty(); }
 };
 struct XB1Pair { std::wstring vKey, hKey; };
@@ -708,6 +750,11 @@ static std::wstring FmtFloat(float v) {
 
 static std::wstring ReadSlotValue(const XB1Slot& slot) {
     if (!slot.Active()) return {};
+    if (!slot.targets.empty()) {
+        if (slot.type == TYPE_BOOL) return slot.displayVal >= 0.5f ? L"On" : L"Off";
+        if (!IsFloat(slot.type)) return std::to_wstring((int)slot.displayVal);
+        return FmtFloat(slot.displayVal);
+    }
     Interface* ip = GetCOREInterface();
     TimeValue t = ip ? ip->GetTime() : 0;
     if (slot.pb) {
@@ -993,6 +1040,10 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     static int   s_lastMouseY  = 0;
     static float s_dragFloat   = 0;
     static bool  s_xb1Dragging = false;
+    static Point3 s_dragPlanePoint(0.0f, 0.0f, 0.0f);
+    static Point3 s_dragPlaneNormal(0.0f, 0.0f, 1.0f);
+    static Point3 s_dragWorldPoint(0.0f, 0.0f, 0.0f);
+    static HWND   s_dragViewHwnd = nullptr;
 
     // XButton1 assigned param drag — uses cached data, works with panel closed
     if (s_xb1Dragging && wp == WM_MOUSEMOVE && (g_xb1V.Active() || g_xb1H.Active())) {
@@ -1005,50 +1056,56 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
         Interface* ip = GetCOREInterface();
         TimeValue t = ip ? ip->GetTime() : 0;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-        bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool alt   = (GetKeyState(VK_MENU) & 0x8000) != 0;
         bool changed = false;
 
         auto adjustSlot = [&](XB1Slot& slot, int delta) {
             if (!slot.Active() || delta == 0) return;
             float step = (float)delta;
-            int selCount = ip ? ip->GetSelNodeCount() : 0;
 
             if (slot.pb) {
-                // PB2 — resolve and adjust on ALL selected nodes
-                for (int ni = 0; ni < selCount; ni++) {
-                    INode* nd = ip->GetSelNode(ni);
-                    if (!nd) continue;
-                    IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt = (ParamType2)0;
-                    if (!FindParam(nd, slot.key, pb, pid, pt)) continue;
+                // PB2 — targets are resolved once on drag start.
+                bool tracked = false;
+                for (const auto& target : slot.targets) {
+                    IParamBlock2* pb = target.pb;
+                    ParamID pid = target.pid;
+                    ParamType2 pt = target.type;
+                    if (!pb) continue;
                     if (IsFloat(pt)) {
                         float cur = pb->GetFloat(pid, t);
                         float a = cur<0?-cur:cur;
                         // Proportional: ~1% of value per pixel, min 0.001
                         float sc = a > 0.001f ? a * 0.01f : 0.001f;
-                        if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
-                        pb->SetValue(pid, t, cur + step * sc);
+                        if (shift) sc *= 10.0f; if (alt) sc *= 0.1f;
+                        float next = cur + step * sc;
+                        pb->SetValue(pid, t, next);
+                        if (!tracked) { slot.displayVal = next; tracked = true; }
                     } else if (pt == TYPE_BOOL) {
-                        pb->SetValue(pid, t, pb->GetInt(pid, t) ? 0 : 1);
+                        int next = pb->GetInt(pid, t) ? 0 : 1;
+                        pb->SetValue(pid, t, next);
+                        if (!tracked) { slot.displayVal = (float)next; tracked = true; }
                     } else {
                         // Ints: 1 per 3 pixels
                         int cur = pb->GetInt(pid, t);
                         int s = delta / 3;
                         if (s == 0) s = delta > 0 ? 1 : -1;
                         if (shift) s *= 10;
-                        pb->SetValue(pid, t, cur + s);
+                        int next = cur + s;
+                        pb->SetValue(pid, t, next);
+                        if (!tracked) { slot.displayVal = (float)next; tracked = true; }
                     }
                 }
             } else if (slot.spIdx >= 0) {
                 float a = g_splineVals[slot.spIdx]<0?-g_splineVals[slot.spIdx]:g_splineVals[slot.spIdx];
                 float sc = a > 0.001f ? a * 0.01f : 0.001f;
-                if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
+                if (shift) sc *= 10.0f; if (alt) sc *= 0.1f;
                 g_splineVals[slot.spIdx] += step * sc;
                 slot.displayVal = g_splineVals[slot.spIdx];
             } else {
                 // PB1 — loop all selected objects via MaxScript
                 float a = slot.displayVal<0?-slot.displayVal:slot.displayVal;
                 float sc = a > 0.001f ? a * 0.01f : 0.001f;
-                if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
+                if (shift) sc *= 10.0f; if (alt) sc *= 0.1f;
                 float inc = step * sc;
                 slot.displayVal += inc;
                 size_t sep = slot.key.find(L':');
@@ -1086,6 +1143,8 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     }
     if (s_xb1Dragging && wp == WM_XBUTTONUP) {
         s_xb1Dragging = false;
+        g_xb1V.targets.clear();
+        g_xb1H.targets.clear();
         theHold.Accept(_T("XB1 Drag"));
         HideDragTip();
         return 1;
@@ -1101,21 +1160,34 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
         Interface* ip = GetCOREInterface();
 
         if (s_dragMode == DRAG_SCREEN && ip && ip->GetSelNodeCount() > 0 && (dx != 0 || dy != 0)) {
-            // Screen-space grab via MaxScript — handles perspective, ortho,
-            // object mode, and sub-object mode (verts/edges/faces) correctly
+            // Explicit view-plane drag: map the cursor to rays and intersect
+            // a plane facing the camera, then move by the resulting world delta.
+            // This avoids coordsys-screen axis remapping entirely.
             ViewExp& vpt = ip->GetActiveViewExp();
-            float screenH = (float)vpt.getGW()->getWinSizeY();
-            float dist = vpt.GetFocalDist();
-            float fov = vpt.GetFOV();
-            // For ortho views FOV encodes zoom, for perspective it's the angle
-            float worldPerPixel = (fov > 0.001f)
-                ? (2.0f * dist * tanf(fov * 0.5f)) / screenH
-                : dist / screenH;  // fallback for near-zero FOV
-            float wx = (float)dx * worldPerPixel;
-            float wy = (float)(-dy) * worldPerPixel;
+            HWND viewHwnd = s_dragViewHwnd ? s_dragViewHwnd : vpt.GetHWnd();
+            if (!viewHwnd) return 1;
+
+            POINT clientPt = ms2->pt;
+            ScreenToClient(viewHwnd, &clientPt);
+
+            Ray ray;
+            vpt.MapScreenToWorldRay((float)clientPt.x, (float)clientPt.y, ray);
+
+            Point3 hit;
+            if (!IntersectRayPlane(ray, s_dragPlanePoint, s_dragPlaneNormal, hit))
+                return 1;
+
+            Point3 delta = hit - s_dragWorldPoint;
+            s_dragWorldPoint = hit;
+            if (std::fabs(delta.x) <= 1.0e-6f &&
+                std::fabs(delta.y) <= 1.0e-6f &&
+                std::fabs(delta.z) <= 1.0e-6f)
+                return 1;
+
             wchar_t script[256];
             swprintf(script, 256,
-                L"in coordsys screen move selection [%f, %f, 0]", wx, wy);
+                L"in coordsys world move selection [%f, %f, %f]",
+                delta.x, delta.y, delta.z);
             ExecuteMAXScriptScript(script, MAXScript::ScriptSource::Dynamic);
             ip->RedrawViews(ip->GetTime());
         }
@@ -1230,6 +1302,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                     auto resolveSlot = [](XB1Slot& slot) {
                         if (!slot.Active()) return;
                         slot.pb = nullptr; slot.spIdx = -1;
+                        slot.targets.clear();
                         slot.msPath.clear(); slot.type = (ParamType2)TYPE_FLOAT;
                         // Search g_edits if panel is open
                         for (auto& ge : g_edits) {
@@ -1272,8 +1345,30 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                             slot.msPath = L"$.baseObject";
                         }
                     };
+                    auto buildDragTargets = [](XB1Slot& slot) {
+                        slot.targets.clear();
+                        if (!slot.Active() || !slot.pb) return;
+                        Interface* ip2 = GetCOREInterface();
+                        if (!ip2) return;
+                        int selCount = ip2->GetSelNodeCount();
+                        slot.targets.reserve(selCount > 0 ? selCount : 1);
+                        for (int ni = 0; ni < selCount; ++ni) {
+                            INode* nd = ip2->GetSelNode(ni);
+                            if (!nd) continue;
+                            IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt = (ParamType2)0;
+                            if (FindParam(nd, slot.key, pb, pid, pt))
+                                slot.targets.push_back({ pb, pid, pt });
+                        }
+                        if (slot.targets.empty())
+                            slot.targets.push_back({ slot.pb, slot.pid, slot.type });
+                        slot.pb = slot.targets[0].pb;
+                        slot.pid = slot.targets[0].pid;
+                        slot.type = slot.targets[0].type;
+                    };
                     resolveSlot(g_xb1V);
                     resolveSlot(g_xb1H);
+                    buildDragTargets(g_xb1V);
+                    buildDragTargets(g_xb1H);
                     // Read initial PB1 values (one-time MaxScript call)
                     auto initDisplayVal = [](XB1Slot& slot) {
                         if (!slot.Active()) return;
@@ -1309,7 +1404,25 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
 
                 // Bare XButton1 = screen space grab
                 if (!ctrl && !shift && !alt && ip && ip->GetSelNodeCount() > 0) {
+                    ViewExp& vpt = ip->GetActiveViewExp();
+                    HWND viewHwnd = vpt.GetHWnd();
+                    Point3 anchor;
+                    if (!viewHwnd || !GetSelectionAnchor(ip, anchor))
+                        return 0;
+
+                    POINT clientPt = ((MOUSEHOOKSTRUCT*)lp)->pt;
+                    ScreenToClient(viewHwnd, &clientPt);
+
+                    Ray ray;
+                    vpt.MapScreenToWorldRay((float)clientPt.x, (float)clientPt.y, ray);
+
+                    s_dragPlanePoint = anchor;
+                    s_dragPlaneNormal = NormalizeSafe(ray.dir);
+                    if (!IntersectRayPlane(ray, s_dragPlanePoint, s_dragPlaneNormal, s_dragWorldPoint))
+                        return 0;
+
                     s_dragMode = DRAG_SCREEN;
+                    s_dragViewHwnd = viewHwnd;
                     s_lastMouseX = ((MOUSEHOOKSTRUCT*)lp)->pt.x;
                     s_lastMouseY = ((MOUSEHOOKSTRUCT*)lp)->pt.y;
                     theHold.Begin();
@@ -1321,6 +1434,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             if (wp == WM_XBUTTONUP) {
                 if (s_dragMode == DRAG_SCREEN) {
                     s_dragMode = DRAG_NONE;
+                    s_dragViewHwnd = nullptr;
                     theHold.Accept(_T("Screen Grab"));
                     Interface* ip2 = GetCOREInterface();
                     if (ip2) ip2->RedrawViews(ip2->GetTime());
@@ -1328,6 +1442,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                 }
                 if (s_dragMode != DRAG_NONE) {
                     s_dragMode = DRAG_NONE;
+                    s_dragViewHwnd = nullptr;
                     return 1;
                 }
             }
