@@ -27,16 +27,23 @@ if not exist "%NATIVE_DIR%build\CMakeCache.txt" (
 %CMAKE% --build "%NATIVE_DIR%build" --config Release
 if %ERRORLEVEL% NEQ 0 goto :fail
 
-:: ── Deploy ──────────────────────────────────────────────────────
-echo [3/4] Deploying...
-copy /Y "%NATIVE_DIR%build\Release\PowerParams.gup" "%MAX_PLUGINS%\PowerParams.gup" >nul
+:: ── Deploy GUP ──────────────────────────────────────────────────
+echo [3/5] Deploying GUP...
+copy /Y "%NATIVE_DIR%build\Release\FlowState.gup" "%MAX_PLUGINS%\FlowState.gup" >nul
 if %ERRORLEVEL% NEQ 0 (
     echo Deploy failed - need admin. Elevating...
-    powershell -Command "Start-Process cmd -ArgumentList '/c copy /Y \"%NATIVE_DIR%build\Release\PowerParams.gup\" \"%MAX_PLUGINS%\PowerParams.gup\"' -Verb RunAs -Wait"
+    powershell -Command "Start-Process cmd -ArgumentList '/c copy /Y \"%NATIVE_DIR%build\Release\FlowState.gup\" \"%MAX_PLUGINS%\FlowState.gup\"' -Verb RunAs -Wait"
+)
+
+:: ── Deploy MCR ─────────────────────────────────────────────────
+echo [4/5] Deploying config macro...
+set MCR_DST=%LOCALAPPDATA%\Autodesk\3dsMax\2026 - 64bit\ENU\usermacros\CloneTools-FlowState_Config.mcr
+if exist "%NATIVE_DIR%macros\CloneTools-FlowState_Config.mcr" (
+    copy /Y "%NATIVE_DIR%macros\CloneTools-FlowState_Config.mcr" "%MCR_DST%" >nul
 )
 
 :: ── Relaunch ────────────────────────────────────────────────────
-echo [4/4] Launching 3ds Max...
+echo [5/5] Launching 3ds Max...
 if "%SCENE%"=="" (
     start "" %MAX_EXE%
 ) else (

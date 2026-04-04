@@ -18,7 +18,7 @@ cd /d "%~dp0"
 set NATIVE_DIR=%~dp0
 set CMAKE="C:\Program Files\CMake\bin\cmake.exe"
 
-:: Configure if needed
+:: Configure (always reconfigure to pick up name changes)
 if not exist "%NATIVE_DIR%build\CMakeCache.txt" (
     echo [1/3] Configuring...
     %CMAKE% -B "%NATIVE_DIR%build" -G "Visual Studio 17 2022" -A x64 "%NATIVE_DIR%"
@@ -35,17 +35,27 @@ for /f "tokens=2 delims==" %%a in ('findstr "PLUGIN_NAME:INTERNAL" "%NATIVE_DIR%
 for /f "tokens=2 delims==" %%a in ('findstr "PLUGIN_TYPE:INTERNAL" "%NATIVE_DIR%build\CMakeCache.txt"') do set PTYPE=%%a
 
 :: Fallback
-if "%PNAME%"=="" set PNAME=PowerParams
+if "%PNAME%"=="" set PNAME=FlowState
 if "%PTYPE%"=="" set PTYPE=gup
 
 set PLUGIN_FILE=%PNAME%.%PTYPE%
 set PLUGIN_SRC=%NATIVE_DIR%build\Release\%PLUGIN_FILE%
 set PLUGIN_DST=C:\Program Files\Autodesk\3ds Max 2026\plugins\%PLUGIN_FILE%
 
-:: Deploy
-echo [3/3] Deploying %PLUGIN_FILE% to 3ds Max plugins...
+:: Deploy GUP
+echo [3/4] Deploying %PLUGIN_FILE% to 3ds Max plugins...
 copy /Y "%PLUGIN_SRC%" "%PLUGIN_DST%"
 if %ERRORLEVEL% NEQ 0 goto :fail
+
+:: Deploy MCR
+set MCR_SRC=%NATIVE_DIR%macros\CloneTools-FlowState_Config.mcr
+set MCR_DST=%LOCALAPPDATA%\Autodesk\3dsMax\2026 - 64bit\ENU\usermacros\CloneTools-FlowState_Config.mcr
+echo [4/4] Deploying config macro...
+if exist "%MCR_SRC%" (
+    copy /Y "%MCR_SRC%" "%MCR_DST%"
+) else (
+    echo WARNING: MCR not found at %MCR_SRC%
+)
 
 echo.
 echo === Done! Restart 3ds Max to load %PLUGIN_FILE% ===
