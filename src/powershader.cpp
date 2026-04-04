@@ -1700,6 +1700,34 @@ private:
         rebuildPending_ = false;
     }
 
+    // Build a map of OSL shader name → folder category
+    void ScanOSLFolder(const std::wstring& dir, const std::wstring& category,
+                       std::map<std::wstring, std::wstring>& nameToCategory)
+    {
+        WIN32_FIND_DATAW fd;
+        HANDLE hFind = FindFirstFileW((dir + L"\\*.osl").c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                std::wstring filename(fd.cFileName);
+                size_t dot = filename.rfind(L'.');
+                std::wstring name = (dot != std::wstring::npos) ? filename.substr(0, dot) : filename;
+                std::wstring norm = Normalize(name, true);
+                if (!norm.empty()) nameToCategory[norm] = category;
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
+        hFind = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                if (fd.cFileName[0] == L'.') continue;
+                ScanOSLFolder(dir + L"\\" + fd.cFileName, std::wstring(fd.cFileName), nameToCategory);
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        }
+    }
+
     void EnsureClassCache()
     {
         if (classCacheReady_) return;
@@ -1708,6 +1736,60 @@ private:
         classItems_.reserve(1024);
         AddClassList(MATERIAL_CLASS_ID, ItemKind::ClassMaterial, classItems_);
         AddClassList(TEXMAP_CLASS_ID, ItemKind::ClassMap, classItems_);
+
+        // Scan OSL folders to build name→category map, then patch existing items
+        {
+            std::map<std::wstring, std::wstring> oslCategories;
+
+            auto scanIfExists = [&](const std::wstring& dir, const std::wstring& cat) {
+                if (GetFileAttributesW(dir.c_str()) != INVALID_FILE_ATTRIBUTES)
+                    ScanOSLFolder(dir, cat, oslCategories);
+            };
+
+            Interface* ip = GetCOREInterface();
+            if (ip) {
+                MSTR maxRoot = ip->GetDir(APP_MAX_SYS_ROOT_DIR);
+                scanIfExists(std::wstring(maxRoot.data()) + L"\\OSL", L"OSL");
+            }
+
+            // ApplicationPlugins — scan plugin OSL folders
+            std::wstring appPlugins = L"C:\\ProgramData\\Autodesk\\ApplicationPlugins";
+            WIN32_FIND_DATAW fd;
+            HANDLE h = FindFirstFileW((appPlugins + L"\\*").c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do {
+                    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                    if (fd.cFileName[0] == L'.') continue;
+                    std::wstring plugDir = appPlugins + L"\\" + fd.cFileName + L"\\Contents";
+                    WIN32_FIND_DATAW fd2;
+                    HANDLE h2 = FindFirstFileW((plugDir + L"\\*").c_str(), &fd2);
+                    if (h2 != INVALID_HANDLE_VALUE) {
+                        do {
+                            if (!(fd2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                            if (fd2.cFileName[0] == L'.') continue;
+                            std::wstring oslDir = plugDir + L"\\" + fd2.cFileName + L"\\Contents\\OSL";
+                            scanIfExists(oslDir, std::wstring(fd2.cFileName));
+                        } while (FindNextFileW(h2, &fd2));
+                        FindClose(h2);
+                    }
+                } while (FindNextFileW(h, &fd));
+                FindClose(h);
+            }
+
+            // Patch categories on existing class items
+            if (!oslCategories.empty()) {
+                for (auto& item : classItems_) {
+                    auto it = oslCategories.find(item.normLabel);
+                    if (it != oslCategories.end()) {
+                        item.category = it->second;
+                        // Also add category to search string
+                        item.search = Normalize(
+                            item.label + L" " + it->second + L" OSL", true);
+                    }
+                }
+            }
+        }
+
         std::sort(classItems_.begin(), classItems_.end(),
             [](const Item& a, const Item& b) { return a.label < b.label; });
 
