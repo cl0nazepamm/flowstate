@@ -482,12 +482,6 @@ bool IsPowerParamsQuickModifier(const wchar_t* internalName) {
 
 // XButton1 dynamic assignment — two slots: vertical (V) and horizontal (H)
 // Keyed per base-object class so each object type remembers its own assignments
-struct XB1ParamTarget {
-    IParamBlock2* pb = nullptr;
-    ParamID pid = 0;
-    ParamType2 type = (ParamType2)0;
-};
-
 struct XB1Slot {
     std::wstring key;
     std::wstring label;
@@ -496,9 +490,8 @@ struct XB1Slot {
     ParamType2 type = (ParamType2)0;
     std::wstring msPath;
     int spIdx = -1;
-    std::vector<XB1ParamTarget> targets;
     float displayVal = 0.f; // tracked value for OSD display
-    void Clear() { key.clear(); label.clear(); pb=nullptr; pid=0; type=(ParamType2)0; msPath.clear(); spIdx=-1; targets.clear(); displayVal=0.f; }
+    void Clear() { key.clear(); label.clear(); pb=nullptr; pid=0; type=(ParamType2)0; msPath.clear(); spIdx=-1; displayVal=0.f; }
     bool Active() const { return !key.empty(); }
 };
 struct XB1Pair { std::wstring vKey, hKey; };
@@ -509,6 +502,14 @@ static std::wstring g_xb1Class; // current base class context
 static HWND         g_osdWnd = nullptr;
 static UINT_PTR     g_osdTimer = 0;
 static HWND         g_dragTip = nullptr; // cursor-following value tooltip
+
+// XButton1 keymap — configurable modifier combos
+// Combo indices: 0=bare, 1=Shift, 2=Ctrl, 3=Ctrl+Shift, 4=Ctrl+Alt+Shift, -1=disabled (config UI "Off")
+static int g_kmGrab    = 0;  // screen space grab
+static int g_kmTime    = 1;  // time slider
+static int g_kmSlider  = 2;  // param slider drag
+static int g_kmOpacity = 3;  // opacity slider
+static int g_kmClear   = 4;  // clear slider assignments
 
 // LoadModuleFlags is now handled by LoadSettings() — reads [config] section from FlowState.cfg
 static void LoadModuleFlags() {
@@ -750,11 +751,6 @@ static std::wstring FmtFloat(float v) {
 
 static std::wstring ReadSlotValue(const XB1Slot& slot) {
     if (!slot.Active()) return {};
-    if (!slot.targets.empty()) {
-        if (slot.type == TYPE_BOOL) return slot.displayVal >= 0.5f ? L"On" : L"Off";
-        if (!IsFloat(slot.type)) return std::to_wstring((int)slot.displayVal);
-        return FmtFloat(slot.displayVal);
-    }
     Interface* ip = GetCOREInterface();
     TimeValue t = ip ? ip->GetTime() : 0;
     if (slot.pb) {
@@ -873,6 +869,12 @@ static void SaveSettings() {
         if (pair.vKey.empty() && pair.hKey.empty()) continue;
         fwprintf(f, L"XB1:%s=%s|%s\n", cls.c_str(), pair.vKey.c_str(), pair.hKey.c_str());
     }
+    // Keymap (only write non-defaults)
+    if (g_kmGrab != 0)    fwprintf(f, L"Key:grab=%d\n", g_kmGrab);
+    if (g_kmTime != 1)    fwprintf(f, L"Key:time=%d\n", g_kmTime);
+    if (g_kmSlider != 2)  fwprintf(f, L"Key:slider=%d\n", g_kmSlider);
+    if (g_kmOpacity != 3) fwprintf(f, L"Key:opacity=%d\n", g_kmOpacity);
+    if (g_kmClear != 4)   fwprintf(f, L"Key:clear=%d\n", g_kmClear);
 
     // [params] — collapsed, hidden, favorites, quick mods
     fwprintf(f, L"[params]\n");
@@ -895,6 +897,7 @@ void FlowState_SaveSettings() { SaveSettings(); }
 static void LoadSettings() {
     g_collapsed.clear(); g_hidden.clear(); g_favorites.clear(); g_quickMods.clear();
     PowerShader::ClearPersistent();
+    g_kmGrab = 0; g_kmTime = 1; g_kmSlider = 2; g_kmOpacity = 3; g_kmClear = 4;
 
     std::wstring path = GetCfgPath();
     if (path.empty()) { UpdateTheme(false); PowerShader::ReloadTheme(false); ModStack::ReloadTheme(false); return; }
@@ -957,6 +960,20 @@ static void LoadSettings() {
                     size_t pipe = val.find(L'|');
                     if (pipe != std::wstring::npos)
                         g_xb1Map[cls] = { val.substr(0, pipe), val.substr(pipe + 1) };
+                }
+            }
+            if (l.compare(0, 4, L"Key:") == 0) {
+                size_t eq = l.find(L'=', 4);
+                if (eq != std::wstring::npos) {
+                    std::wstring act = l.substr(4, eq - 4);
+                    int val = _wtoi(l.substr(eq + 1).c_str());
+                    if (val >= -1 && val <= 4) {
+                        if (act == L"grab")    g_kmGrab = val;
+                        if (act == L"time")    g_kmTime = val;
+                        if (act == L"slider")  g_kmSlider = val;
+                        if (act == L"opacity") g_kmOpacity = val;
+                        if (act == L"clear")   g_kmClear = val;
+                    }
                 }
             }
         }
@@ -1064,35 +1081,29 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             float step = (float)delta;
 
             if (slot.pb) {
-                // PB2 — targets are resolved once on drag start.
-                bool tracked = false;
-                for (const auto& target : slot.targets) {
-                    IParamBlock2* pb = target.pb;
-                    ParamID pid = target.pid;
-                    ParamType2 pt = target.type;
-                    if (!pb) continue;
+                // PB2 — resolve and adjust on ALL selected nodes
+                int selCount = ip ? ip->GetSelNodeCount() : 0;
+                for (int ni = 0; ni < selCount; ni++) {
+                    INode* nd = ip->GetSelNode(ni);
+                    if (!nd) continue;
+                    IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt = (ParamType2)0;
+                    if (!FindParam(nd, slot.key, pb, pid, pt)) continue;
                     if (IsFloat(pt)) {
                         float cur = pb->GetFloat(pid, t);
                         float a = cur<0?-cur:cur;
                         // Proportional: ~1% of value per pixel, min 0.001
                         float sc = a > 0.001f ? a * 0.01f : 0.001f;
                         if (shift) sc *= 10.0f; if (alt) sc *= 0.1f;
-                        float next = cur + step * sc;
-                        pb->SetValue(pid, t, next);
-                        if (!tracked) { slot.displayVal = next; tracked = true; }
+                        pb->SetValue(pid, t, cur + step * sc);
                     } else if (pt == TYPE_BOOL) {
-                        int next = pb->GetInt(pid, t) ? 0 : 1;
-                        pb->SetValue(pid, t, next);
-                        if (!tracked) { slot.displayVal = (float)next; tracked = true; }
+                        pb->SetValue(pid, t, pb->GetInt(pid, t) ? 0 : 1);
                     } else {
                         // Ints: 1 per 3 pixels
                         int cur = pb->GetInt(pid, t);
                         int s = delta / 3;
                         if (s == 0) s = delta > 0 ? 1 : -1;
                         if (shift) s *= 10;
-                        int next = cur + s;
-                        pb->SetValue(pid, t, next);
-                        if (!tracked) { slot.displayVal = (float)next; tracked = true; }
+                        pb->SetValue(pid, t, cur + s);
                     }
                 }
             } else if (slot.spIdx >= 0) {
@@ -1143,8 +1154,6 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     }
     if (s_xb1Dragging && wp == WM_XBUTTONUP) {
         s_xb1Dragging = false;
-        g_xb1V.targets.clear();
-        g_xb1H.targets.clear();
         theHold.Accept(_T("XB1 Drag"));
         HideDragTip();
         return 1;
@@ -1218,12 +1227,8 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     if (wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP) {
         WORD xbutton = HIWORD(reinterpret_cast<MOUSEHOOKSTRUCTEX*>(lp)->mouseData);
 
-        // XButton1 combos:
-        //   bare        = screen space grab
-        //   Shift       = time slider
-        //   Ctrl        = param slider drag (assigned fav)
-        //   Ctrl+Shift  = opacity slider
-        //   Ctrl+Alt+Shift = clear all slider assignments
+        // XButton1 combos — configurable via g_km* keymap globals
+        // Combo indices: 0=bare, 1=Shift, 2=Ctrl, 3=Ctrl+Shift, 4=Ctrl+Alt+Shift
         if (xbutton == XBUTTON1) {
             if (wp == WM_XBUTTONDOWN) {
                 bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -1231,8 +1236,17 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                 bool alt   = (GetKeyState(VK_MENU) & 0x8000) != 0;
                 Interface* ip = GetCOREInterface();
 
-                // Ctrl+Alt+Shift+XButton1 = clear all slider assignments
-                if (ctrl && alt && shift) {
+                // Resolve modifier combo index
+                int combo;
+                if (ctrl && alt && shift)          combo = 4;
+                else if (ctrl && shift && !alt)    combo = 3;
+                else if (ctrl && !shift && !alt)   combo = 2;
+                else if (shift && !ctrl && !alt)   combo = 1;
+                else if (!ctrl && !shift && !alt)  combo = 0;
+                else                               return 0; // unmapped combo
+
+                // Clear all slider assignments
+                if (combo == g_kmClear) {
                     SyncXB1ToSelection();
                     if (g_xb1V.Active() || g_xb1H.Active()) {
                         g_xb1V.Clear(); g_xb1H.Clear();
@@ -1242,16 +1256,16 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                     return 1;
                 }
 
-                // Shift+XButton1 = time slider
-                if (shift && !ctrl && ip) {
+                // Time slider
+                if (combo == g_kmTime && ip) {
                     s_dragMode = DRAG_TIME;
                     s_lastMouseX = ((MOUSEHOOKSTRUCT*)lp)->pt.x;
                     s_dragFloat = (float)ip->GetTime() / GetTicksPerFrame();
                     return 1;
                 }
 
-                // Ctrl+Shift+XButton1 = opacity slider
-                if (ctrl && shift && ip && ip->GetSelNodeCount() > 0) {
+                // Opacity slider
+                if (combo == g_kmOpacity && ip && ip->GetSelNodeCount() > 0) {
                     s_dragMode = DRAG_OPACITY;
                     s_lastMouseX = ((MOUSEHOOKSTRUCT*)lp)->pt.x;
                     s_dragFloat = ip->GetSelNode(0)->GetVisibility(ip->GetTime());
@@ -1259,151 +1273,119 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                     return 1;
                 }
 
-                // Ctrl+XButton1 = assigned param drag (fav sliders)
-                if (ctrl && !shift) {
-                    // Dynamic assignment or drag assigned param
+                // Param slider drag (fav sliders)
+                if (combo == g_kmSlider) {
+                    // Dynamic assignment — check if cursor is over a favorite edit
                     if (g_open && g_favWnd && IsWindowVisible(g_favWnd)) {
-                    // Check if cursor is over a favorite edit
-                    POINT cp = ((MOUSEHOOKSTRUCT*)lp)->pt;
-                    for (int fi = 0; fi < (int)g_favEdits.size(); fi++) {
-                        if (!g_favEdits[fi].hwnd) continue;
-                        RECT fr; GetWindowRect(g_favEdits[fi].hwnd, &fr);
-                        fr.top -= 11; // kFavLabelH
-                        if (PtInRect(&fr, cp)) {
-                            const std::wstring& fkey = g_favEdits[fi].key;
-                            const std::wstring& flbl = g_favEdits[fi].label;
-                            // Assignment only stores keys — PB resolved at drag start
-                            SyncXB1ToSelection();
-                            if (g_xb1V.key == fkey) {
-                                g_xb1V.Clear();
-                                ShowOSD(L"\u2195 OFF" + (g_xb1H.Active() ? (L"  \u2194 " + g_xb1H.label) : L""));
-                            } else if (g_xb1H.key == fkey) {
-                                g_xb1H.Clear();
-                                ShowOSD((g_xb1V.Active() ? (L"\u2195 " + g_xb1V.label + L"  ") : L"") + L"\u2194 OFF");
-                            } else if (!g_xb1V.Active()) {
-                                g_xb1V.key = fkey; g_xb1V.label = flbl;
-                                ShowOSD(L"\u2195 " + flbl + (g_xb1H.Active() ? (L"  \u2194 " + g_xb1H.label) : L""));
-                            } else if (!g_xb1H.Active()) {
-                                g_xb1H.key = fkey; g_xb1H.label = flbl;
-                                ShowOSD(L"\u2195 " + g_xb1V.label + L"  \u2194 " + flbl);
-                            } else {
-                                g_xb1H.key = fkey; g_xb1H.label = flbl;
-                                ShowOSD(L"\u2195 " + g_xb1V.label + L"  \u2194 " + flbl);
+                        POINT cp = ((MOUSEHOOKSTRUCT*)lp)->pt;
+                        for (int fi = 0; fi < (int)g_favEdits.size(); fi++) {
+                            if (!g_favEdits[fi].hwnd) continue;
+                            RECT fr; GetWindowRect(g_favEdits[fi].hwnd, &fr);
+                            fr.top -= 11; // kFavLabelH
+                            if (PtInRect(&fr, cp)) {
+                                const std::wstring& fkey = g_favEdits[fi].key;
+                                const std::wstring& flbl = g_favEdits[fi].label;
+                                SyncXB1ToSelection();
+                                if (g_xb1V.key == fkey) {
+                                    g_xb1V.Clear();
+                                    ShowOSD(L"\u2195 OFF" + (g_xb1H.Active() ? (L"  \u2194 " + g_xb1H.label) : L""));
+                                } else if (g_xb1H.key == fkey) {
+                                    g_xb1H.Clear();
+                                    ShowOSD((g_xb1V.Active() ? (L"\u2195 " + g_xb1V.label + L"  ") : L"") + L"\u2194 OFF");
+                                } else if (!g_xb1V.Active()) {
+                                    g_xb1V.key = fkey; g_xb1V.label = flbl;
+                                    ShowOSD(L"\u2195 " + flbl + (g_xb1H.Active() ? (L"  \u2194 " + g_xb1H.label) : L""));
+                                } else if (!g_xb1H.Active()) {
+                                    g_xb1H.key = fkey; g_xb1H.label = flbl;
+                                    ShowOSD(L"\u2195 " + g_xb1V.label + L"  \u2194 " + flbl);
+                                } else {
+                                    g_xb1H.key = fkey; g_xb1H.label = flbl;
+                                    ShowOSD(L"\u2195 " + g_xb1V.label + L"  \u2194 " + flbl);
+                                }
+                                SaveXB1Assignment();
+                                return 1;
                             }
-                            SaveXB1Assignment();
+                        }
+                    }
+                    // Drag with existing assignment
+                    SyncXB1ToSelection();
+                    if (g_xb1V.Active() || g_xb1H.Active()) {
+                        auto resolveSlot = [](XB1Slot& slot) {
+                            if (!slot.Active()) return;
+                            slot.pb = nullptr; slot.spIdx = -1;
+                            slot.msPath.clear(); slot.type = (ParamType2)TYPE_FLOAT;
+                            for (auto& ge : g_edits) {
+                                if (ge.key == slot.key) {
+                                    slot.pb = ge.pb; slot.pid = ge.id;
+                                    slot.type = ge.type; slot.msPath = ge.msPath;
+                                    if (!ge.pb && (int)ge.id >= kSpSentinel && (int)ge.id < kSpSentinel + kSpCount)
+                                        slot.spIdx = (int)ge.id - kSpSentinel;
+                                    return;
+                                }
+                            }
+                            Interface* ip2 = GetCOREInterface();
+                            if (!ip2 || ip2->GetSelNodeCount() == 0) { slot.Clear(); return; }
+                            INode* nd = ip2->GetSelNode(0);
+                            IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt = (ParamType2)0;
+                            if (FindParam(nd, slot.key, pb, pid, pt)) {
+                                slot.pb = pb; slot.pid = pid; slot.type = pt;
+                            } else {
+                                size_t sep = slot.key.find(L':');
+                                if (sep == std::wstring::npos) { slot.Clear(); return; }
+                                std::wstring cls = slot.key.substr(0, sep);
+                                Object* walk = nd->GetObjectRef();
+                                while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+                                    IDerivedObject* dv = static_cast<IDerivedObject*>(walk);
+                                    for (int mi = 0; mi < dv->NumModifiers(); mi++) {
+                                        Modifier* mod = dv->GetModifier(mi);
+                                        if (!mod) continue;
+                                        MSTR mcn; mod->GetClassName(mcn, false);
+                                        if (mcn.data() && _wcsicmp(mcn.data(), cls.c_str()) == 0) {
+                                            slot.msPath = L"$.modifiers[" + std::to_wstring(mi+1) + L"]";
+                                            return;
+                                        }
+                                    }
+                                    walk = dv->GetObjRef();
+                                }
+                                slot.msPath = L"$.baseObject";
+                            }
+                        };
+                        resolveSlot(g_xb1V);
+                        resolveSlot(g_xb1H);
+                        auto initDisplayVal = [](XB1Slot& slot) {
+                            if (!slot.Active()) return;
+                            if (slot.pb) {
+                                Interface* ip3 = GetCOREInterface();
+                                TimeValue t3 = ip3 ? ip3->GetTime() : 0;
+                                slot.displayVal = IsFloat(slot.type) ? slot.pb->GetFloat(slot.pid, t3) : (float)slot.pb->GetInt(slot.pid, t3);
+                            } else if (slot.spIdx >= 0) {
+                                slot.displayVal = g_splineVals[slot.spIdx];
+                            } else {
+                                size_t sep = slot.key.find(L':');
+                                if (sep != std::wstring::npos) {
+                                    std::wstring prop = slot.key.substr(sep + 1);
+                                    std::wstring path = slot.msPath.empty() ? L"$.baseObject" : slot.msPath;
+                                    std::wstring s = L"try((getProperty " + path + L" #" + prop + L") as string)catch(\"0\")";
+                                    FPValue r; ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &r);
+                                    if (r.type == TYPE_STRING && r.s) slot.displayVal = (float)_wtof(r.s);
+                                }
+                            }
+                        };
+                        initDisplayVal(g_xb1V);
+                        initDisplayVal(g_xb1H);
+                        if (g_xb1V.Active() || g_xb1H.Active()) {
+                            s_lastMouseX = ((MOUSEHOOKSTRUCT*)lp)->pt.x;
+                            s_lastMouseY = ((MOUSEHOOKSTRUCT*)lp)->pt.y;
+                            s_xb1Dragging = true;
+                            theHold.Begin();
                             return 1;
                         }
                     }
-                }
-                // XButton1 alone with assignment — sync to selection and resolve PB
-                SyncXB1ToSelection();
-                if (g_xb1V.Active() || g_xb1H.Active()) {
-                    // Resolve PB pointers fresh from current selection
-                    auto resolveSlot = [](XB1Slot& slot) {
-                        if (!slot.Active()) return;
-                        slot.pb = nullptr; slot.spIdx = -1;
-                        slot.targets.clear();
-                        slot.msPath.clear(); slot.type = (ParamType2)TYPE_FLOAT;
-                        // Search g_edits if panel is open
-                        for (auto& ge : g_edits) {
-                            if (ge.key == slot.key) {
-                                slot.pb = ge.pb; slot.pid = ge.id;
-                                slot.type = ge.type; slot.msPath = ge.msPath;
-                                if (!ge.pb && (int)ge.id >= kSpSentinel && (int)ge.id < kSpSentinel + kSpCount)
-                                    slot.spIdx = (int)ge.id - kSpSentinel;
-                                return;
-                            }
-                        }
-                        // Panel closed — resolve PB2 from selection via FindParam
-                        Interface* ip2 = GetCOREInterface();
-                        if (!ip2 || ip2->GetSelNodeCount() == 0) { slot.Clear(); return; }
-                        INode* nd = ip2->GetSelNode(0);
-                        IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt = (ParamType2)0;
-                        if (FindParam(nd, slot.key, pb, pid, pt)) {
-                            slot.pb = pb; slot.pid = pid; slot.type = pt;
-                        } else {
-                            // PB1 fallback — use MaxScript path
-                            size_t sep = slot.key.find(L':');
-                            if (sep == std::wstring::npos) { slot.Clear(); return; }
-                            std::wstring cls = slot.key.substr(0, sep);
-                            // Walk modifiers
-                            Object* walk = nd->GetObjectRef();
-                            while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-                                IDerivedObject* dv = static_cast<IDerivedObject*>(walk);
-                                for (int mi = 0; mi < dv->NumModifiers(); mi++) {
-                                    Modifier* mod = dv->GetModifier(mi);
-                                    if (!mod) continue;
-                                    MSTR mcn; mod->GetClassName(mcn, false);
-                                    if (mcn.data() && _wcsicmp(mcn.data(), cls.c_str()) == 0) {
-                                        slot.msPath = L"$.modifiers[" + std::to_wstring(mi+1) + L"]";
-                                        return;
-                                    }
-                                }
-                                walk = dv->GetObjRef();
-                            }
-                            // Base object
-                            slot.msPath = L"$.baseObject";
-                        }
-                    };
-                    auto buildDragTargets = [](XB1Slot& slot) {
-                        slot.targets.clear();
-                        if (!slot.Active() || !slot.pb) return;
-                        Interface* ip2 = GetCOREInterface();
-                        if (!ip2) return;
-                        int selCount = ip2->GetSelNodeCount();
-                        slot.targets.reserve(selCount > 0 ? selCount : 1);
-                        for (int ni = 0; ni < selCount; ++ni) {
-                            INode* nd = ip2->GetSelNode(ni);
-                            if (!nd) continue;
-                            IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt = (ParamType2)0;
-                            if (FindParam(nd, slot.key, pb, pid, pt))
-                                slot.targets.push_back({ pb, pid, pt });
-                        }
-                        if (slot.targets.empty())
-                            slot.targets.push_back({ slot.pb, slot.pid, slot.type });
-                        slot.pb = slot.targets[0].pb;
-                        slot.pid = slot.targets[0].pid;
-                        slot.type = slot.targets[0].type;
-                    };
-                    resolveSlot(g_xb1V);
-                    resolveSlot(g_xb1H);
-                    buildDragTargets(g_xb1V);
-                    buildDragTargets(g_xb1H);
-                    // Read initial PB1 values (one-time MaxScript call)
-                    auto initDisplayVal = [](XB1Slot& slot) {
-                        if (!slot.Active()) return;
-                        if (slot.pb) {
-                            Interface* ip3 = GetCOREInterface();
-                            TimeValue t3 = ip3 ? ip3->GetTime() : 0;
-                            slot.displayVal = IsFloat(slot.type) ? slot.pb->GetFloat(slot.pid, t3) : (float)slot.pb->GetInt(slot.pid, t3);
-                        } else if (slot.spIdx >= 0) {
-                            slot.displayVal = g_splineVals[slot.spIdx];
-                        } else {
-                            size_t sep = slot.key.find(L':');
-                            if (sep != std::wstring::npos) {
-                                std::wstring prop = slot.key.substr(sep + 1);
-                                std::wstring path = slot.msPath.empty() ? L"$.baseObject" : slot.msPath;
-                                std::wstring s = L"try((getProperty " + path + L" #" + prop + L") as string)catch(\"0\")";
-                                FPValue r; ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &r);
-                                if (r.type == TYPE_STRING && r.s) slot.displayVal = (float)_wtof(r.s);
-                            }
-                        }
-                    };
-                    initDisplayVal(g_xb1V);
-                    initDisplayVal(g_xb1H);
-                    if (g_xb1V.Active() || g_xb1H.Active()) {
-                        s_lastMouseX = ((MOUSEHOOKSTRUCT*)lp)->pt.x;
-                        s_lastMouseY = ((MOUSEHOOKSTRUCT*)lp)->pt.y;
-                        s_xb1Dragging = true;
-                        theHold.Begin();
-                        return 1;
-                    }
-                }
                     return 0;
-                } // end ctrl+XB1 param drag
+                } // end param slider
 
-                // Bare XButton1 = screen space grab
-                if (!ctrl && !shift && !alt && ip && ip->GetSelNodeCount() > 0) {
+                // Screen space grab
+                if (combo == g_kmGrab && ip && ip->GetSelNodeCount() > 0) {
                     ViewExp& vpt = ip->GetActiveViewExp();
                     HWND viewHwnd = vpt.GetHWnd();
                     Point3 anchor;

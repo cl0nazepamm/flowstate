@@ -356,7 +356,7 @@ macroscript flowstate_Config
     ) catch()
     logoP.controls.add pic
 
-    local vLbl = mkLabel "v1.1" 0 180 W 18 fObj:fSmall cObj:cDim
+    local vLbl = mkLabel "v1.3" 0 180 W 18 fObj:fSmall cObj:cDim
     vLbl.TextAlign = alC.MiddleCenter
     logoP.controls.add vLbl
     frm.controls.add logoP
@@ -390,31 +390,199 @@ macroscript flowstate_Config
     global flowstate_chkLight = mkCheck "Light Theme" (pad+4) Y (iW-8) chk:false
     frm.controls.add flowstate_chkLight; Y += 34
 
-    -- ── Shortcuts ──
+    -- ── Keymap (XButton1) ──
     frm.controls.add (mkSep pad Y iW); Y += 12
-    frm.controls.add (mkLabel "SHORTCUTS" pad Y iW 18 fObj:fBold cObj:cHead); Y += 24
+    frm.controls.add (mkLabel "KEYMAP  (XButton1)" pad Y iW 18 fObj:fBold cObj:cHead); Y += 24
 
+    -- Modifier labels (index matches C++ combo indices 0-4); shared by keymap UI + save logic
+    global flowstate_kmChoiceLabels = #("(bare)", "Shift", "Ctrl", "Ctrl+Shift", "Ctrl+Alt+Shift")
+    -- Action titles (for labels + duplicate-keymap messages)
+    global flowstate_kmActionNames = #("Screen Grab", "Time Slider", "Param Slider", "Opacity Slider", "Clear Sliders")
+    local actKeys  = #("grab", "time", "slider", "opacity", "clear")
+    local defaults = #(0, 1, 2, 3, 4)
+
+    -- Read current keymap from config
+    fn readKeymap path key default:0 = (
+        local f = openFile path mode:"r"
+        if f == undefined do return default
+        local result = default
+        while not eof f do (
+            local ln = readLine f
+            local tag = "Key:" + key + "="
+            if findString ln tag == 1 do (
+                local n = ln.count - tag.count
+                local v = if n > 0 then (substring ln (tag.count + 1) n) else ""
+                local iv = v as integer
+                if iv != undefined and iv >= -1 and iv <= 4 do result = iv
+            )
+        )
+        close f
+        result
+    )
+
+    -- Modifiers 0..4 at most once each; -1 = Off (multiple rows may be Off). Later duplicate mods -> Off.
+    fn flowstate_normalizeKmSel src = (
+        if src.count != 5 do return src
+        local used = #(false, false, false, false, false)
+        local out = #()
+        for i = 1 to 5 do (
+            local v = src[i]
+            if v < -1 or v > 4 do v = -1
+            if v == -1 then (
+                append out -1
+            ) else (
+                if not used[v + 1] then (
+                    used[v + 1] = true
+                    append out v
+                ) else (
+                    append out -1
+                )
+            )
+        )
+        out
+    )
+
+    -- Keymap menu handlers (must not close over outer locals — MaxScript forbids that).
+    -- slot + choice index are encoded in ToolStripItem.Tag as "slot,jj" (1-based slot).
+    fn flowstate_onKmMenuPick s e = (
+        global flowstate_kmSel
+        global flowstate_kmBtns
+        global flowstate_kmChoiceLabels
+        global flowstate_kmActionNames
+        local raw = ""
+        try (raw = s.Tag as string) catch (return())
+        local parts = filterString raw ","
+        if parts.count < 2 do return()
+        local slot = parts[1] as integer
+        local jj = parts[2] as integer
+        if slot < 1 or slot > flowstate_kmBtns.count do return()
+        if jj < -1 or jj > 4 do return()
+        -- Each modifier 0..4 may only drive one action (Off does not consume a modifier)
+        if jj >= 0 do (
+            for o = 1 to flowstate_kmSel.count do (
+                if o != slot and flowstate_kmSel[o] == jj do (
+                    local otherName = flowstate_kmActionNames[o]
+                    messageBox ("That modifier is already used for:\n\n" + otherName + "\n\nPick another or set a row to Off.") title:"flowstate"
+                    return()
+                )
+            )
+        )
+        flowstate_kmSel[slot] = jj
+        try (
+            local b = flowstate_kmBtns[slot]
+            if jj == -1 then
+                b.Text = "  Off   " + "▼"
+            else
+                b.Text = "  " + flowstate_kmChoiceLabels[jj + 1] + "   " + "▼"
+        ) catch ()
+    )
+    fn flowstate_onKmBtnClick s e = (
+        local m = undefined
+        try (m = s.Tag) catch (return())
+        if m == undefined do return()
+        try (
+            local ptC2 = dotNetClass "System.Drawing.Point"
+            local pt = dotNetObject ptC2 0 s.Height
+            m.Show s pt
+        ) catch ()
+    )
+
+    -- Keymap pickers: ComboBox text/selection often does not paint in 3ds Max's WinForms
+    -- host (gray boxes). Use a flat Button + ContextMenuStrip instead — always readable.
+    fn mkKeyPickBtn x y w labelTxt = (
+        local b = dotNetObject "System.Windows.Forms.Button"
+        b.Location = dotNetObject ptC x y
+        b.Size     = dotNetObject szC w 24
+        b.FlatStyle = flatC.Flat
+        b.FlatAppearance.BorderColor       = cBtnBd
+        b.FlatAppearance.BorderSize        = 1
+        b.FlatAppearance.MouseOverBackColor = cBtnHov
+        b.BackColor = (dotNetClass "System.Drawing.Color").FromArgb 45 45 45
+        b.ForeColor = cText
+        b.Font = dotNetObject fntC "Segoe UI" 8.0 fntS.Regular
+        b.TextAlign = alC.MiddleLeft
+        b.Cursor = curC.Hand
+        b.Text = "  " + labelTxt + "   " + "▼"
+        b
+    )
+
+    fn attachKeyMenu btn slot = (
+        global flowstate_kmChoiceLabels
+        local menu = dotNetObject "System.Windows.Forms.ContextMenuStrip"
+        menu.ShowImageMargin = false
+        menu.BackColor = (dotNetClass "System.Drawing.Color").FromArgb 45 45 45
+        menu.ForeColor = cText
+        for j = 1 to flowstate_kmChoiceLabels.count do (
+            local jj = j - 1
+            local mi = menu.Items.Add flowstate_kmChoiceLabels[j]
+            mi.Tag = (slot as string) + "," + (jj as string)
+            dotNet.addEventHandler mi "Click" flowstate_onKmMenuPick
+        )
+        local miOff = menu.Items.Add "Off"
+        miOff.Tag = (slot as string) + ",-1"
+        dotNet.addEventHandler miOff "Click" flowstate_onKmMenuPick
+        btn.Tag = menu
+        dotNet.addEventHandler btn "Click" flowstate_onKmBtnClick
+        menu
+    )
+
+    global flowstate_kmSel = #()
+    global flowstate_kmBtns = #()
+    global flowstate_kmMenus = #()
+    local lblW = 110
+    local cbW = 140
+    local cbX = pad + lblW + 4
+    for i = 1 to flowstate_kmActionNames.count do (
+        local slot = i
+        local curVal = readKeymap iniPath actKeys[slot] default:defaults[slot]
+        append flowstate_kmSel curVal
+        frm.controls.add (mkLabel flowstate_kmActionNames[slot] (pad+4) (Y+2) lblW 20 fObj:fSmall cObj:cDim)
+        local pickTxt = if curVal == -1 then "Off" else if curVal >= 0 and curVal < flowstate_kmChoiceLabels.count then flowstate_kmChoiceLabels[curVal + 1] else flowstate_kmChoiceLabels[1]
+        local btn = mkKeyPickBtn cbX Y cbW pickTxt
+        local m = attachKeyMenu btn slot
+        frm.controls.add btn
+        append flowstate_kmBtns btn
+        append flowstate_kmMenus m
+        Y += 28
+    )
+    -- Repair duplicate assignments from older configs / hand-edited files
+    local kmFixed = flowstate_normalizeKmSel flowstate_kmSel
+    for i = 1 to 5 do (
+        flowstate_kmSel[i] = kmFixed[i]
+        try (
+            local jj = kmFixed[i]
+            if jj == -1 then
+                flowstate_kmBtns[i].Text = "  Off   " + "▼"
+            else
+                flowstate_kmBtns[i].Text = "  " + flowstate_kmChoiceLabels[jj + 1] + "   " + "▼"
+        ) catch ()
+    )
+    Y += 6
+
+    -- Drag modifiers info
+    frm.controls.add (mkLabel "DRAG MODIFIERS" pad Y iW 18 fObj:fBold cObj:cHead); Y += 22
+    for s in #(
+        "  + Shift  --  10x coarse",
+        "  + Alt  --  0.1x fine"
+    ) do (
+        frm.controls.add (mkLabel s (pad+4) Y (iW-8) 17 fObj:fSmall cObj:cDim)
+        Y += 17
+    )
+    Y += 6
+
+    -- Fixed shortcuts
+    frm.controls.add (mkLabel "OTHER SHORTCUTS" pad Y iW 18 fObj:fBold cObj:cHead); Y += 22
     for s in #(
         "XButton2  --  Parameter panel",
         "Shift + XButton2  --  Shader search",
         "Tab (in SME)  --  Shader search",
         "Ctrl + XButton2  --  Swap V/H sliders",
         "",
-        "XButton1  --  Screen space grab",
-        "Shift + XButton1  --  Time slider",
-        "Ctrl + XButton1  --  Param slider drag",
-        "Ctrl+Shift + XButton1  --  Opacity slider",
-        "Ctrl+Alt+Shift + XButton1  --  Clear sliders",
-        "XButton1 on pin  --  Assign drag axis",
-        "",
         "Click value  --  Type value",
         "Drag value  --  Scrub value",
         "Scroll value  --  Adjust value",
-        "  + Shift  --  10x coarse",
-        "  + Ctrl  --  10x fine",
-        "",
         "Right-click param  --  Pin/unpin",
-        "Eye button  --  Toggle visibility editor",
+        "Eye button  --  Visibility editor",
         "Middle-mouse  --  Drag panel"
     ) do (
         if s == "" then Y += 6
@@ -528,6 +696,7 @@ macroscript flowstate_Config
 
     -- Save
     fn onSave s e = (
+        global flowstate_kmSel
         local cfg = (getDir #plugcfg) + "\\FlowState.cfg"
         -- Read existing lines, keep everything except the flags we manage
         local keep = #()
@@ -540,6 +709,7 @@ macroscript flowstate_Config
                 else if findString ln "SubObjToggles=" != undefined then ()
                 else if findString ln "TabShader=" != undefined then ()
                 else if findString ln "LightTheme=" != undefined then ()
+                else if findString ln "Key:" == 1 then ()
                 else append keep ln
             )
             close f
@@ -555,6 +725,13 @@ macroscript flowstate_Config
         if flowstate_chkSubObj.Checked      do format "SubObjToggles=1\n" to:f
         if not flowstate_chkTab.Checked     do format "TabShader=0\n" to:f
         if flowstate_chkLight.Checked       do format "LightTheme=1\n" to:f
+        -- Write keymap (only non-defaults)
+        local kmKeys = #("grab", "time", "slider", "opacity", "clear")
+        local kmDefs = #(0, 1, 2, 3, 4)
+        for i = 1 to flowstate_kmSel.count do (
+            local idx = flowstate_kmSel[i]
+            if idx != kmDefs[i] do format "Key:%=%\n" kmKeys[i] idx to:f
+        )
         close f
         messageBox "Configuration saved.\nRestart 3ds Max for changes to take effect." title:"flowstate"
     )
@@ -591,9 +768,10 @@ macroscript flowstate_Config
     dotNet.addEventHandler frm "FormClosed" onClosed
 
     -- Pin handler references so GC can't collect them while the form is alive
-    global flowstate_handlers = #(onPaint, onClose, onXEnter, onXLeave, onDragDown, onDragMove, onDragUp, onDeactivate, onSave, onReset, onKey, onClosed)
+    global flowstate_handlers = #(onPaint, onClose, onXEnter, onXLeave, onDragDown, onDragMove, onDragUp, onDeactivate, onSave, onReset, onKey, onClosed, flowstate_onKmMenuPick, flowstate_onKmBtnClick)
 
     -- Show
+    try (format "[flowstate] config UI v1.3 — KEYMAP includes Off; restart Max after Save for plugin.\n" to:listener) catch ()
     frm.Show()
 )
 
