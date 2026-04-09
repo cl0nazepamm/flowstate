@@ -10,6 +10,7 @@
 #include <iparamm2.h>
 #include <iepoly.h>
 #include <splshape.h>
+#include <cmdmode.h>
 #include <maxscript/maxscript.h>
 #include <hold.h>
 #include <windowsx.h>
@@ -104,21 +105,6 @@ static std::wstring MakeParamLabel(const MCHAR* rawName) {
     return label;
 }
 
-static Point3 NormalizeSafe(const Point3& v) {
-    float len = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (len <= 1.0e-6f) return Point3(0.0f, 0.0f, 1.0f);
-    return v / len;
-}
-
-static bool IntersectRayPlane(const Ray& ray, const Point3& planePoint, const Point3& planeNormal, Point3& hit) {
-    float denom = DotProd(ray.dir, planeNormal);
-    if (std::fabs(denom) <= 1.0e-6f) return false;
-    float t = DotProd(planePoint - ray.p, planeNormal) / denom;
-    if (t < 0.0f) return false;
-    hit = ray.p + ray.dir * t;
-    return true;
-}
-
 static bool GetSelectionAnchor(Interface* ip, Point3& anchor) {
     if (!ip) return false;
     int selCount = ip->GetSelNodeCount();
@@ -136,6 +122,253 @@ static bool GetSelectionAnchor(Interface* ip, Point3& anchor) {
     if (validCount <= 0) return false;
     anchor /= (float)validCount;
     return true;
+}
+
+enum ScreenGrabState {
+    SCREEN_GRAB_NONE = 0,
+    SCREEN_GRAB_PENDING,
+    SCREEN_GRAB_ACTIVE,
+};
+
+enum ScreenGrabTarget {
+    SCREEN_GRAB_TARGET_NONE = 0,
+    SCREEN_GRAB_TARGET_NODES,
+    SCREEN_GRAB_TARGET_SUBOBJECT,
+};
+
+static ScreenGrabState g_screenGrabState = SCREEN_GRAB_NONE;
+static ScreenGrabTarget g_screenGrabTarget = SCREEN_GRAB_TARGET_NONE;
+static HWND            g_screenGrabViewHwnd = nullptr;
+static POINT           g_screenGrabPendingStartPt = { 0, 0 };
+static POINT           g_screenGrabLastScreenPt = { 0, 0 };
+static BaseObject*      g_screenGrabEditObj = nullptr;
+static bool             g_screenGrabHoldStarted = false;
+static bool             g_screenGrabMoved = false;
+
+static bool TryGetViewportFromScreenPoint(const POINT& screenPt, HWND& viewHwnd, POINT* ptLocal = nullptr) {
+    viewHwnd = nullptr;
+    if (Interface17* ip17 = GetCOREInterface17()) {
+        int panelIndex = 0, vptIndex = 0, vptID = 0;
+        POINT localPt{};
+        INode* hitNode = nullptr;
+        if (ip17->GetViewportFromScreenCoord(screenPt, panelIndex, vptIndex, vptID, localPt, viewHwnd, &hitNode)
+            && viewHwnd && IsWindow(viewHwnd)) {
+            if (ptLocal) *ptLocal = localPt;
+            return true;
+        }
+    }
+
+    Interface* ip = GetCOREInterface();
+    if (!ip) return false;
+    ViewExp& vpt = ip->GetActiveViewExp();
+    viewHwnd = vpt.GetHWnd();
+    if (!viewHwnd || !IsWindow(viewHwnd)) return false;
+    if (ptLocal) {
+        *ptLocal = screenPt;
+        ScreenToClient(viewHwnd, ptLocal);
+    }
+    return true;
+}
+
+static bool GetScreenGrabAnchor(Interface* ip, Point3& anchor) {
+    if (!ip) return false;
+
+    if (ip->GetSubObjectLevel() > 0) {
+        if (Interface11* ip11 = GetCOREInterface11()) {
+            Matrix3 gizmoTM = ip11->GetTransformGizmoTM();
+            anchor = gizmoTM.GetTrans();
+            return true;
+        }
+    }
+
+    return GetSelectionAnchor(ip, anchor);
+}
+
+static bool GetScreenGrabDelta(HWND viewHwnd, const POINT& prevScreenPt, const POINT& screenPt,
+    Point3& delta, Matrix3& tmAxis) {
+    Interface* ip = GetCOREInterface();
+    if (!ip || !viewHwnd || !IsWindow(viewHwnd)) return false;
+
+    Point3 anchor(0.0f, 0.0f, 0.0f);
+    if (!GetScreenGrabAnchor(ip, anchor))
+        return false;
+
+    ViewExp& vpt = ip->GetViewExp(viewHwnd);
+    Matrix3 worldToView;
+    vpt.GetAffineTM(worldToView);
+    Matrix3 viewToWorld = Inverse(worldToView);
+
+    Point3 anchorView = worldToView.PointTransform(anchor);
+
+    POINT prevClient = prevScreenPt;
+    POINT curClient = screenPt;
+    ScreenToClient(viewHwnd, &prevClient);
+    ScreenToClient(viewHwnd, &curClient);
+
+    Point3 prevView = vpt.MapScreenToView(IPoint2(prevClient.x, prevClient.y), anchorView.z);
+    Point3 curView = vpt.MapScreenToView(IPoint2(curClient.x, curClient.y), anchorView.z);
+
+    delta = curView - prevView;
+    tmAxis = viewToWorld;
+    tmAxis.SetTrans(anchor);
+
+    return true;
+}
+
+static bool EnsureScreenGrabHoldStarted() {
+    Interface* ip = GetCOREInterface();
+    if (!ip) return false;
+    if (g_screenGrabHoldStarted) return true;
+
+    if (g_screenGrabTarget == SCREEN_GRAB_TARGET_SUBOBJECT) {
+        if (!g_screenGrabEditObj) return false;
+        g_screenGrabEditObj->TransformStart(ip->GetTime());
+    }
+
+    theHold.Begin();
+
+    if (g_screenGrabTarget == SCREEN_GRAB_TARGET_SUBOBJECT && g_screenGrabEditObj)
+        g_screenGrabEditObj->TransformHoldingStart(ip->GetTime());
+
+    g_screenGrabHoldStarted = true;
+    return true;
+}
+
+static bool ApplyScreenGrabDelta(const POINT& screenPt) {
+    Interface* ip = GetCOREInterface();
+    if (!ip || !g_screenGrabViewHwnd || !IsWindow(g_screenGrabViewHwnd))
+        return false;
+
+    Point3 delta(0.0f, 0.0f, 0.0f);
+    Matrix3 tmAxis;
+    if (!GetScreenGrabDelta(g_screenGrabViewHwnd, g_screenGrabLastScreenPt, screenPt, delta, tmAxis))
+        return false;
+
+    g_screenGrabLastScreenPt = screenPt;
+
+    if (std::fabs(delta.x) <= 1.0e-6f && std::fabs(delta.y) <= 1.0e-6f && std::fabs(delta.z) <= 1.0e-6f)
+        return true;
+    if (!EnsureScreenGrabHoldStarted())
+        return false;
+
+    TimeValue t = ip->GetTime();
+
+    if (g_screenGrabTarget == SCREEN_GRAB_TARGET_SUBOBJECT && g_screenGrabEditObj) {
+        ModContextList modContexts;
+        INodeTab nodes;
+        ip->GetModContexts(modContexts, nodes);
+
+        bool any = false;
+        if (nodes.Count() > 0) {
+            for (int i = 0; i < nodes.Count(); ++i) {
+                INode* node = nodes[i];
+                ModContext* mc = (i < modContexts.Count()) ? modContexts[i] : nullptr;
+
+                Matrix3 partm;
+                if (node)
+                    partm = node->GetObjectTM(t);
+                if (mc && mc->tm)
+                    partm = partm * Inverse(*mc->tm);
+
+                Matrix3 partmCopy = partm;
+                Matrix3 tmAxisCopy = tmAxis;
+                Point3 moveDelta = delta;
+                g_screenGrabEditObj->Move(t, partmCopy, tmAxisCopy, moveDelta, FALSE);
+                any = true;
+            }
+        }
+        else if (ip->GetSelNodeCount() > 0) {
+            Matrix3 partm = ip->GetSelNode(0)->GetObjectTM(t);
+            Matrix3 partmCopy = partm;
+            Matrix3 tmAxisCopy = tmAxis;
+            Point3 moveDelta = delta;
+            g_screenGrabEditObj->Move(t, partmCopy, tmAxisCopy, moveDelta, FALSE);
+            any = true;
+        }
+
+        if (!any)
+            return false;
+
+        g_screenGrabEditObj->NotifyDependents(FOREVER, PART_GEOM, REFMSG_CHANGE);
+    }
+    else {
+        int selCount = ip->GetSelNodeCount();
+        if (selCount <= 0)
+            return false;
+
+        for (int i = 0; i < selCount; ++i) {
+            INode* node = ip->GetSelNode(i);
+            if (!node) continue;
+            Point3 moveDelta = delta;
+            node->Move(t, tmAxis, moveDelta, FALSE, TRUE, PIV_NONE, FALSE);
+        }
+    }
+
+    g_screenGrabMoved = true;
+    ip->RedrawViews(t, REDRAW_INTERACTIVE);
+    return true;
+}
+
+static bool BeginScreenGrab(const POINT& screenPt) {
+    Interface* ip = GetCOREInterface();
+    if (!ip || ip->GetSelNodeCount() <= 0) return false;
+
+    HWND viewHwnd = nullptr;
+    if (!TryGetViewportFromScreenPoint(screenPt, viewHwnd, nullptr))
+        return false;
+
+    g_screenGrabState = SCREEN_GRAB_ACTIVE;
+    g_screenGrabViewHwnd = viewHwnd;
+    g_screenGrabLastScreenPt = screenPt;
+    g_screenGrabEditObj = nullptr;
+    g_screenGrabHoldStarted = false;
+    g_screenGrabMoved = false;
+
+    int subObjectLevel = ip->GetSubObjectLevel();
+    BaseObject* editObj = ip->GetCurEditObject();
+    if (subObjectLevel > 0 && editObj) {
+        g_screenGrabTarget = SCREEN_GRAB_TARGET_SUBOBJECT;
+        g_screenGrabEditObj = editObj;
+    }
+    else {
+        g_screenGrabTarget = SCREEN_GRAB_TARGET_NODES;
+    }
+
+    SetFocus(viewHwnd);
+    return true;
+}
+
+static void EndScreenGrab(bool accept) {
+    Interface* ip = GetCOREInterface();
+    BaseObject* editObj = g_screenGrabEditObj;
+    bool holdStarted = g_screenGrabHoldStarted;
+    bool moved = g_screenGrabMoved;
+
+    g_screenGrabState = SCREEN_GRAB_NONE;
+    g_screenGrabTarget = SCREEN_GRAB_TARGET_NONE;
+    g_screenGrabViewHwnd = nullptr;
+    g_screenGrabEditObj = nullptr;
+    g_screenGrabHoldStarted = false;
+    g_screenGrabMoved = false;
+
+    if (holdStarted) {
+        TimeValue t = ip ? ip->GetTime() : 0;
+        if (accept && moved) {
+            if (editObj)
+                editObj->TransformHoldingFinish(t);
+            theHold.Accept(_T("Screen Grab"));
+            if (editObj)
+                editObj->TransformFinish(t);
+        }
+        else {
+            theHold.Cancel();
+            if (editObj)
+                editObj->TransformCancel(t);
+        }
+    }
+
+    if (ip)
+        ip->RedrawViews(ip->GetTime());
 }
 
 // Compatibility fallback for operation settings when live rollout controls are unavailable.
@@ -233,6 +466,8 @@ static RECT     g_visBtnRect    = {};
 static bool     g_visEditMode   = false;  // visibility edit mode — shows hidden params, click to toggle
 
 static const UINT WM_PP_TOGGLE   = WM_USER + 100;
+static const UINT WM_PP_GRAB_START = WM_USER + 106;
+static const UINT WM_PP_GRAB_END   = WM_USER + 107;
 
 // Forward declarations
 static LRESULT CALLBACK ModSearchEditProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
@@ -504,7 +739,8 @@ static UINT_PTR     g_osdTimer = 0;
 static HWND         g_dragTip = nullptr; // cursor-following value tooltip
 
 // XButton1 keymap — configurable modifier combos
-// Combo indices: 0=bare, 1=Shift, 2=Ctrl, 3=Ctrl+Shift, 4=Ctrl+Alt+Shift, -1=disabled (config UI "Off")
+// Combo indices: 0=bare, 1=Shift, 2=Ctrl, 3=Ctrl+Shift, 4=Ctrl+Alt+Shift,
+//                5=Alt, 6=Alt+Shift, 7=Ctrl+Alt, -1=disabled (config UI "Off")
 static int g_kmGrab    = 0;  // screen space grab
 static int g_kmTime    = 1;  // time slider
 static int g_kmSlider  = 2;  // param slider drag
@@ -967,7 +1203,7 @@ static void LoadSettings() {
                 if (eq != std::wstring::npos) {
                     std::wstring act = l.substr(4, eq - 4);
                     int val = _wtoi(l.substr(eq + 1).c_str());
-                    if (val >= -1 && val <= 4) {
+                    if (val >= -1 && val <= 7) {
                         if (act == L"grab")    g_kmGrab = val;
                         if (act == L"time")    g_kmTime = val;
                         if (act == L"slider")  g_kmSlider = val;
@@ -1051,16 +1287,12 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     }
 
     // ── XButton1 hold-drag tools ──────────────────────────────
-    enum DragMode { DRAG_NONE, DRAG_TIME, DRAG_OPACITY, DRAG_SCREEN };
+    enum DragMode { DRAG_NONE, DRAG_TIME, DRAG_OPACITY };
     static DragMode s_dragMode = DRAG_NONE;
     static int   s_lastMouseX  = 0;
     static int   s_lastMouseY  = 0;
     static float s_dragFloat   = 0;
     static bool  s_xb1Dragging = false;
-    static Point3 s_dragPlanePoint(0.0f, 0.0f, 0.0f);
-    static Point3 s_dragPlaneNormal(0.0f, 0.0f, 1.0f);
-    static Point3 s_dragWorldPoint(0.0f, 0.0f, 0.0f);
-    static HWND   s_dragViewHwnd = nullptr;
 
     // XButton1 assigned param drag — uses cached data, works with panel closed
     if (s_xb1Dragging && wp == WM_MOUSEMOVE && (g_xb1V.Active() || g_xb1H.Active())) {
@@ -1159,7 +1391,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
         return 1;
     }
 
-    if (s_dragMode != DRAG_NONE && wp == WM_MOUSEMOVE) {
+    if ((s_dragMode != DRAG_NONE || g_screenGrabState == SCREEN_GRAB_ACTIVE) && wp == WM_MOUSEMOVE) {
         MOUSEHOOKSTRUCT* ms2 = (MOUSEHOOKSTRUCT*)lp;
         int dx = ms2->pt.x - s_lastMouseX;
         int dy = ms2->pt.y - s_lastMouseY;
@@ -1168,37 +1400,14 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
 
         Interface* ip = GetCOREInterface();
 
-        if (s_dragMode == DRAG_SCREEN && ip && ip->GetSelNodeCount() > 0 && (dx != 0 || dy != 0)) {
-            // Explicit view-plane drag: map the cursor to rays and intersect
-            // a plane facing the camera, then move by the resulting world delta.
-            // This avoids coordsys-screen axis remapping entirely.
-            ViewExp& vpt = ip->GetActiveViewExp();
-            HWND viewHwnd = s_dragViewHwnd ? s_dragViewHwnd : vpt.GetHWnd();
-            if (!viewHwnd) return 1;
-
-            POINT clientPt = ms2->pt;
-            ScreenToClient(viewHwnd, &clientPt);
-
-            Ray ray;
-            vpt.MapScreenToWorldRay((float)clientPt.x, (float)clientPt.y, ray);
-
-            Point3 hit;
-            if (!IntersectRayPlane(ray, s_dragPlanePoint, s_dragPlaneNormal, hit))
+        if (g_screenGrabState == SCREEN_GRAB_ACTIVE) {
+            if (!g_screenGrabViewHwnd || !IsWindow(g_screenGrabViewHwnd)) {
+                EndScreenGrab(false);
                 return 1;
-
-            Point3 delta = hit - s_dragWorldPoint;
-            s_dragWorldPoint = hit;
-            if (std::fabs(delta.x) <= 1.0e-6f &&
-                std::fabs(delta.y) <= 1.0e-6f &&
-                std::fabs(delta.z) <= 1.0e-6f)
-                return 1;
-
-            wchar_t script[256];
-            swprintf(script, 256,
-                L"in coordsys world move selection [%f, %f, %f]",
-                delta.x, delta.y, delta.z);
-            ExecuteMAXScriptScript(script, MAXScript::ScriptSource::Dynamic);
-            ip->RedrawViews(ip->GetTime());
+            }
+            if ((dx != 0 || dy != 0) && !ApplyScreenGrabDelta(ms2->pt)) {
+                EndScreenGrab(false);
+            }
         }
         else if (s_dragMode == DRAG_TIME && ip && dx != 0) {
             float speed = 1.0f;
@@ -1228,7 +1437,8 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
         WORD xbutton = HIWORD(reinterpret_cast<MOUSEHOOKSTRUCTEX*>(lp)->mouseData);
 
         // XButton1 combos — configurable via g_km* keymap globals
-        // Combo indices: 0=bare, 1=Shift, 2=Ctrl, 3=Ctrl+Shift, 4=Ctrl+Alt+Shift
+        // Combo indices: 0=bare, 1=Shift, 2=Ctrl, 3=Ctrl+Shift, 4=Ctrl+Alt+Shift,
+        //                5=Alt, 6=Alt+Shift, 7=Ctrl+Alt
         if (xbutton == XBUTTON1) {
             if (wp == WM_XBUTTONDOWN) {
                 bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -1239,11 +1449,13 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                 // Resolve modifier combo index
                 int combo;
                 if (ctrl && alt && shift)          combo = 4;
+                else if (ctrl && alt && !shift)    combo = 7;
                 else if (ctrl && shift && !alt)    combo = 3;
+                else if (alt && shift && !ctrl)    combo = 6;
                 else if (ctrl && !shift && !alt)   combo = 2;
+                else if (alt && !ctrl && !shift)   combo = 5;
                 else if (shift && !ctrl && !alt)   combo = 1;
-                else if (!ctrl && !shift && !alt)  combo = 0;
-                else                               return 0; // unmapped combo
+                else                               combo = 0;
 
                 // Clear all slider assignments
                 if (combo == g_kmClear) {
@@ -1386,45 +1598,29 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
 
                 // Screen space grab
                 if (combo == g_kmGrab && ip && ip->GetSelNodeCount() > 0) {
-                    ViewExp& vpt = ip->GetActiveViewExp();
-                    HWND viewHwnd = vpt.GetHWnd();
-                    Point3 anchor;
-                    if (!viewHwnd || !GetSelectionAnchor(ip, anchor))
+                    POINT screenPt = ((MOUSEHOOKSTRUCT*)lp)->pt;
+                    HWND viewHwnd = nullptr;
+                    if (!TryGetViewportFromScreenPoint(screenPt, viewHwnd, nullptr))
                         return 0;
 
-                    POINT clientPt = ((MOUSEHOOKSTRUCT*)lp)->pt;
-                    ScreenToClient(viewHwnd, &clientPt);
-
-                    Ray ray;
-                    vpt.MapScreenToWorldRay((float)clientPt.x, (float)clientPt.y, ray);
-
-                    s_dragPlanePoint = anchor;
-                    s_dragPlaneNormal = NormalizeSafe(ray.dir);
-                    if (!IntersectRayPlane(ray, s_dragPlanePoint, s_dragPlaneNormal, s_dragWorldPoint))
-                        return 0;
-
-                    s_dragMode = DRAG_SCREEN;
-                    s_dragViewHwnd = viewHwnd;
-                    s_lastMouseX = ((MOUSEHOOKSTRUCT*)lp)->pt.x;
-                    s_lastMouseY = ((MOUSEHOOKSTRUCT*)lp)->pt.y;
-                    theHold.Begin();
+                    g_screenGrabPendingStartPt = screenPt;
+                    g_screenGrabLastScreenPt = screenPt;
+                    g_screenGrabState = SCREEN_GRAB_PENDING;
+                    s_lastMouseX = screenPt.x;
+                    s_lastMouseY = screenPt.y;
+                    PostMessage(g_panel, WM_PP_GRAB_START, 0, 0);
                     return 1;
                 }
 
                 return 0;
             }
             if (wp == WM_XBUTTONUP) {
-                if (s_dragMode == DRAG_SCREEN) {
-                    s_dragMode = DRAG_NONE;
-                    s_dragViewHwnd = nullptr;
-                    theHold.Accept(_T("Screen Grab"));
-                    Interface* ip2 = GetCOREInterface();
-                    if (ip2) ip2->RedrawViews(ip2->GetTime());
+                if (g_screenGrabState == SCREEN_GRAB_PENDING || g_screenGrabState == SCREEN_GRAB_ACTIVE) {
+                    PostMessage(g_panel, WM_PP_GRAB_END, 0, 0);
                     return 1;
                 }
                 if (s_dragMode != DRAG_NONE) {
                     s_dragMode = DRAG_NONE;
-                    s_dragViewHwnd = nullptr;
                     return 1;
                 }
             }
@@ -3254,6 +3450,17 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_open) ClosePanel();
         return 0;
 
+    case WM_PP_GRAB_START:
+        if (g_screenGrabState != SCREEN_GRAB_PENDING)
+            return 0;
+        if (!BeginScreenGrab(g_screenGrabPendingStartPt))
+            EndScreenGrab(false);
+        return 0;
+
+    case WM_PP_GRAB_END:
+        EndScreenGrab(true);
+        return 0;
+
     case WM_WINDOWPOSCHANGED: {
         if (g_open) {
             PositionBtnStrips(); PositionFavStrip();
@@ -3944,6 +4151,8 @@ static void OpenPanel() {
 
 static void ClosePanel() {
     if (!g_open) return;
+    if (g_screenGrabState != SCREEN_GRAB_NONE)
+        EndScreenGrab(false);
     ExitModSearch();
     if (g_modSearchEdit) ShowWindow(g_modSearchEdit, SW_HIDE);
     EPolyAccept();  // commit the takeover preview
@@ -4097,6 +4306,8 @@ public:
     void Stop() override {
         ModStack::Shutdown();
         PowerShader::Shutdown();
+        if (g_screenGrabState != SCREEN_GRAB_NONE)
+            EndScreenGrab(false);
         if (g_kbHook)    { UnhookWindowsHookEx(g_kbHook);    g_kbHook = nullptr; }
         if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
         ClosePanel();
