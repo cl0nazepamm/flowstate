@@ -10,6 +10,11 @@
 #include <iparamm2.h>
 #include <iepoly.h>
 #include <splshape.h>
+#include <triobj.h>
+#include <polyobj.h>
+#include <mnmesh.h>
+#include <mesh.h>
+#include <channels.h>
 #include <cmdmode.h>
 #include <maxscript/maxscript.h>
 #include <hold.h>
@@ -746,6 +751,379 @@ static int g_kmTime    = 1;  // time slider
 static int g_kmSlider  = 2;  // param slider drag
 static int g_kmOpacity = 3;  // opacity slider
 static int g_kmClear   = 4;  // clear slider assignments
+static int g_kmUVGrab  = 5;  // UV island grab
+
+// UV grab state — built once at drag start, mutated in-place during drag
+struct UVDragState {
+    INode*       node       = nullptr;
+    bool         isPoly     = false;
+    PolyObject*  polyObj    = nullptr;
+    TriObject*   triObj     = nullptr;
+    int          mapChannel = 1;
+    std::vector<int>    uvVerts;     // map-vert indices in the island
+    std::vector<UVVert> origUVs;     // originals, parallel to uvVerts
+    UVVert       centroid   = UVVert(0.0f, 0.0f, 0.0f);
+    POINT        startPt    = { 0, 0 };
+    HWND         viewHwnd   = nullptr;
+};
+static UVDragState s_uv;
+
+static void ResetUVDrag() {
+    s_uv.node       = nullptr;
+    s_uv.polyObj    = nullptr;
+    s_uv.triObj     = nullptr;
+    s_uv.uvVerts.clear();
+    s_uv.origUVs.clear();
+    s_uv.centroid   = UVVert(0.0f, 0.0f, 0.0f);
+    s_uv.viewHwnd   = nullptr;
+}
+
+// Walk a node's pipeline to its base object.
+static Object* GetBaseObject(INode* node) {
+    if (!node) return nullptr;
+    Object* obj = node->GetObjectRef();
+    while (obj && obj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        obj = ((IDerivedObject*)obj)->GetObjRef();
+    }
+    return obj;
+}
+
+// BFS the UV island containing seedFace on an MNMesh map channel.
+static bool BuildUVIslandFromMNMesh(MNMesh& mn, int channel, int seedFace, std::vector<int>& outVerts) {
+    MNMap* mp = mn.M(channel);
+    if (!mp || mp->numv == 0 || mp->numf == 0) return false;
+    if (seedFace < 0 || seedFace >= mp->numf) return false;
+
+    std::vector<std::vector<int>> uv2f(mp->numv);
+    for (int f = 0; f < mp->numf; f++) {
+        const MNMapFace& mf = mp->f[f];
+        for (int j = 0; j < mf.deg; j++) {
+            int vi = mf.tv[j];
+            if (vi >= 0 && vi < mp->numv) uv2f[vi].push_back(f);
+        }
+    }
+
+    std::vector<bool> visF(mp->numf, false);
+    std::vector<bool> visV(mp->numv, false);
+    std::vector<int>  stack; stack.reserve(64);
+    stack.push_back(seedFace);
+    visF[seedFace] = true;
+
+    while (!stack.empty()) {
+        int f = stack.back(); stack.pop_back();
+        const MNMapFace& mf = mp->f[f];
+        for (int j = 0; j < mf.deg; j++) {
+            int vi = mf.tv[j];
+            if (vi < 0 || vi >= mp->numv || visV[vi]) continue;
+            visV[vi] = true;
+            outVerts.push_back(vi);
+            for (int nf : uv2f[vi]) {
+                if (!visF[nf]) { visF[nf] = true; stack.push_back(nf); }
+            }
+        }
+    }
+    return !outVerts.empty();
+}
+
+// BFS the UV island containing seedFace on a Mesh (Editable Mesh).
+static bool BuildUVIslandFromMesh(Mesh& mesh, int channel, int seedFace, std::vector<int>& outVerts) {
+    if (!mesh.mapSupport(channel)) return false;
+    int nFaces = mesh.getNumFaces();
+    int nMV    = mesh.getNumMapVerts(channel);
+    TVFace* mf = mesh.mapFaces(channel);
+    if (!mf || nMV == 0 || nFaces == 0) return false;
+    if (seedFace < 0 || seedFace >= nFaces) return false;
+
+    std::vector<std::vector<int>> uv2f(nMV);
+    for (int f = 0; f < nFaces; f++) {
+        for (int j = 0; j < 3; j++) {
+            int vi = (int)mf[f].t[j];
+            if (vi >= 0 && vi < nMV) uv2f[vi].push_back(f);
+        }
+    }
+
+    std::vector<bool> visF(nFaces, false);
+    std::vector<bool> visV(nMV, false);
+    std::vector<int>  stack; stack.reserve(64);
+    stack.push_back(seedFace);
+    visF[seedFace] = true;
+
+    while (!stack.empty()) {
+        int f = stack.back(); stack.pop_back();
+        for (int j = 0; j < 3; j++) {
+            int vi = (int)mf[f].t[j];
+            if (vi < 0 || vi >= nMV || visV[vi]) continue;
+            visV[vi] = true;
+            outVerts.push_back(vi);
+            for (int nf : uv2f[vi]) {
+                if (!visF[nf]) { visF[nf] = true; stack.push_back(nf); }
+            }
+        }
+    }
+    return !outVerts.empty();
+}
+
+// Möller–Trumbore ray-triangle intersection. No back-face culling so the user
+// can pick from any side. Writes the hit distance to outT on success.
+static bool RayIntersectTri(const Ray& r, const Point3& a, const Point3& b, const Point3& c, float& outT) {
+    const float EPS = 1e-7f;
+    Point3 e1 = b - a;
+    Point3 e2 = c - a;
+    Point3 h  = r.dir ^ e2;
+    float det = e1 % h;
+    if (det > -EPS && det < EPS) return false;
+    float invDet = 1.0f / det;
+    Point3 s = r.p - a;
+    float u = invDet * (s % h);
+    if (u < 0.0f || u > 1.0f) return false;
+    Point3 q = s ^ e1;
+    float v = invDet * (r.dir % q);
+    if (v < 0.0f || u + v > 1.0f) return false;
+    float t = invDet * (e2 % q);
+    if (t < EPS) return false;
+    outT = t;
+    return true;
+}
+
+// Build an object-space ray for the cursor.
+static bool BuildPickRay(INode* node, HWND viewHwnd, const POINT& screenPt, Ray& outRay) {
+    Interface* ip = GetCOREInterface();
+    if (!ip || !node || !viewHwnd) return false;
+    POINT clientPt = screenPt;
+    ScreenToClient(viewHwnd, &clientPt);
+    ViewExp& vpt = ip->GetViewExp(viewHwnd);
+    Ray rayWorld;
+    vpt.MapScreenToWorldRay((float)clientPt.x, (float)clientPt.y, rayWorld);
+    Matrix3 inv = Inverse(node->GetObjectTM(ip->GetTime()));
+    outRay.p   = inv.PointTransform(rayWorld.p);
+    outRay.dir = inv.VectorTransform(rayWorld.dir);
+    return true;
+}
+
+// Pick an MNMesh face under the cursor by triangulating each face and
+// testing against the ray. Returns the source-mesh face index.
+static bool PickFaceMNMesh(MNMesh& mn, INode* node, HWND viewHwnd, const POINT& screenPt, int& outFace) {
+    Ray rayObj;
+    if (!BuildPickRay(node, viewHwnd, screenPt, rayObj)) return false;
+
+    float bestT = 1e30f;
+    int   bestFace = -1;
+    Tab<int> tris;
+
+    for (int f = 0; f < mn.numf; f++) {
+        MNFace* face = mn.F(f);
+        if (!face || face->GetFlag(MN_DEAD)) continue;
+        if (face->deg < 3) continue;
+
+        face->GetTriangles(tris);
+        int numTris = tris.Count() / 3;
+        for (int ti = 0; ti < numTris; ti++) {
+            int i0 = tris[ti*3 + 0];
+            int i1 = tris[ti*3 + 1];
+            int i2 = tris[ti*3 + 2];
+            if (i0 < 0 || i1 < 0 || i2 < 0) continue; // skip hidden-vert tris
+            const Point3& a = mn.P(face->vtx[i0]);
+            const Point3& b = mn.P(face->vtx[i1]);
+            const Point3& c = mn.P(face->vtx[i2]);
+            float at;
+            if (RayIntersectTri(rayObj, a, b, c, at) && at < bestT) {
+                bestT = at;
+                bestFace = f;
+            }
+        }
+    }
+    if (bestFace < 0) return false;
+    outFace = bestFace;
+    return true;
+}
+
+// Cast a viewport ray and find the face index under the cursor.
+static bool PickFaceUnderCursor(INode* node, HWND viewHwnd, const POINT& screenPt, int& outFace) {
+    Interface* ip = GetCOREInterface();
+    if (!ip || !node || !viewHwnd) return false;
+
+    POINT clientPt = screenPt;
+    ScreenToClient(viewHwnd, &clientPt);
+
+    ViewExp& vpt = ip->GetViewExp(viewHwnd);
+    Ray rayWorld;
+    vpt.MapScreenToWorldRay((float)clientPt.x, (float)clientPt.y, rayWorld);
+
+    TimeValue t = ip->GetTime();
+    Matrix3 ntm = node->GetObjectTM(t);
+    Matrix3 inv = Inverse(ntm);
+    Ray rayObj;
+    rayObj.p   = inv.PointTransform(rayWorld.p);
+    rayObj.dir = inv.VectorTransform(rayWorld.dir);
+
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj || !os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0)))
+        return false;
+    TriObject* tri = (TriObject*)os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0));
+    if (!tri) return false;
+    bool needsDelete = (tri != (Object*)os.obj);
+
+    Mesh& m = tri->GetMesh();
+    float at; Point3 norm; DWORD fi = 0; Point3 bary;
+    int hit = m.IntersectRay(rayObj, at, norm, fi, bary);
+
+    if (needsDelete) tri->DeleteThis();
+    if (!hit) return false;
+    outFace = (int)fi;
+    return true;
+}
+
+// Begin a UV grab: pick face, find island, cache originals + centroid.
+static bool BeginUVGrab(INode* node, HWND viewHwnd, const POINT& screenPt) {
+    if (!node || !viewHwnd) return false;
+    Object* base = GetBaseObject(node);
+    if (!base) return false;
+
+    ResetUVDrag();
+    s_uv.node       = node;
+    s_uv.mapChannel = 1;
+    s_uv.viewHwnd   = viewHwnd;
+    s_uv.startPt    = screenPt;
+
+    if (base->ClassID() == EPOLYOBJ_CLASS_ID) {
+        s_uv.isPoly  = true;
+        s_uv.polyObj = (PolyObject*)base;
+        MNMesh& mn = s_uv.polyObj->GetMesh();
+        // Pick directly against the source MNMesh — using the eval'd
+        // TriObject's tri index would not map back to the MNMesh face index.
+        int seedFace = -1;
+        if (!PickFaceMNMesh(mn, node, viewHwnd, screenPt, seedFace)) {
+            ResetUVDrag(); return false;
+        }
+        if (!BuildUVIslandFromMNMesh(mn, 1, seedFace, s_uv.uvVerts)) {
+            ResetUVDrag(); return false;
+        }
+        MNMap* mp = mn.M(1);
+        s_uv.origUVs.reserve(s_uv.uvVerts.size());
+        UVVert sum(0.0f, 0.0f, 0.0f);
+        for (int vi : s_uv.uvVerts) {
+            UVVert v = mp->v[vi];
+            s_uv.origUVs.push_back(v);
+            sum += v;
+        }
+        s_uv.centroid = sum / (float)s_uv.uvVerts.size();
+        return true;
+    }
+    else if (base->ClassID() == Class_ID(EDITTRIOBJ_CLASS_ID, 0) ||
+             base->ClassID() == Class_ID(TRIOBJ_CLASS_ID, 0)) {
+        s_uv.isPoly = false;
+        s_uv.triObj = (TriObject*)base;
+        // For TriObject, eval-mesh face indices match source face indices.
+        int seedFace = -1;
+        if (!PickFaceUnderCursor(node, viewHwnd, screenPt, seedFace)) {
+            ResetUVDrag(); return false;
+        }
+        Mesh& m = s_uv.triObj->GetMesh();
+        if (!BuildUVIslandFromMesh(m, 1, seedFace, s_uv.uvVerts)) {
+            ResetUVDrag(); return false;
+        }
+        UVVert* mv = m.mapVerts(1);
+        s_uv.origUVs.reserve(s_uv.uvVerts.size());
+        UVVert sum(0.0f, 0.0f, 0.0f);
+        for (int vi : s_uv.uvVerts) {
+            UVVert v = mv[vi];
+            s_uv.origUVs.push_back(v);
+            sum += v;
+        }
+        s_uv.centroid = sum / (float)s_uv.uvVerts.size();
+        return true;
+    }
+
+    ResetUVDrag();
+    return false;
+}
+
+// Apply a transform from the cached originals based on screen delta + modifiers.
+static void ApplyUVDrag(int dxPix, int dyPix, bool ctrl, bool shift) {
+    if (s_uv.uvVerts.empty()) return;
+
+    UVVert* base = nullptr;
+    MNMesh* mn   = nullptr;
+    Mesh*   me   = nullptr;
+    if (s_uv.isPoly && s_uv.polyObj) {
+        mn = &s_uv.polyObj->GetMesh();
+        MNMap* mp = mn->M(s_uv.mapChannel);
+        if (!mp) return;
+        base = mp->v;
+    }
+    else if (!s_uv.isPoly && s_uv.triObj) {
+        me = &s_uv.triObj->GetMesh();
+        if (!me->mapSupport(s_uv.mapChannel)) return;
+        base = me->mapVerts(s_uv.mapChannel);
+    }
+    if (!base) return;
+
+    const UVVert c = s_uv.centroid;
+
+    if (ctrl) {
+        // Rotate around centroid: dx pixels → angle (radians)
+        float angle = (float)dxPix * 0.01f;
+        float cs = cosf(angle), sn = sinf(angle);
+        for (size_t i = 0; i < s_uv.uvVerts.size(); i++) {
+            const UVVert& o = s_uv.origUVs[i];
+            float ox = o.x - c.x, oy = o.y - c.y;
+            UVVert& dst = base[s_uv.uvVerts[i]];
+            dst.x = c.x + ox * cs - oy * sn;
+            dst.y = c.y + ox * sn + oy * cs;
+        }
+    }
+    else if (shift) {
+        // Scale around centroid: dx pixels → scale factor
+        float k = 1.0f + (float)dxPix * 0.005f;
+        if (k < 0.01f) k = 0.01f;
+        for (size_t i = 0; i < s_uv.uvVerts.size(); i++) {
+            const UVVert& o = s_uv.origUVs[i];
+            UVVert& dst = base[s_uv.uvVerts[i]];
+            dst.x = c.x + (o.x - c.x) * k;
+            dst.y = c.y + (o.y - c.y) * k;
+        }
+    }
+    else {
+        // Translate: texture follows the cursor (drag right → texture moves
+        // right on geo → UV.u must decrease; drag down → V must increase since
+        // V=1 is the top of the texture in 3ds Max).
+        const float k = 1.0f / 250.0f;
+        float du = -(float)dxPix * k;
+        float dv =  (float)dyPix * k;
+        for (size_t i = 0; i < s_uv.uvVerts.size(); i++) {
+            const UVVert& o = s_uv.origUVs[i];
+            UVVert& dst = base[s_uv.uvVerts[i]];
+            dst.x = o.x + du;
+            dst.y = o.y + dv;
+        }
+    }
+
+    // Invalidate caches and notify the dependency chain so the viewport
+    // re-binds the texture against the new UVs.
+    if (s_uv.isPoly && s_uv.polyObj) {
+        s_uv.polyObj->FreeCaches();
+        // EPoly::LocalDataChanged is the official invalidation hook —
+        // without it the cached display mesh keeps the stale UVs.
+        EPoly* iep = (EPoly*)s_uv.polyObj->GetInterface(EPOLY_INTERFACE);
+        if (iep) {
+            iep->LocalDataChanged(TEXMAP_CHANNEL);
+            iep->RefreshScreen();
+        }
+        s_uv.polyObj->NotifyDependents(FOREVER, PART_TEXMAP, REFMSG_CHANGE);
+    }
+    else if (s_uv.triObj) {
+        s_uv.triObj->mesh.InvalidateGeomCache();
+        s_uv.triObj->NotifyDependents(FOREVER, PART_TEXMAP, REFMSG_CHANGE);
+    }
+    if (s_uv.node) {
+        s_uv.node->NotifyDependents(FOREVER, PART_TEXMAP, REFMSG_CHANGE);
+        Interface* ip = GetCOREInterface();
+        if (ip) s_uv.node->InvalidateRect(ip->GetTime());
+    }
+
+    Interface* ip = GetCOREInterface();
+    if (ip) ip->RedrawViews(ip->GetTime(), REDRAW_NORMAL);
+}
 
 // LoadModuleFlags is now handled by LoadSettings() — reads [config] section from FlowState.cfg
 static void LoadModuleFlags() {
@@ -1111,6 +1489,7 @@ static void SaveSettings() {
     if (g_kmSlider != 2)  fwprintf(f, L"Key:slider=%d\n", g_kmSlider);
     if (g_kmOpacity != 3) fwprintf(f, L"Key:opacity=%d\n", g_kmOpacity);
     if (g_kmClear != 4)   fwprintf(f, L"Key:clear=%d\n", g_kmClear);
+    if (g_kmUVGrab != 5)  fwprintf(f, L"Key:uvgrab=%d\n", g_kmUVGrab);
 
     // [params] — collapsed, hidden, favorites, quick mods
     fwprintf(f, L"[params]\n");
@@ -1133,7 +1512,7 @@ void FlowState_SaveSettings() { SaveSettings(); }
 static void LoadSettings() {
     g_collapsed.clear(); g_hidden.clear(); g_favorites.clear(); g_quickMods.clear();
     PowerShader::ClearPersistent();
-    g_kmGrab = 0; g_kmTime = 1; g_kmSlider = 2; g_kmOpacity = 3; g_kmClear = 4;
+    g_kmGrab = 0; g_kmTime = 1; g_kmSlider = 2; g_kmOpacity = 3; g_kmClear = 4; g_kmUVGrab = 5;
 
     std::wstring path = GetCfgPath();
     if (path.empty()) { UpdateTheme(false); PowerShader::ReloadTheme(false); ModStack::ReloadTheme(false); return; }
@@ -1209,6 +1588,7 @@ static void LoadSettings() {
                         if (act == L"slider")  g_kmSlider = val;
                         if (act == L"opacity") g_kmOpacity = val;
                         if (act == L"clear")   g_kmClear = val;
+                        if (act == L"uvgrab")  g_kmUVGrab = val;
                     }
                 }
             }
@@ -1287,7 +1667,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     }
 
     // ── XButton1 hold-drag tools ──────────────────────────────
-    enum DragMode { DRAG_NONE, DRAG_TIME, DRAG_OPACITY };
+    enum DragMode { DRAG_NONE, DRAG_TIME, DRAG_OPACITY, DRAG_UVGRAB };
     static DragMode s_dragMode = DRAG_NONE;
     static int   s_lastMouseX  = 0;
     static int   s_lastMouseY  = 0;
@@ -1429,6 +1809,13 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                 if (nd) nd->SetVisibility(ip->GetTime(), s_dragFloat);
             }
             ip->RedrawViews(ip->GetTime());
+        }
+        else if (s_dragMode == DRAG_UVGRAB) {
+            int totalDx = ms2->pt.x - s_uv.startPt.x;
+            int totalDy = ms2->pt.y - s_uv.startPt.y;
+            bool ctrlNow  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool shiftNow = (GetKeyState(VK_SHIFT)   & 0x8000) != 0;
+            ApplyUVDrag(totalDx, totalDy, ctrlNow, shiftNow);
         }
         return 1;
     }
@@ -1612,11 +1999,37 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                     return 1;
                 }
 
+                // UV island grab
+                if (combo == g_kmUVGrab && ip && ip->GetSelNodeCount() > 0) {
+                    POINT screenPt = ((MOUSEHOOKSTRUCT*)lp)->pt;
+                    HWND viewHwnd = nullptr;
+                    if (!TryGetViewportFromScreenPoint(screenPt, viewHwnd, nullptr))
+                        return 0;
+
+                    INode* node = ip->GetSelNode(0);
+                    if (!BeginUVGrab(node, viewHwnd, screenPt)) {
+                        ShowOSD(L"UV grab: no island under cursor");
+                        return 1;
+                    }
+                    s_dragMode = DRAG_UVGRAB;
+                    s_lastMouseX = screenPt.x;
+                    s_lastMouseY = screenPt.y;
+                    theHold.Begin();
+                    ShowOSD(L"UV grab");
+                    return 1;
+                }
+
                 return 0;
             }
             if (wp == WM_XBUTTONUP) {
                 if (g_screenGrabState == SCREEN_GRAB_PENDING || g_screenGrabState == SCREEN_GRAB_ACTIVE) {
                     PostMessage(g_panel, WM_PP_GRAB_END, 0, 0);
+                    return 1;
+                }
+                if (s_dragMode == DRAG_UVGRAB) {
+                    s_dragMode = DRAG_NONE;
+                    theHold.Accept(_T("UV Grab"));
+                    ResetUVDrag();
                     return 1;
                 }
                 if (s_dragMode != DRAG_NONE) {

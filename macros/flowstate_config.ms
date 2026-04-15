@@ -394,12 +394,12 @@ macroscript flowstate_Config
     frm.controls.add (mkSep pad Y iW); Y += 12
     frm.controls.add (mkLabel "KEYMAP  (XButton1)" pad Y iW 18 fObj:fBold cObj:cHead); Y += 24
 
-    -- Modifier labels (index matches C++ combo indices 0-4); shared by keymap UI + save logic
-    global flowstate_kmChoiceLabels = #("(bare)", "Shift", "Ctrl", "Ctrl+Shift", "Ctrl+Alt+Shift")
+    -- Modifier labels (index matches C++ combo indices 0-7); shared by keymap UI + save logic
+    global flowstate_kmChoiceLabels = #("(bare)", "Shift", "Ctrl", "Ctrl+Shift", "Ctrl+Alt+Shift", "Alt", "Alt+Shift", "Ctrl+Alt")
     -- Action titles (for labels + duplicate-keymap messages)
-    global flowstate_kmActionNames = #("Screen Grab", "Time Slider", "Param Slider", "Opacity Slider", "Clear Sliders")
-    local actKeys  = #("grab", "time", "slider", "opacity", "clear")
-    local defaults = #(0, 1, 2, 3, 4)
+    global flowstate_kmActionNames = #("Screen Grab", "Time Slider", "Param Slider", "Opacity Slider", "Clear Sliders", "UV Grab")
+    local actKeys  = #("grab", "time", "slider", "opacity", "clear", "uvgrab")
+    local defaults = #(0, 1, 2, 3, 4, 5)
 
     -- Read current keymap from config
     fn readKeymap path key default:0 = (
@@ -413,21 +413,21 @@ macroscript flowstate_Config
                 local n = ln.count - tag.count
                 local v = if n > 0 then (substring ln (tag.count + 1) n) else ""
                 local iv = v as integer
-                if iv != undefined and iv >= -1 and iv <= 4 do result = iv
+                if iv != undefined and iv >= -1 and iv <= 7 do result = iv
             )
         )
         close f
         result
     )
 
-    -- Modifiers 0..4 at most once each; -1 = Off (multiple rows may be Off). Later duplicate mods -> Off.
+    -- Modifiers 0..7 at most once each; -1 = Off (multiple rows may be Off). Later duplicate mods -> Off.
     fn flowstate_normalizeKmSel src = (
         if src.count != 5 do return src
-        local used = #(false, false, false, false, false)
+        local used = #(false, false, false, false, false, false, false, false)
         local out = #()
         for i = 1 to 5 do (
             local v = src[i]
-            if v < -1 or v > 4 do v = -1
+            if v < -1 or v > 7 do v = -1
             if v == -1 then (
                 append out -1
             ) else (
@@ -456,7 +456,7 @@ macroscript flowstate_Config
         local slot = parts[1] as integer
         local jj = parts[2] as integer
         if slot < 1 or slot > flowstate_kmBtns.count do return()
-        if jj < -1 or jj > 4 do return()
+        if jj < -1 or jj > 7 do return()
         -- Each modifier 0..4 may only drive one action (Off does not consume a modifier)
         if jj >= 0 do (
             for o = 1 to flowstate_kmSel.count do (
@@ -726,8 +726,8 @@ macroscript flowstate_Config
         if not flowstate_chkTab.Checked     do format "TabShader=0\n" to:f
         if flowstate_chkLight.Checked       do format "LightTheme=1\n" to:f
         -- Write keymap (only non-defaults)
-        local kmKeys = #("grab", "time", "slider", "opacity", "clear")
-        local kmDefs = #(0, 1, 2, 3, 4)
+        local kmKeys = #("grab", "time", "slider", "opacity", "clear", "uvgrab")
+        local kmDefs = #(0, 1, 2, 3, 4, 5)
         for i = 1 to flowstate_kmSel.count do (
             local idx = flowstate_kmSel[i]
             if idx != kmDefs[i] do format "Key:%=%\n" kmKeys[i] idx to:f

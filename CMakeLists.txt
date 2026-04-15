@@ -74,7 +74,8 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
     comctl32.lib
     Geom.lib
     Maxscrpt.lib
-    # mesh.lib
+    mesh.lib
+    MNMath.lib
     bmm.lib
     gdiplus.lib
 )
