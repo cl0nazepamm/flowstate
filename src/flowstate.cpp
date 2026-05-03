@@ -542,8 +542,6 @@ static void ApplyModSearchResult() {
     auto& mc = g_modCache[g_modSearchResults[g_modSearchSel]];
     Interface* ip = GetCOREInterface();
     if (!ip || ip->GetSelNodeCount() == 0) return;
-    INode* node = ip->GetSelNode(0);
-    if (!node) return;
 
     // Create modifier via C++ SDK — bypasses MaxScript name issues
     if (mc.cd) {
@@ -551,7 +549,7 @@ static void ApplyModSearchResult() {
         Modifier* mod = static_cast<Modifier*>(obj);
         if (mod) {
             theHold.Begin();
-            GetCOREInterface7()->AddModifier(*node, *mod);
+            GetCOREInterface7()->AddModToSelection(mod);
             theHold.Accept(_T("Add Modifier"));
             ip->RedrawViews(ip->GetTime());
             return;
@@ -635,6 +633,7 @@ constexpr int kSpCount = 4;
 static const TCHAR* kSpLabels[] = { _T("Weld"), _T("Fillet"), _T("Chamfer"), _T("Outline") };
 
 struct BtnDef { const TCHAR* label; int id; };
+static const int kSplineButtonOpBase = 10000;
 
 // EPoly buttons
 static const BtnDef kEPolySubObj[] = {
@@ -655,7 +654,8 @@ static const BtnDef kSplineOps[] = {
     {_T("REF"),ScmRefine}, {_T("FIL"),ScmFillet},
     {_T("CHM"),ScmChamfer}, {_T("OTL"),ScmOutline},
     {_T("CON"),ScmConnect}, {_T("TRM"),ScmTrim},
-    {_T("EXD"),ScmExtend}, {_T("BOL"),ScmUnion}
+    {_T("EXD"),ScmExtend}, {_T("BOL"),ScmUnion},
+    {_T("ATT"),ScmAttach}, {_T("DET"),kSplineButtonOpBase + SopDetach}
 };
 static int g_hoverBtn  = -1;  // hovered button ID for strip windows
 static bool g_showSubObj = false; // sub-object toggles (off by default, configurable)
@@ -671,6 +671,8 @@ static int   g_lmbDragIdx  = -1;
 static int   g_lmbDragStartX = 0;
 static int   g_lmbDragAccum  = 0;  // accumulated sub-threshold movement for ints
 static bool  g_lmbDragMoved  = false; // true once mouse moves enough to be a drag (not a click)
+static bool  g_lmbDragChanged = false;
+static bool  g_lmbBoolToggled = false;
 
 // Module enable flags (read from FlowState.ini)
 static bool g_enablePowerParams = true;
@@ -765,6 +767,15 @@ struct UVDragState {
     UVVert       centroid   = UVVert(0.0f, 0.0f, 0.0f);
     POINT        startPt    = { 0, 0 };
     HWND         viewHwnd   = nullptr;
+    // Screen-aligned grab: we translate UVs purely by cursor direction
+    // (cursor right → U+, cursor up → V+) regardless of the UV mapping's
+    // orientation on the hit triangle. A triangle-derived isotropic scale
+    // (sqrt(UV_area / screen_area)) makes the motion feel proportional
+    // to the texture size as it appears on screen.
+    Point3       triP[3];            // object-space verts
+    UVVert       triUV[3];           // UVs of hit triangle corners
+    float        screenScale = 0.0f; // UV units per screen pixel
+    bool         screenValid = false;
 };
 static UVDragState s_uv;
 
@@ -776,7 +787,61 @@ static void ResetUVDrag() {
     s_uv.origUVs.clear();
     s_uv.centroid   = UVVert(0.0f, 0.0f, 0.0f);
     s_uv.viewHwnd   = nullptr;
+    s_uv.screenValid = false;
 }
+
+// RestoreObj that captures before/after UV vert positions for a UV island
+// grab so Max's undo system can step over the operation cleanly.
+class UVIslandRestore : public RestoreObj {
+public:
+    Object* obj   = nullptr;
+    INode*  node  = nullptr;
+    bool    isPoly = false;
+    MNMesh* mn    = nullptr;
+    Mesh*   mesh  = nullptr;
+    int     channel = 1;
+    std::vector<int>    uvVerts;
+    std::vector<UVVert> beforeUVs;
+    std::vector<UVVert> afterUVs;
+
+    void Apply(const std::vector<UVVert>& uvs) {
+        if (isPoly && mn) {
+            MNMap* mp = mn->M(channel);
+            if (!mp) return;
+            for (size_t i = 0; i < uvVerts.size(); i++)
+                mp->v[uvVerts[i]] = uvs[i];
+            // Mirror the live-drag invalidation chain exactly: without
+            // EPoly::LocalDataChanged + RefreshScreen the cached display
+            // mesh keeps the stale UVs and undo appears to do nothing.
+            PolyObject* po = (PolyObject*)obj;
+            if (po) po->FreeCaches();
+            EPoly* iep = po ? (EPoly*)po->GetInterface(EPOLY_INTERFACE) : nullptr;
+            if (iep) {
+                iep->LocalDataChanged(TEXMAP_CHANNEL);
+                iep->RefreshScreen();
+            }
+            if (obj) obj->NotifyDependents(FOREVER, PART_TEXMAP, REFMSG_CHANGE);
+        } else if (mesh) {
+            if (!mesh->mapSupport(channel)) return;
+            UVVert* mv = mesh->mapVerts(channel);
+            for (size_t i = 0; i < uvVerts.size(); i++)
+                mv[uvVerts[i]] = uvs[i];
+            mesh->InvalidateGeomCache();
+            if (obj) obj->NotifyDependents(FOREVER, PART_TEXMAP, REFMSG_CHANGE);
+        }
+        if (node) {
+            node->NotifyDependents(FOREVER, PART_TEXMAP, REFMSG_CHANGE);
+            Interface* ip = GetCOREInterface();
+            if (ip) node->InvalidateRect(ip->GetTime());
+        }
+        Interface* ip = GetCOREInterface();
+        if (ip) ip->RedrawViews(ip->GetTime(), REDRAW_NORMAL);
+    }
+    void Restore(int /*isUndo*/) override { Apply(beforeUVs); }
+    void Redo() override { Apply(afterUVs); }
+    TSTR Description() override { return TSTR(_M("UV Island Grab")); }
+    int  Size() override { return (int)(sizeof(*this) + uvVerts.size()*sizeof(int) + (beforeUVs.size()+afterUVs.size())*sizeof(UVVert)); }
+};
 
 // Walk a node's pipeline to its base object.
 static Object* GetBaseObject(INode* node) {
@@ -900,14 +965,44 @@ static bool BuildPickRay(INode* node, HWND viewHwnd, const POINT& screenPt, Ray&
     return true;
 }
 
+// Intersect ray with the plane of a triangle (unbounded). Returns the
+// barycentric-style params (s, t) so the hit point is p[0] + s*(p[1]-p[0]) + t*(p[2]-p[0]).
+static bool IntersectPlaneBary(const Ray& r, const Point3 p[3], float& outS, float& outT) {
+    Point3 e1 = p[1] - p[0];
+    Point3 e2 = p[2] - p[0];
+    Point3 N  = e1 ^ e2;
+    float denom = r.dir % N;
+    if (fabsf(denom) < 1e-9f) return false;
+    float ta = ((p[0] - r.p) % N) / denom;
+    Point3 H = r.p + r.dir * ta;
+    Point3 W = H - p[0];
+    float d11 = e1 % e1;
+    float d12 = e1 % e2;
+    float d22 = e2 % e2;
+    float det = d11 * d22 - d12 * d12;
+    if (fabsf(det) < 1e-9f) return false;
+    float dp1 = W % e1;
+    float dp2 = W % e2;
+    outS = (d22 * dp1 - d12 * dp2) / det;
+    outT = (d11 * dp2 - d12 * dp1) / det;
+    return true;
+}
+
 // Pick an MNMesh face under the cursor by triangulating each face and
-// testing against the ray. Returns the source-mesh face index.
-static bool PickFaceMNMesh(MNMesh& mn, INode* node, HWND viewHwnd, const POINT& screenPt, int& outFace) {
+// testing against the ray. Also returns the hit triangle's 3 object-space
+// verts and 3 UVs on the requested map channel so the caller can do
+// true screen-space cursor tracking.
+static bool PickFaceMNMesh(MNMesh& mn, int channel, INode* node, HWND viewHwnd, const POINT& screenPt,
+                           int& outFace, Point3 outTriP[3], UVVert outTriUV[3]) {
     Ray rayObj;
     if (!BuildPickRay(node, viewHwnd, screenPt, rayObj)) return false;
 
+    MNMap* mp = mn.M(channel);
+    if (!mp) return false;
+
     float bestT = 1e30f;
     int   bestFace = -1;
+    int   bestI[3] = { 0, 1, 2 };
     Tab<int> tris;
 
     for (int f = 0; f < mn.numf; f++) {
@@ -921,7 +1016,7 @@ static bool PickFaceMNMesh(MNMesh& mn, INode* node, HWND viewHwnd, const POINT& 
             int i0 = tris[ti*3 + 0];
             int i1 = tris[ti*3 + 1];
             int i2 = tris[ti*3 + 2];
-            if (i0 < 0 || i1 < 0 || i2 < 0) continue; // skip hidden-vert tris
+            if (i0 < 0 || i1 < 0 || i2 < 0) continue;
             const Point3& a = mn.P(face->vtx[i0]);
             const Point3& b = mn.P(face->vtx[i1]);
             const Point3& c = mn.P(face->vtx[i2]);
@@ -929,10 +1024,18 @@ static bool PickFaceMNMesh(MNMesh& mn, INode* node, HWND viewHwnd, const POINT& 
             if (RayIntersectTri(rayObj, a, b, c, at) && at < bestT) {
                 bestT = at;
                 bestFace = f;
+                bestI[0] = i0; bestI[1] = i1; bestI[2] = i2;
             }
         }
     }
     if (bestFace < 0) return false;
+
+    MNFace* face = mn.F(bestFace);
+    MNMapFace& mf = mp->f[bestFace];
+    for (int k = 0; k < 3; k++) {
+        outTriP[k]  = mn.P(face->vtx[bestI[k]]);
+        outTriUV[k] = mp->v[mf.tv[bestI[k]]];
+    }
     outFace = bestFace;
     return true;
 }
@@ -989,10 +1092,8 @@ static bool BeginUVGrab(INode* node, HWND viewHwnd, const POINT& screenPt) {
         s_uv.isPoly  = true;
         s_uv.polyObj = (PolyObject*)base;
         MNMesh& mn = s_uv.polyObj->GetMesh();
-        // Pick directly against the source MNMesh — using the eval'd
-        // TriObject's tri index would not map back to the MNMesh face index.
         int seedFace = -1;
-        if (!PickFaceMNMesh(mn, node, viewHwnd, screenPt, seedFace)) {
+        if (!PickFaceMNMesh(mn, 1, node, viewHwnd, screenPt, seedFace, s_uv.triP, s_uv.triUV)) {
             ResetUVDrag(); return false;
         }
         if (!BuildUVIslandFromMNMesh(mn, 1, seedFace, s_uv.uvVerts)) {
@@ -1007,22 +1108,28 @@ static bool BeginUVGrab(INode* node, HWND viewHwnd, const POINT& screenPt) {
             sum += v;
         }
         s_uv.centroid = sum / (float)s_uv.uvVerts.size();
-        return true;
     }
     else if (base->ClassID() == Class_ID(EDITTRIOBJ_CLASS_ID, 0) ||
              base->ClassID() == Class_ID(TRIOBJ_CLASS_ID, 0)) {
         s_uv.isPoly = false;
         s_uv.triObj = (TriObject*)base;
-        // For TriObject, eval-mesh face indices match source face indices.
+        Mesh& m = s_uv.triObj->GetMesh();
+        if (!m.mapSupport(1)) { ResetUVDrag(); return false; }
         int seedFace = -1;
         if (!PickFaceUnderCursor(node, viewHwnd, screenPt, seedFace)) {
             ResetUVDrag(); return false;
         }
-        Mesh& m = s_uv.triObj->GetMesh();
         if (!BuildUVIslandFromMesh(m, 1, seedFace, s_uv.uvVerts)) {
             ResetUVDrag(); return false;
         }
+        // Cache hit triangle's object-space verts + UVs for screen-space tracking.
+        Face& face = m.faces[seedFace];
+        TVFace& tf = m.mapFaces(1)[seedFace];
         UVVert* mv = m.mapVerts(1);
+        for (int k = 0; k < 3; k++) {
+            s_uv.triP[k]  = m.verts[face.v[k]];
+            s_uv.triUV[k] = mv[tf.t[k]];
+        }
         s_uv.origUVs.reserve(s_uv.uvVerts.size());
         UVVert sum(0.0f, 0.0f, 0.0f);
         for (int vi : s_uv.uvVerts) {
@@ -1031,8 +1138,43 @@ static bool BeginUVGrab(INode* node, HWND viewHwnd, const POINT& screenPt) {
             sum += v;
         }
         s_uv.centroid = sum / (float)s_uv.uvVerts.size();
-        return true;
     }
+    else {
+        ResetUVDrag();
+        return false;
+    }
+
+    // Compute an isotropic UV-per-pixel scale from the hit triangle by
+    // comparing its UV area with its screen-projected area. Independent
+    // of UV orientation → direction of drag is pure screen-aligned.
+    Interface* ipNow = GetCOREInterface();
+    if (ipNow) {
+        ViewExp& vpt = ipNow->GetViewExp(s_uv.viewHwnd);
+        GraphicsWindow* gw = vpt.getGW();
+        if (gw) {
+            Matrix3 ntm = node->GetObjectTM(ipNow->GetTime());
+            Matrix3 identity;
+            gw->setTransform(identity);
+            Point3 sp[3];
+            for (int k = 0; k < 3; k++) {
+                Point3 world = ntm.PointTransform(s_uv.triP[k]);
+                gw->transPoint(&world, &sp[k]);
+            }
+            float ds1x = sp[1].x - sp[0].x, ds1y = sp[1].y - sp[0].y;
+            float ds2x = sp[2].x - sp[0].x, ds2y = sp[2].y - sp[0].y;
+            float screenArea = fabsf(ds1x * ds2y - ds1y * ds2x);
+            float du1 = s_uv.triUV[1].x - s_uv.triUV[0].x;
+            float dv1 = s_uv.triUV[1].y - s_uv.triUV[0].y;
+            float du2 = s_uv.triUV[2].x - s_uv.triUV[0].x;
+            float dv2 = s_uv.triUV[2].y - s_uv.triUV[0].y;
+            float uvArea = fabsf(du1 * dv2 - dv1 * du2);
+            if (screenArea > 1e-4f && uvArea > 1e-10f) {
+                s_uv.screenScale = sqrtf(uvArea / screenArea);
+                s_uv.screenValid = true;
+            }
+        }
+    }
+    return true;
 
     ResetUVDrag();
     return false;
@@ -1084,12 +1226,17 @@ static void ApplyUVDrag(int dxPix, int dyPix, bool ctrl, bool shift) {
         }
     }
     else {
-        // Translate: texture follows the cursor (drag right → texture moves
-        // right on geo → UV.u must decrease; drag down → V must increase since
-        // V=1 is the top of the texture in 3ds Max).
-        const float k = 1.0f / 250.0f;
-        float du = -(float)dxPix * k;
-        float dv =  (float)dyPix * k;
+        // Pure screen-aligned UV translation — direction is entirely
+        // determined by cursor, never by the UV mapping's orientation
+        // on the triangle. Scale is isotropic, derived from the hit
+        // triangle at drag start (UV area / screen area).
+        //   cursor right (dx > 0) → U increases
+        //   cursor up    (dy < 0) → V increases  (V=1 is top of texture)
+        float du = 0.0f, dv = 0.0f;
+        if (s_uv.screenValid) {
+            du =  (float)dxPix * s_uv.screenScale;
+            dv = -(float)dyPix * s_uv.screenScale;
+        }
         for (size_t i = 0; i < s_uv.uvVerts.size(); i++) {
             const UVVert& o = s_uv.origUVs[i];
             UVVert& dst = base[s_uv.uvVerts[i]];
@@ -1303,6 +1450,11 @@ static void FadeOut(HWND hwnd) {
 // Forward declarations (defined later in file)
 static bool IsFloat(ParamType2 t);
 static bool IsInt(ParamType2 t);
+static int  ClampDragDelta(int delta);
+static bool IsWritableParam(IParamBlock2* pb, ParamID pid);
+static bool SetPB2FloatSafe(IParamBlock2* pb, ParamID pid, ParamType2 type, TimeValue t, float value);
+static bool SetPB2IntSafe(IParamBlock2* pb, ParamID pid, ParamType2 type, TimeValue t, int value);
+static bool TogglePB2BoolSafe(IParamBlock2* pb, ParamID pid, TimeValue t);
 static std::wstring PropFromKey(const EditField& ef);
 static bool FindParam(INode* node, const std::wstring& key,
                       IParamBlock2*& outPB, ParamID& outID, ParamType2& outType);
@@ -1673,12 +1825,30 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     static int   s_lastMouseY  = 0;
     static float s_dragFloat   = 0;
     static bool  s_xb1Dragging = false;
+    static bool  s_xb1Changed  = false;
+    static bool  s_xb1BoolToggledV = false;
+    static bool  s_xb1BoolToggledH = false;
+
+    auto finishXB1Drag = [&]() {
+        s_xb1Dragging = false;
+        if (s_xb1Changed) theHold.Accept(_T("XB1 Drag"));
+        else theHold.Cancel();
+        s_xb1Changed = false;
+        s_xb1BoolToggledV = false;
+        s_xb1BoolToggledH = false;
+        HideDragTip();
+    };
+
+    if (s_xb1Dragging && wp == WM_MOUSEMOVE && !(GetAsyncKeyState(VK_XBUTTON1) & 0x8000)) {
+        finishXB1Drag();
+        return 1;
+    }
 
     // XButton1 assigned param drag — uses cached data, works with panel closed
     if (s_xb1Dragging && wp == WM_MOUSEMOVE && (g_xb1V.Active() || g_xb1H.Active())) {
         MOUSEHOOKSTRUCT* ms2 = (MOUSEHOOKSTRUCT*)lp;
-        int dy = s_lastMouseY - ms2->pt.y;  // up = positive
-        int dx = ms2->pt.x - s_lastMouseX;  // right = positive
+        int dy = ClampDragDelta(s_lastMouseY - ms2->pt.y);  // up = positive
+        int dx = ClampDragDelta(ms2->pt.x - s_lastMouseX);  // right = positive
         s_lastMouseX = ms2->pt.x;
         s_lastMouseY = ms2->pt.y;
 
@@ -1688,7 +1858,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
         bool alt   = (GetKeyState(VK_MENU) & 0x8000) != 0;
         bool changed = false;
 
-        auto adjustSlot = [&](XB1Slot& slot, int delta) {
+        auto adjustSlot = [&](XB1Slot& slot, int delta, bool& boolToggled) {
             if (!slot.Active() || delta == 0) return;
             float step = (float)delta;
 
@@ -1700,30 +1870,33 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                     if (!nd) continue;
                     IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt = (ParamType2)0;
                     if (!FindParam(nd, slot.key, pb, pid, pt)) continue;
+                    if (!IsWritableParam(pb, pid)) continue;
                     if (IsFloat(pt)) {
                         float cur = pb->GetFloat(pid, t);
                         float a = cur<0?-cur:cur;
                         // Proportional: ~1% of value per pixel, min 0.001
                         float sc = a > 0.001f ? a * 0.01f : 0.001f;
                         if (shift) sc *= 10.0f; if (alt) sc *= 0.1f;
-                        pb->SetValue(pid, t, cur + step * sc);
-                    } else if (pt == TYPE_BOOL) {
-                        pb->SetValue(pid, t, pb->GetInt(pid, t) ? 0 : 1);
-                    } else {
+                        changed |= SetPB2FloatSafe(pb, pid, pt, t, cur + step * sc);
+                    } else if (pt == TYPE_BOOL && !boolToggled) {
+                        changed |= TogglePB2BoolSafe(pb, pid, t);
+                    } else if (IsInt(pt)) {
                         // Ints: 1 per 3 pixels
                         int cur = pb->GetInt(pid, t);
                         int s = delta / 3;
                         if (s == 0) s = delta > 0 ? 1 : -1;
                         if (shift) s *= 10;
-                        pb->SetValue(pid, t, cur + s);
+                        changed |= SetPB2IntSafe(pb, pid, pt, t, cur + s);
                     }
                 }
+                if (slot.type == TYPE_BOOL) boolToggled = true;
             } else if (slot.spIdx >= 0) {
                 float a = g_splineVals[slot.spIdx]<0?-g_splineVals[slot.spIdx]:g_splineVals[slot.spIdx];
                 float sc = a > 0.001f ? a * 0.01f : 0.001f;
                 if (shift) sc *= 10.0f; if (alt) sc *= 0.1f;
                 g_splineVals[slot.spIdx] += step * sc;
                 slot.displayVal = g_splineVals[slot.spIdx];
+                changed = true;
             } else {
                 // PB1 — loop all selected objects via MaxScript
                 float a = slot.displayVal<0?-slot.displayVal:slot.displayVal;
@@ -1740,13 +1913,14 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                         L";local v=getProperty o #" + prop +
                         L";setProperty o #" + prop + L" (v+" + std::to_wstring(inc) + L"))catch()";
                     ExecuteMAXScriptScript(sc2.c_str(), MAXScript::ScriptSource::Dynamic);
+                    changed = true;
                 }
             }
-            changed = true;
         };
 
-        adjustSlot(g_xb1V, dy);
-        adjustSlot(g_xb1H, dx);
+        adjustSlot(g_xb1V, dy, s_xb1BoolToggledV);
+        adjustSlot(g_xb1H, dx, s_xb1BoolToggledH);
+        s_xb1Changed |= changed;
 
         if (changed && ip) {
             for (int ni = 0; ni < ip->GetSelNodeCount(); ni++) {
@@ -1765,9 +1939,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
         return 1;
     }
     if (s_xb1Dragging && wp == WM_XBUTTONUP) {
-        s_xb1Dragging = false;
-        theHold.Accept(_T("XB1 Drag"));
-        HideDragTip();
+        finishXB1Drag();
         return 1;
     }
 
@@ -1976,6 +2148,9 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                             s_lastMouseX = ((MOUSEHOOKSTRUCT*)lp)->pt.x;
                             s_lastMouseY = ((MOUSEHOOKSTRUCT*)lp)->pt.y;
                             s_xb1Dragging = true;
+                            s_xb1Changed = false;
+                            s_xb1BoolToggledV = false;
+                            s_xb1BoolToggledH = false;
                             theHold.Begin();
                             return 1;
                         }
@@ -2028,6 +2203,28 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                 }
                 if (s_dragMode == DRAG_UVGRAB) {
                     s_dragMode = DRAG_NONE;
+                    // Record the before/after UVs so Undo can roll back
+                    // the whole drag as a single atomic step.
+                    if (!s_uv.uvVerts.empty() && (s_uv.polyObj || s_uv.triObj)) {
+                        UVIslandRestore* r = new UVIslandRestore;
+                        r->obj     = s_uv.isPoly ? (Object*)s_uv.polyObj : (Object*)s_uv.triObj;
+                        r->node    = s_uv.node;
+                        r->isPoly  = s_uv.isPoly;
+                        r->mn      = s_uv.isPoly ? &s_uv.polyObj->GetMesh() : nullptr;
+                        r->mesh    = s_uv.isPoly ? nullptr : &s_uv.triObj->GetMesh();
+                        r->channel = s_uv.mapChannel;
+                        r->uvVerts = s_uv.uvVerts;
+                        r->beforeUVs = s_uv.origUVs;
+                        r->afterUVs.reserve(s_uv.uvVerts.size());
+                        if (s_uv.isPoly) {
+                            MNMap* mp = s_uv.polyObj->GetMesh().M(s_uv.mapChannel);
+                            if (mp) for (int vi : s_uv.uvVerts) r->afterUVs.push_back(mp->v[vi]);
+                        } else {
+                            UVVert* mv = s_uv.triObj->GetMesh().mapVerts(s_uv.mapChannel);
+                            if (mv) for (int vi : s_uv.uvVerts) r->afterUVs.push_back(mv[vi]);
+                        }
+                        theHold.Put(r);
+                    }
                     theHold.Accept(_T("UV Grab"));
                     ResetUVDrag();
                     return 1;
@@ -2081,6 +2278,64 @@ static LRESULT CALLBACK KbHookProc(int nCode, WPARAM wp, LPARAM lp) {
 static bool IsFloat(ParamType2 t) { return t==TYPE_FLOAT||t==TYPE_ANGLE||t==TYPE_PCNT_FRAC||t==TYPE_WORLD||t==TYPE_COLOR_CHANNEL; }
 static bool IsInt(ParamType2 t)   { return t==TYPE_INT||t==TYPE_TIMEVALUE||t==TYPE_RADIOBTN_INDEX||t==TYPE_INDEX; }
 
+static int ClampDragDelta(int delta) {
+    const int kMaxParamDragDelta = 120;
+    if (delta >  kMaxParamDragDelta) return  kMaxParamDragDelta;
+    if (delta < -kMaxParamDragDelta) return -kMaxParamDragDelta;
+    return delta;
+}
+
+static bool IsWritableParam(IParamBlock2* pb, ParamID pid) {
+    if (!pb) return false;
+    const ParamDef& d = pb->GetParamDef(pid);
+    return (d.flags & (P_READ_ONLY | P_OBSOLETE)) == 0;
+}
+
+static float ClampPB2Float(IParamBlock2* pb, ParamID pid, ParamType2 type, float value) {
+    if (!pb) return value;
+    const ParamDef& d = pb->GetParamDef(pid);
+    if ((d.flags & P_HAS_RANGE) && IsFloat(type)) {
+        float lo = d.range_low.f;
+        float hi = d.range_high.f;
+        if (lo <= hi) {
+            if (value < lo) value = lo;
+            if (value > hi) value = hi;
+        }
+    }
+    return value;
+}
+
+static int ClampPB2Int(IParamBlock2* pb, ParamID pid, ParamType2 type, int value) {
+    if (!pb) return value;
+    const ParamDef& d = pb->GetParamDef(pid);
+    if (d.flags & P_HAS_RANGE) {
+        int lo = (type == TYPE_TIMEVALUE) ? d.range_low.t : d.range_low.i;
+        int hi = (type == TYPE_TIMEVALUE) ? d.range_high.t : d.range_high.i;
+        if (lo <= hi) {
+            if (value < lo) value = lo;
+            if (value > hi) value = hi;
+        }
+    }
+    return value;
+}
+
+static bool SetPB2FloatSafe(IParamBlock2* pb, ParamID pid, ParamType2 type, TimeValue t, float value) {
+    if (!IsWritableParam(pb, pid)) return false;
+    pb->SetValue(pid, t, ClampPB2Float(pb, pid, type, value));
+    return true;
+}
+
+static bool SetPB2IntSafe(IParamBlock2* pb, ParamID pid, ParamType2 type, TimeValue t, int value) {
+    if (!IsWritableParam(pb, pid)) return false;
+    pb->SetValue(pid, t, ClampPB2Int(pb, pid, type, value));
+    return true;
+}
+
+static bool TogglePB2BoolSafe(IParamBlock2* pb, ParamID pid, TimeValue t) {
+    if (!IsWritableParam(pb, pid)) return false;
+    pb->SetValue(pid, t, pb->GetInt(pid, t) ? 0 : 1);
+    return true;
+}
 
 static int GetNextKeyOrdinal(const std::wstring& key) {
     int ord = 0;
@@ -2522,6 +2777,10 @@ static void GatherParams() {
             GroupHeader gh;
             gh.title = L"SplineCmd";
             gh.startIdx = (int)g_edits.size();
+            gh.actionStart = (int)g_actions.size();
+            g_actions.push_back({L"ATT", nullptr, (FunctionID)ScmAttach, 0});
+            g_actions.push_back({L"DET", nullptr, (FunctionID)(kSplineButtonOpBase + SopDetach), 0});
+            gh.actionCount = 2;
             for (int si = 0; si < kSpCount; si++) {
                 std::wstring key = L"SplineShape:" + std::wstring(kSpLabels[si]);
                 if (!g_visEditMode && g_hidden.count(key)) continue;
@@ -2813,6 +3072,8 @@ static bool  g_favDragging = false;
 static int   g_favDragIdx  = -1;
 static int   g_favDragStartX = 0;
 static int   g_favDragAccum = 0;
+static bool  g_favDragChanged = false;
+static bool  g_favBoolToggled = false;
 
 // ── Tool name overlay near cursor ────────────────────────────────
 static const TCHAR* GetCommandModeName(int mode) {
@@ -2972,6 +3233,81 @@ static void DrawBtnRow(HDC mem, const BtnDef* btns, int count, int x, int y, int
     }
 }
 
+static RECT GroupActionRect(const GroupHeader& gh, int actionIdx, int headerY, int rightEdge) {
+    const int bw = 34;
+    const int gap = 2;
+    int totalW = gh.actionCount * bw + std::max(0, gh.actionCount - 1) * gap;
+    int left = rightEdge - totalW;
+    int x = left + actionIdx * (bw + gap);
+    return { x, headerY + 2, x + bw, headerY + kLineH - 3 };
+}
+
+static void DrawGroupActions(HDC mem, const GroupHeader& gh, int headerY, int rightEdge) {
+    if (gh.actionCount <= 0 || gh.actionStart < 0 ||
+        gh.actionStart + gh.actionCount > (int)g_actions.size()) return;
+
+    SelectObject(mem, g_font);
+    for (int ai = 0; ai < gh.actionCount; ++ai) {
+        const ActionBtn& ab = g_actions[gh.actionStart + ai];
+        RECT br = GroupActionRect(gh, ai, headerY, rightEdge);
+        bool hover = false; // Header buttons are compact; keep hover state reserved for strip buttons.
+        HBRUSH bb = CreateSolidBrush(hover ? kBtnHov : kBtnBg);
+        FillRect(mem, &br, bb);
+        DeleteObject(bb);
+        HPEN pen = CreatePen(PS_SOLID, 1, kBorder);
+        HPEN old = (HPEN)SelectObject(mem, pen);
+        SelectObject(mem, GetStockObject(NULL_BRUSH));
+        Rectangle(mem, br.left, br.top, br.right, br.bottom);
+        SelectObject(mem, old);
+        DeleteObject(pen);
+        SetTextColor(mem, kLabelClr);
+        DrawText(mem, ab.label.c_str(), -1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+}
+
+static int HitGroupAction(const GroupHeader& gh, int headerY, int rightEdge, POINT pt) {
+    if (gh.actionCount <= 0 || gh.actionStart < 0 ||
+        gh.actionStart + gh.actionCount > (int)g_actions.size()) return -1;
+    for (int ai = 0; ai < gh.actionCount; ++ai) {
+        RECT br = GroupActionRect(gh, ai, headerY, rightEdge);
+        if (PtInRect(&br, pt)) return ai;
+    }
+    return -1;
+}
+
+static int GroupHeaderY(int groupIdx) {
+    int y = g_contentStartY - g_scrollY;
+    for (int gi = 0; gi < (int)g_groups.size(); ++gi) {
+        if (gi == groupIdx) return y;
+        y += kLineH;
+        bool collapsed = g_collapsed.count(g_groups[gi].title) > 0;
+        if (!collapsed) y += g_groups[gi].count * kLineH;
+        if (gi + 1 < (int)g_groups.size()) y += kGroupGap;
+    }
+    return -99999;
+}
+
+static bool RunSplineHeaderAction(const ActionBtn& action) {
+    if (!g_splineForButtons) return false;
+    ISplineOps* ops = (ISplineOps*)g_splineForButtons->GetInterface(I_SPLINEOPS);
+    if (!ops) return false;
+
+    Interface* ip = GetCOREInterface();
+    if (ip) ip->SetCommandPanelTaskMode(TASK_MODE_MODIFY);
+
+    int id = (int)action.fnId;
+    if (id >= kSplineButtonOpBase) {
+        splineButtonOp op = (splineButtonOp)(id - kSplineButtonOpBase);
+        theHold.Begin();
+        ops->ButtonOp(op);
+        theHold.Accept(_T("Spline Op"));
+        if (ip) ip->RedrawViews(ip->GetTime());
+    } else {
+        ops->StartCommandMode((splineCommandMode)id);
+    }
+    return true;
+}
+
 // ── Paint ───────────────────────────────────────────────────────
 static void PaintPanel(HWND hwnd) {
     PAINTSTRUCT ps;
@@ -3093,6 +3429,7 @@ static void PaintPanel(HWND hwnd) {
         if (isOpGroup) hdr += L"  [\x2717 CANCEL]";
         if (!modEnabled) hdr += L"  [OFF]";
         TextOut(mem, x, y, hdr.c_str(), (int)hdr.length());
+        DrawGroupActions(mem, gh, y, rEdge);
 
         // Draw [●][▲][▼][×] buttons for modifier groups
         if (gh.mod) {
@@ -3694,6 +4031,47 @@ static void PositionFavStrip() {
     if (!g_freshOpen) InvalidateRect(g_favWnd, nullptr, FALSE);
 }
 
+static void RefreshFavoritesStrip() {
+    BuildFavorites();
+    PositionFavStrip();
+    if (!g_favWnd) return;
+
+    if (g_favEdits.empty()) {
+        KillTimer(g_favWnd, 1);
+        ShowWindow(g_favWnd, SW_HIDE);
+        return;
+    }
+
+    SetTimer(g_favWnd, 1, kRefreshMs, nullptr);
+    ShowWindow(g_favWnd, SW_SHOWNOACTIVATE);
+    InvalidateRect(g_favWnd, nullptr, TRUE);
+    UpdateWindow(g_favWnd);
+}
+
+static void CancelFavDrag() {
+    if (!g_favDragging) return;
+    g_favDragging = false;
+    g_favDragIdx = -1;
+    g_favDragAccum = 0;
+    g_favDragChanged = false;
+    g_favBoolToggled = false;
+    theHold.Cancel();
+    HideDragTip();
+    SetCursor(LoadCursor(nullptr, IDC_ARROW));
+}
+
+static void CancelPanelValueDrag() {
+    if (!g_lmbDragging) return;
+    g_lmbDragging = false;
+    g_lmbDragIdx = -1;
+    g_lmbDragAccum = 0;
+    g_lmbDragMoved = false;
+    g_lmbDragChanged = false;
+    g_lmbBoolToggled = false;
+    theHold.Cancel();
+    HideDragTip();
+}
+
 static HFONT g_fontTiny = nullptr;
 
 static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -3773,6 +4151,8 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 g_favDragIdx  = i;
                 g_favDragStartX = pt.x;
                 g_favDragAccum  = 0;
+                g_favDragChanged = false;
+                g_favBoolToggled = false;
                 SetCapture(hwnd);
                 theHold.Begin();
                 SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
@@ -3784,7 +4164,7 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     case WM_MOUSEMOVE: {
         if (!g_favDragging || g_favDragIdx < 0 || g_favDragIdx >= (int)g_favEdits.size()) break;
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        int dx = pt.x - g_favDragStartX;
+        int dx = ClampDragDelta(pt.x - g_favDragStartX);
         if (dx == 0) return 0;
         g_favDragStartX = pt.x;
         auto& ef = g_favEdits[g_favDragIdx];
@@ -3792,20 +4172,21 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         TimeValue t = ip ? ip->GetTime() : 0;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        if (ef.pb) {
-            float cur = ef.pb->GetFloat(ef.id, t);
+        if (ef.pb && IsWritableParam(ef.pb, ef.id)) {
             if (IsFloat(ef.type)) {
+                float cur = ef.pb->GetFloat(ef.id, t);
                 float a = cur < 0 ? -cur : cur;
                 float sc = a > 0.001f ? a * 0.01f : 0.001f;
                 if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
-                ef.pb->SetValue(ef.id, t, cur + (float)dx * sc);
-            } else if (ef.type == TYPE_BOOL) {
-                ef.pb->SetValue(ef.id, t, ef.pb->GetInt(ef.id, t) ? 0 : 1);
-            } else {
+                g_favDragChanged |= SetPB2FloatSafe(ef.pb, ef.id, ef.type, t, cur + (float)dx * sc);
+            } else if (ef.type == TYPE_BOOL && !g_favBoolToggled) {
+                g_favDragChanged |= TogglePB2BoolSafe(ef.pb, ef.id, t);
+                g_favBoolToggled = true;
+            } else if (IsInt(ef.type)) {
                 g_favDragAccum += dx;
                 int s = g_favDragAccum / 3;
                 if (s != 0) { g_favDragAccum -= s * 3; if (shift) s *= 10;
-                    ef.pb->SetValue(ef.id, t, ef.pb->GetInt(ef.id, t) + s); }
+                    g_favDragChanged |= SetPB2IntSafe(ef.pb, ef.id, ef.type, t, ef.pb->GetInt(ef.id, t) + s); }
             }
         }
         if (ip) {
@@ -3828,11 +4209,18 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         g_favDragging = false;
         g_favDragIdx  = -1;
         ReleaseCapture();
-        theHold.Accept(_T("Pin Drag"));
+        if (g_favDragChanged) theHold.Accept(_T("Pin Drag"));
+        else theHold.Cancel();
+        g_favDragChanged = false;
+        g_favBoolToggled = false;
         HideDragTip();
         SetCursor(LoadCursor(nullptr, IDC_ARROW));
         return 0;
     }
+    case WM_CAPTURECHANGED:
+    case WM_CANCELMODE:
+        CancelFavDrag();
+        return 0;
     case WM_SETCURSOR: {
         // Show resize cursor when hovering label areas
         if (!g_favDragging) {
@@ -3901,7 +4289,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (PtInRect(&g_visBtnRect, pt)) {
             g_visEditMode = !g_visEditMode;
             GatherParams(); BuildLayout();
-            BuildFavorites(); PositionFavStrip();
+            RefreshFavoritesStrip();
             return 0;
         }
         if (PtInRect(&g_modStackRect, pt)) { ModStack::Toggle(); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
@@ -3914,7 +4302,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ApplyModSearchResult();
                 ExitModSearch();
                 GatherParams(); BuildLayout();
-                BuildFavorites(); PositionFavStrip();
+                RefreshFavoritesStrip();
             }
             return 0;
         }
@@ -3938,6 +4326,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_lmbDragStartX = pt.x;
                     g_lmbDragAccum  = 0;
                     g_lmbDragMoved  = false;
+                    g_lmbDragChanged = false;
+                    g_lmbBoolToggled = false;
                     SetCapture(hwnd);
                     theHold.Begin();
                 }
@@ -3961,6 +4351,19 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Click on group header
         { int gIdx = FindGroupAtY(pt.y);
         if (gIdx >= 0) {
+            const GroupHeader& clickedGroup = g_groups[gIdx];
+            int headerY = GroupHeaderY(gIdx);
+            int actionIdx = HitGroupAction(clickedGroup, headerY, pw - kPad, pt);
+            if (actionIdx >= 0) {
+                int globalActionIdx = clickedGroup.actionStart + actionIdx;
+                if (globalActionIdx >= 0 && globalActionIdx < (int)g_actions.size() &&
+                    clickedGroup.title == L"SplineCmd") {
+                    if (RunSplineHeaderAction(g_actions[globalActionIdx])) {
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                        return 0;
+                    }
+                }
+            }
             // [●][▲][▼][×] buttons for modifier groups
             if (g_groups[gIdx].mod) {
                 int rEdge2 = pw - kPad;
@@ -4010,7 +4413,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         EPolyAccept();
                         ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
                         GatherParams(); BuildLayout();
-                        BuildFavorites(); PositionFavStrip();
+                        RefreshFavoritesStrip();
                         if (auto* ip2 = GetCOREInterface()) ip2->RedrawViews(ip2->GetTime());
                     }
                     return 0;
@@ -4038,7 +4441,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         EPolyAccept();
                         ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
                         GatherParams(); BuildLayout();
-                        BuildFavorites(); PositionFavStrip();
+                        RefreshFavoritesStrip();
                         if (ip2) ip2->RedrawViews(ip2->GetTime());
                     }
                     return 0;
@@ -4051,7 +4454,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         EPolyAccept();
                         ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
                         GatherParams(); BuildLayout();
-                        BuildFavorites(); PositionFavStrip();
+                        RefreshFavoritesStrip();
                         if (auto* ip2 = GetCOREInterface()) ip2->RedrawViews(ip2->GetTime());
                     }
                     return 0;
@@ -4132,8 +4535,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_favorites.count(key)) g_favorites.erase(key);
             else g_favorites.insert(key);
             SaveSettings();
-            BuildFavorites();
-            PositionFavStrip();
+            RefreshFavoritesStrip();
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
@@ -4146,26 +4548,34 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_lmbDragging = false;
             g_lmbDragIdx  = -1;
             ReleaseCapture();
-            if (moved) {
+            if (moved && g_lmbDragChanged) {
                 theHold.Accept(_T("Param Drag"));
                 HideDragTip();
                 GatherParams(); BuildLayout();
-                BuildFavorites(); PositionFavStrip();
+                RefreshFavoritesStrip();
             } else {
                 // No drag — treat as click, spawn edit box
                 theHold.Cancel();
-                if (idx >= 0 && idx < (int)g_edits.size())
+                if (!moved && idx >= 0 && idx < (int)g_edits.size())
                     SpawnEditAt(idx);
             }
+            g_lmbDragChanged = false;
+            g_lmbBoolToggled = false;
         }
         return 0;
     }
+
+    case WM_CAPTURECHANGED:
+    case WM_CANCELMODE:
+        CancelPanelValueDrag();
+        if (g_mmDragging) g_mmDragging = false;
+        return 0;
 
     case WM_MOUSEMOVE: {
         // Left-click param drag → scrub value
         if (g_lmbDragging && g_lmbDragIdx >= 0 && g_lmbDragIdx < (int)g_edits.size()) {
             POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-            int dx = pt.x - g_lmbDragStartX;
+            int dx = ClampDragDelta(pt.x - g_lmbDragStartX);
             // Deadzone: 3px before committing to drag (prevents accidental scrub on click)
             if (!g_lmbDragMoved && (dx > -3 && dx < 3)) return 0;
             if (!g_lmbDragMoved) g_lmbDragMoved = true;
@@ -4185,24 +4595,26 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         if (!nd) continue;
                         IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
                         if (!FindParam(nd, ef.key, pb, pid, pt2)) continue;
+                        if (!IsWritableParam(pb, pid)) continue;
                         if (IsFloat(pt2)) {
                             float cur = pb->GetFloat(pid, t);
                             float a = cur < 0 ? -cur : cur;
                             float sc = a > 0.001f ? a * 0.01f : 0.001f;
                             if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
-                            pb->SetValue(pid, t, cur + (float)dx * sc);
-                        } else if (pt2 == TYPE_BOOL) {
-                            pb->SetValue(pid, t, pb->GetInt(pid, t) ? 0 : 1);
-                        } else {
+                            g_lmbDragChanged |= SetPB2FloatSafe(pb, pid, pt2, t, cur + (float)dx * sc);
+                        } else if (pt2 == TYPE_BOOL && !g_lmbBoolToggled) {
+                            g_lmbDragChanged |= TogglePB2BoolSafe(pb, pid, t);
+                        } else if (IsInt(pt2)) {
                             g_lmbDragAccum += dx;
                             int s = g_lmbDragAccum / 3;
                             if (s != 0) {
                                 g_lmbDragAccum -= s * 3;
                                 if (shift) s *= 10;
-                                pb->SetValue(pid, t, pb->GetInt(pid, t) + s);
+                                g_lmbDragChanged |= SetPB2IntSafe(pb, pid, pt2, t, pb->GetInt(pid, t) + s);
                             }
                         }
                     }
+                    if (ef.type == TYPE_BOOL) g_lmbBoolToggled = true;
                 } else if (!ef.msPath.empty()) {
                     // PB1 fallback via MaxScript
                     size_t sep = ef.key.find(L':');
@@ -4216,12 +4628,14 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         float sc = a > 0.001f ? a * 0.01f : 0.001f;
                         if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
                         float inc = (float)dx * sc;
+                        if (inc == 0.0f) return 0;
                         std::wstring objPath = ef.msPath;
                         if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
                         std::wstring s = L"for obj in selection do try(local o=obj" + objPath +
                             L";local v=getProperty o #" + prop +
                             L";setProperty o #" + prop + L" (v+" + std::to_wstring(inc) + L"))catch()";
                         ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
+                        g_lmbDragChanged = true;
                     }
                 }
 
@@ -4474,7 +4888,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_epolyPreview) {
                 EPolyCancelDrop();
                 GatherParams(); BuildLayout();
-                BuildFavorites(); PositionFavStrip();
+                RefreshFavoritesStrip();
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else {
                 ClosePanel();
@@ -4530,8 +4944,7 @@ static void OpenPanel() {
 
     BuildLayout();
     PositionBtnStrips();
-    BuildFavorites();
-    PositionFavStrip();
+    RefreshFavoritesStrip();
 
     // Fade in panel with companions (button strips, fav strip)
     HWND fadeComps[] = { g_btnLeft, g_favWnd, g_btnRight };
@@ -4588,7 +5001,7 @@ static void ClosePanel() {
 
     KillTimer(g_panel, 1);
     KillActiveEdit(false);
-    if (g_lmbDragging) { g_lmbDragging = false; g_lmbDragIdx = -1; ReleaseCapture(); theHold.Cancel(); HideDragTip(); }
+    if (g_lmbDragging) { g_lmbDragging = false; g_lmbDragIdx = -1; g_lmbDragChanged = false; g_lmbBoolToggled = false; ReleaseCapture(); theHold.Cancel(); HideDragTip(); }
     g_visEditMode = false;
     g_hoverParam = -1;
     g_edits.clear();

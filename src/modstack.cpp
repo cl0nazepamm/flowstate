@@ -791,7 +791,7 @@ private:
             Modifier* mod = static_cast<Modifier*>(obj);
             if (mod) {
                 theHold.Begin();
-                GetCOREInterface7()->AddModifier(*ip->GetSelNode(0), *mod);
+                GetCOREInterface7()->AddModToSelection(mod);
                 theHold.Accept(_T("Add Modifier"));
             }
         }

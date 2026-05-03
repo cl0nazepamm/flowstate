@@ -1282,6 +1282,31 @@ private:
         return DefSubclassProc(h, m, w, l);
     }
 
+    static LRESULT CALLBACK RenameEditProc(HWND h, UINT m, WPARAM w, LPARAM l,
+                                           UINT_PTR, DWORD_PTR ref)
+    {
+        auto* self = reinterpret_cast<Palette*>(ref);
+        if (!self) return DefSubclassProc(h, m, w, l);
+
+        switch (m)
+        {
+        case WM_KEYDOWN:
+            if (w == VK_RETURN) { self->FinishRename(true); return 0; }
+            if (w == VK_ESCAPE) { self->FinishRename(false); return 0; }
+            break;
+        case WM_CHAR:
+            if (w == VK_RETURN || w == VK_ESCAPE) return 0;
+            break;
+        case WM_KILLFOCUS:
+            self->FinishRename(true);
+            return 0;
+        case WM_NCDESTROY:
+            RemoveWindowSubclass(h, RenameEditProc, 1);
+            break;
+        }
+        return DefSubclassProc(h, m, w, l);
+    }
+
     // ─── Window management ──────────────────────────────────────
     bool EnsureWindow()
     {
@@ -1590,6 +1615,7 @@ private:
     void Hide()
     {
         CancelPendingRebuild();
+        FinishRename(true);
         HidePreview();
         // Fade & slide out — cubic ease-in, 50ms
         if (IsWindowVisible(wnd_)) {
@@ -2234,6 +2260,7 @@ private:
 
     void RebuildBrickUI()
     {
+        FinishRename(true);
         // Destroy existing brick buttons
         for (HWND bh : brickBtns_)
             if (bh) DestroyWindow(bh);
@@ -2281,8 +2308,11 @@ private:
     void RenameBrickFav(int brickIdx)
     {
         if (brickIdx < 0 || brickIdx >= static_cast<int>(brickFavs_.size())) return;
+        FinishRename(true);
+        if (brickIdx >= static_cast<int>(brickBtns_.size())) return;
         // Simple inline rename: prompt via small EDIT overlay
         HWND btn = brickBtns_[brickIdx];
+        if (!btn || !IsWindow(btn)) return;
         RECT br; GetWindowRect(btn, &br);
         POINT p = {br.left, br.top}; ScreenToClient(wnd_, &p);
         HWND ed = CreateWindowExW(0, L"EDIT", brickFavs_[brickIdx].label.c_str(),
@@ -2291,27 +2321,42 @@ private:
         SendMessageW(ed, WM_SETFONT, reinterpret_cast<WPARAM>(Theme::fontUI), TRUE);
         SendMessageW(ed, EM_SETLIMITTEXT, 4, 0); // max 4 chars
         SendMessageW(ed, EM_SETSEL, 0, -1);
+        SetWindowSubclass(ed, RenameEditProc, 1, reinterpret_cast<DWORD_PTR>(this));
         SetFocus(ed);
         // Store info for completion
         renameEdit_ = ed;
         renameIdx_ = brickIdx;
     }
 
-    void FinishRename()
+    void FinishRename(bool commit = true)
     {
-        if (!renameEdit_ || renameIdx_ < 0) return;
-        wchar_t buf[8] = {};
-        GetWindowTextW(renameEdit_, buf, 8);
-        std::wstring lbl(buf);
-        if (!lbl.empty() && renameIdx_ < static_cast<int>(brickFavs_.size())) {
-            brickFavs_[renameIdx_].label = lbl;
-            SaveBrickFavs();
-            if (renameIdx_ < static_cast<int>(brickBtns_.size()))
-                SetWindowTextW(brickBtns_[renameIdx_], lbl.c_str());
-        }
-        DestroyWindow(renameEdit_);
+        if (renaming_ || !renameEdit_) return;
+
+        renaming_ = true;
+        HWND edit = renameEdit_;
+        int idx = renameIdx_;
         renameEdit_ = nullptr;
         renameIdx_ = -1;
+
+        std::wstring lbl;
+        if (commit && idx >= 0 && idx < static_cast<int>(brickFavs_.size()) && IsWindow(edit)) {
+            wchar_t buf[8] = {};
+            GetWindowTextW(edit, buf, 8);
+            lbl = buf;
+            if (!lbl.empty()) {
+                brickFavs_[idx].label = lbl;
+                SaveBrickFavs();
+                if (idx < static_cast<int>(brickBtns_.size()) && brickBtns_[idx] && IsWindow(brickBtns_[idx]))
+                    SetWindowTextW(brickBtns_[idx], lbl.c_str());
+            }
+        }
+
+        if (edit && IsWindow(edit)) {
+            RemoveWindowSubclass(edit, RenameEditProc, 1);
+            DestroyWindow(edit);
+        }
+
+        renaming_ = false;
     }
 
     // ─── State ──────────────────────────────────────────────────
@@ -2349,6 +2394,7 @@ private:
     std::vector<HWND> brickBtns_;            // brick button HWNDs
     HWND  renameEdit_ = nullptr;
     int   renameIdx_  = -1;
+    bool  renaming_   = false;
     int   brickDragId_   = -1;
     bool  brickDragging_ = false;
     int   shllRes_       = 256; // SHLL preview resolution
