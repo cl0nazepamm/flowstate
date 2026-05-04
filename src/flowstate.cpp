@@ -149,6 +149,16 @@ static POINT           g_screenGrabLastScreenPt = { 0, 0 };
 static BaseObject*      g_screenGrabEditObj = nullptr;
 static bool             g_screenGrabHoldStarted = false;
 static bool             g_screenGrabMoved = false;
+static bool             g_orbitPivotLocked = false;
+
+static void ShowOSD(const std::wstring& text);
+
+static bool NormalizeRayDirection(Ray& ray) {
+    float len = Length(ray.dir);
+    if (len <= 1.0e-8f) return false;
+    ray.dir = ray.dir / len;
+    return true;
+}
 
 static bool TryGetViewportFromScreenPoint(const POINT& screenPt, HWND& viewHwnd, POINT* ptLocal = nullptr) {
     viewHwnd = nullptr;
@@ -172,6 +182,102 @@ static bool TryGetViewportFromScreenPoint(const POINT& screenPt, HWND& viewHwnd,
         *ptLocal = screenPt;
         ScreenToClient(viewHwnd, ptLocal);
     }
+    return true;
+}
+
+static bool OrbitRayIntersectTri(const Ray& r, const Point3& a, const Point3& b, const Point3& c, float& outT) {
+    const float EPS = 1.0e-7f;
+    Point3 e1 = b - a;
+    Point3 e2 = c - a;
+    Point3 p = r.dir ^ e2;
+    float det = e1 % p;
+    if (det > -EPS && det < EPS) return false;
+    float invDet = 1.0f / det;
+    Point3 s = r.p - a;
+    float u = invDet * (s % p);
+    if (u < 0.0f || u > 1.0f) return false;
+    Point3 q = s ^ e1;
+    float v = invDet * (r.dir % q);
+    if (v < 0.0f || u + v > 1.0f) return false;
+    float t = invDet * (e2 % q);
+    if (t <= EPS) return false;
+    outT = t;
+    return true;
+}
+
+static void OrbitPickNode(INode* node, TimeValue t, const Ray& rayWorld,
+    bool& found, float& bestDist, Point3& bestPoint) {
+    if (!node) return;
+
+    for (int i = 0; i < node->NumberOfChildren(); ++i)
+        OrbitPickNode(node->GetChildNode(i), t, rayWorld, found, bestDist, bestPoint);
+
+    if (node->IsNodeHidden(FALSE)) return;
+
+    ObjectState os = node->EvalWorldState(t);
+    if (!os.obj || !os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0)))
+        return;
+
+    TriObject* tri = (TriObject*)os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0));
+    if (!tri) return;
+    bool needsDelete = (tri != (Object*)os.obj);
+
+    Matrix3 tm = node->GetObjectTM(t);
+    Matrix3 inv = Inverse(tm);
+    Ray rayObj;
+    rayObj.p = inv.PointTransform(rayWorld.p);
+    rayObj.dir = inv.VectorTransform(rayWorld.dir);
+    if (!NormalizeRayDirection(rayObj)) {
+        if (needsDelete) tri->DeleteThis();
+        return;
+    }
+
+    Mesh& mesh = tri->GetMesh();
+    int faceCount = mesh.getNumFaces();
+    for (int fi = 0; fi < faceCount; ++fi) {
+        Face& f = mesh.faces[fi];
+        Point3 a = mesh.verts[f.v[0]];
+        Point3 b = mesh.verts[f.v[1]];
+        Point3 c = mesh.verts[f.v[2]];
+        float hitT = 0.0f;
+        if (!OrbitRayIntersectTri(rayObj, a, b, c, hitT))
+            continue;
+
+        Point3 hitObj = rayObj.p + rayObj.dir * hitT;
+        Point3 hitWorld = tm.PointTransform(hitObj);
+        float dist = Length(hitWorld - rayWorld.p);
+        if (!found || dist < bestDist) {
+            found = true;
+            bestDist = dist;
+            bestPoint = hitWorld;
+        }
+    }
+
+    if (needsDelete) tri->DeleteThis();
+}
+
+static bool OrbitPickMeshSurface(HWND viewHwnd, const POINT& localPt, Point3& outPoint) {
+    Interface* ip = GetCOREInterface();
+    if (!ip || !viewHwnd || !IsWindow(viewHwnd)) return false;
+
+    ViewExp& vpt = ip->GetViewExp(viewHwnd);
+    Ray rayWorld;
+    vpt.MapScreenToWorldRay((float)localPt.x, (float)localPt.y, rayWorld);
+    if (!NormalizeRayDirection(rayWorld)) return false;
+
+    bool found = false;
+    float bestDist = 1.0e30f;
+    Point3 bestPoint(0.0f, 0.0f, 0.0f);
+    TimeValue t = ip->GetTime();
+
+    INode* root = ip->GetRootNode();
+    if (root) {
+        for (int i = 0; i < root->NumberOfChildren(); ++i)
+            OrbitPickNode(root->GetChildNode(i), t, rayWorld, found, bestDist, bestPoint);
+    }
+
+    if (!found) return false;
+    outPoint = bestPoint;
     return true;
 }
 
@@ -341,6 +447,73 @@ static bool BeginScreenGrab(const POINT& screenPt) {
 
     SetFocus(viewHwnd);
     return true;
+}
+
+static bool ToggleOrbitPivotLock(const POINT& screenPt, HWND viewHwnd) {
+    POINT localPt{};
+    HWND resolvedViewHwnd = nullptr;
+    if (TryGetViewportFromScreenPoint(screenPt, resolvedViewHwnd, &localPt)) {
+        viewHwnd = resolvedViewHwnd;
+    } else if (viewHwnd && IsWindow(viewHwnd)) {
+        localPt = screenPt;
+        ScreenToClient(viewHwnd, &localPt);
+    } else {
+        return false;
+    }
+
+    unsigned long long hwndValue = (unsigned long long)(ULONG_PTR)viewHwnd;
+    wchar_t script[4096] = {};
+
+    if (g_orbitPivotLocked) {
+        swprintf(script, 4096,
+            L"try(IAutoCamMax.SetHoldPivotBallPosition false;"
+            L"try(IAutoCamMax.HidePivotBall %llu)catch();"
+            L"redrawViews();\"1\")catch(\"0\")",
+            hwndValue);
+        FPValue result;
+        BOOL ok = ExecuteMAXScriptScript(script, MAXScript::ScriptSource::Dynamic, TRUE, &result);
+        if (ok && result.type == TYPE_STRING && result.s && wcscmp(result.s, L"1") == 0) {
+            g_orbitPivotLocked = false;
+            ShowOSD(L"Orbit pivot unlocked");
+            return true;
+        }
+        return false;
+    }
+
+    if (Interface* ip = GetCOREInterface())
+        ip->SetActiveViewport(viewHwnd);
+    SetFocus(viewHwnd);
+
+    RECT rc{};
+    GetClientRect(viewHwnd, &rc);
+    int w = std::max(1, (int)(rc.right - rc.left));
+    int h = std::max(1, (int)(rc.bottom - rc.top));
+    int px = std::clamp((int)localPt.x, 0, w - 1);
+    int py = std::clamp((int)localPt.y, 0, h - 1);
+
+    Point3 hitPoint(0.0f, 0.0f, 0.0f);
+    POINT clampedLocalPt{ px, py };
+    if (!OrbitPickMeshSurface(viewHwnd, clampedLocalPt, hitPoint)) {
+        ShowOSD(L"Orbit pivot: no mesh hit");
+        return false;
+    }
+
+    std::wstring scriptText =
+        L"try(IAutoCamMax.SetHoldPivotBallPosition false;"
+        L"local mousePoint=[" + std::to_wstring(px) + L"," + std::to_wstring(py) + L"];"
+        L"local centerPoint=[0,0,0];"
+        L"IAutoCamMax.ShowPivotBall " + std::to_wstring(hwndValue) + L" &mousePoint &centerPoint true applyUIScaling:false;"
+        L"redrawViews();"
+        L"IAutoCamMax.SetHoldPivotBallPosition true;"
+        L"\"1\")catch(\"0\")";
+    FPValue result;
+    BOOL ok = ExecuteMAXScriptScript(scriptText.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &result);
+    if (ok && result.type == TYPE_STRING && result.s && wcscmp(result.s, L"1") == 0) {
+        g_orbitPivotLocked = true;
+        ShowOSD(L"Orbit pivot locked");
+        return true;
+    }
+    return false;
 }
 
 static void EndScreenGrab(bool accept) {
@@ -2270,9 +2443,17 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
         if (xbutton == XBUTTON2 && wp == WM_XBUTTONDOWN) {
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool alt   = (GetKeyState(VK_MENU) & 0x8000) != 0;
             bool matEd = IsMaterialEditorFocused();
-            if (ctrl) {
-                // Ctrl+XButton2 → swap V/H slider assignments
+            if (ctrl && !shift && !alt) {
+                POINT screenPt = ((MOUSEHOOKSTRUCT*)lp)->pt;
+                HWND viewHwnd = nullptr;
+                if (!TryGetViewportFromScreenPoint(screenPt, viewHwnd, nullptr))
+                    return 0;
+                ToggleOrbitPivotLock(screenPt, viewHwnd);
+                return 1;
+            } else if (alt && shift && !ctrl) {
+                // Alt+Shift+XButton2 -> swap V/H slider assignments
                 SyncXB1ToSelection();
                 if (g_xb1V.Active() || g_xb1H.Active()) {
                     std::swap(g_xb1V, g_xb1H);
@@ -2649,6 +2830,23 @@ static SplineShape* FindSplineShape(INode* node) {
     return nullptr;
 }
 
+static bool IsSplineShapeActiveForOps(INode* node, SplineShape* spline) {
+    if (!node || !spline) return false;
+    Object* obj = node->GetObjectRef();
+    if (!obj) return false;
+    if (obj->SuperClassID() != GEN_DERIVOB_CLASS_ID) return true;
+
+    std::wstring script =
+        L"try(local ok=false;"
+        L"if selection.count > 0 do "
+        L"(ok=((modPanel.getCurrentObject()) == selection[1].baseObject));"
+        L"if ok then \"1\" else \"0\")catch(\"0\")";
+    FPValue result;
+    BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic,
+        TRUE, &result);
+    return ok && result.type == TYPE_STRING && result.s && wcscmp(result.s, L"1") == 0;
+}
+
 // Returns EPoly only if it's the currently active modifier (A_MOD_BEING_EDITED)
 // or the base object. Edit Poly modifiers that aren't selected in the stack
 // won't respond to tool operations.
@@ -2836,7 +3034,7 @@ static void GatherParams() {
     // ── Spline detection — base Editable Spline only (not Edit Spline modifier)
     if (g_ctx == CTX_NONE) {
         SplineShape* ss = FindSplineShape(node);
-        if (ss) {
+        if (ss && IsSplineShapeActiveForOps(node, ss)) {
             g_ctx = CTX_SPLINE;
             g_splineForButtons = ss;
 
@@ -3034,7 +3232,9 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 int idx = (int)ef->id - kSpSentinel;
                 g_splineVals[idx] = (float)_wtof(txt);
                 Interface* ip = GetCOREInterface();
-                if (ip && ip->GetSelNodeCount() > 0 && g_splineForButtons && g_splineVals[idx] != 0.0f) {
+                if (ip && ip->GetSelNodeCount() > 0 && g_splineForButtons &&
+                    IsSplineShapeActiveForOps(ip->GetSelNode(0), g_splineForButtons) &&
+                    g_splineVals[idx] != 0.0f) {
                     TimeValue t = ip->GetTime();
                     SplineShape* ss = g_splineForButtons;
                     theHold.Begin();
@@ -3356,11 +3556,16 @@ static int GroupHeaderY(int groupIdx) {
 
 static bool RunSplineHeaderAction(const ActionBtn& action) {
     if (!g_splineForButtons) return false;
+    Interface* ip = GetCOREInterface();
+    if (!ip || ip->GetSelNodeCount() == 0 ||
+        !IsSplineShapeActiveForOps(ip->GetSelNode(0), g_splineForButtons)) {
+        ShowOSD(L"Spline command unavailable on current stack item");
+        return false;
+    }
     ISplineOps* ops = (ISplineOps*)g_splineForButtons->GetInterface(I_SPLINEOPS);
     if (!ops) return false;
 
-    Interface* ip = GetCOREInterface();
-    if (ip) ip->SetCommandPanelTaskMode(TASK_MODE_MODIFY);
+    ip->SetCommandPanelTaskMode(TASK_MODE_MODIFY);
 
     int id = (int)action.fnId;
     if (id >= kSplineButtonOpBase) {
@@ -3617,7 +3822,7 @@ static void KillActiveEdit(bool apply) {
                 Interface* ip = GetCOREInterface();
                 if (ip && ip->GetSelNodeCount() > 0 && g_splineVals[idx] != 0.0f) {
                     SplineShape* ss = FindSplineShape(ip->GetSelNode(0));
-                    if (ss) {
+                    if (ss && IsSplineShapeActiveForOps(ip->GetSelNode(0), ss)) {
                         TimeValue t = ip->GetTime();
                         int spId = idx + kSpSentinel;
                         if (spId == kSpFillet || spId == kSpChamfer) ss->SetFCLimit();
@@ -3901,7 +4106,8 @@ static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 for (int i = 0; i < count; ++i) qBtns.push_back({g_quickMods[i].shortLabel.c_str(), i});
                 hit = HitBtnStrip(qBtns.data(), count, BtnStripW(count), pt);
                 if (hit >= 0 && hit < count) {
-                    AddModifierViaModPanelScript(g_quickMods[hit].internalName, g_quickMods[hit].label);
+                    bool added = AddModifierViaModPanelScript(g_quickMods[hit].internalName, g_quickMods[hit].label);
+                    if (added) { GatherParams(); BuildLayout(); }
                     if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
                     return 0;
                 }
