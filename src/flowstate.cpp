@@ -5442,14 +5442,28 @@ public:
 
 static PPClassDesc ppDesc;
 
+ClassDesc* GetPowerCutClassDesc();
+ClassDesc* GetNormalizePolyDesc();
+
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
-    if (fdwReason == DLL_PROCESS_ATTACH) { hInstance = hinstDLL; DisableThreadLibraryCalls(hinstDLL); }
+    if (fdwReason == DLL_PROCESS_ATTACH) {
+        MaxSDK::Util::UseLanguagePackLocale();
+        hInstance = hinstDLL;
+        DisableThreadLibraryCalls(hinstDLL);
+    }
     return TRUE;
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return PPARAM_NAME; }
-__declspec(dllexport) int          LibNumberClasses()  { return 1; }
-__declspec(dllexport) ClassDesc*   LibClassDesc(int i) { return i == 0 ? &ppDesc : nullptr; }
+__declspec(dllexport) int          LibNumberClasses()  { return 3; }
+__declspec(dllexport) ClassDesc*   LibClassDesc(int i) {
+    switch (i) {
+    case 0: return &ppDesc;
+    case 1: return GetPowerCutClassDesc();
+    case 2: return GetNormalizePolyDesc();
+    default: return nullptr;
+    }
+}
 __declspec(dllexport) ULONG        LibVersion()        { return VERSION_3DSMAX; }
 __declspec(dllexport) int          LibInitialize()     { return TRUE; }
 __declspec(dllexport) int          LibShutdown()       { return TRUE; }

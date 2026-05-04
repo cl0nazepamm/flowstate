@@ -31,11 +31,10 @@ echo [2/4] Building...
 %CMAKE% --build "%BUILD_DIR%" --config Release
 if %ERRORLEVEL% NEQ 0 goto :fail
 
-echo [3/4] Deploying plugins...
-for %%F in (FlowState.gup PowerCut.dlm normalize_poly.dlm) do (
-    copy /Y "%BUILD_DIR%\Release\%%F" "%MAX_PLUGINS%\%%F"
-    if ERRORLEVEL 1 goto :fail
-)
+echo [3/4] Deploying plugin...
+copy /Y "%BUILD_DIR%\Release\FlowState.gup" "%MAX_PLUGINS%\FlowState.gup"
+if ERRORLEVEL 1 goto :fail
+del /Q "%MAX_PLUGINS%\PowerCut.dlm" "%MAX_PLUGINS%\normalize_poly.dlm" >nul 2>&1
 
 echo [4/4] Deploying macros...
 if not exist "%USERMACROS%" mkdir "%USERMACROS%"
@@ -44,7 +43,7 @@ for %%M in ("%NATIVE_DIR%macros\*.ms" "%NATIVE_DIR%macros\*.mcr") do (
 )
 
 echo.
-echo === Done! Restart 3ds Max to load the FlowState suite. ===
+echo === Done! Restart 3ds Max to load FlowState.gup. ===
 goto :done
 
 :fail

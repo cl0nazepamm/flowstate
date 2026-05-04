@@ -71,12 +71,30 @@ add_library(FlowState SHARED
     src/modstack.cpp
     src/modstack.h
     src/FlowState.def
+    src/powercut/dllmain.cpp
+    src/powercut/MeshCutter.cpp
+    src/powercut/MeshCutter.h
+    src/powercut/PowerCut.rc
+    src/powercut/PowerCutDesc.h
+    src/powercut/PowerCutMod.cpp
+    src/powercut/PowerCutMod.h
+    src/powercut/SplineProjector.cpp
+    src/powercut/SplineProjector.h
+    src/powercut/DebugLog.h
+    src/powercut/resource.h
+    src/normalize_edges/f2_extend_tool.cpp
+    src/normalize_edges/normalize_poly.cpp
+    src/normalize_edges/normalize_poly.rc
+    src/normalize_edges/resource.h
+    src/normalize_edges/smooth_bridge_tool.cpp
 )
 
 configure_max_plugin(FlowState FlowState gup)
 target_include_directories(FlowState PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/powercut"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/normalize_edges"
 )
 target_link_libraries(FlowState PRIVATE
     core.lib
@@ -88,71 +106,10 @@ target_link_libraries(FlowState PRIVATE
     Maxscrpt.lib
     mesh.lib
     MNMath.lib
+    poly.lib
     bmm.lib
     gdiplus.lib
 )
 if(MSVC)
-    target_compile_options(FlowState PRIVATE /EHa)
-endif()
-
-# PowerCut.dlm
-add_library(PowerCut SHARED
-    src/powercut/dllmain.cpp
-    src/powercut/MeshCutter.cpp
-    src/powercut/MeshCutter.h
-    src/powercut/PowerCut.rc
-    src/powercut/PowerCut.def
-    src/powercut/PowerCutDesc.h
-    src/powercut/PowerCutMod.cpp
-    src/powercut/PowerCutMod.h
-    src/powercut/SplineProjector.cpp
-    src/powercut/SplineProjector.h
-    src/powercut/DebugLog.h
-    src/powercut/resource.h
-)
-
-configure_max_plugin(PowerCut PowerCut dlm)
-target_include_directories(PowerCut PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/powercut"
-)
-target_link_libraries(PowerCut PRIVATE
-    core.lib
-    maxutil.lib
-    Geom.lib
-    Paramblk2.lib
-    mesh.lib
-    MNMath.lib
-    poly.lib
-    comctl32.lib
-)
-if(MSVC)
-    target_compile_options(PowerCut PRIVATE /EHsc /O2 /fp:fast)
-endif()
-
-# normalize_poly.dlm
-add_library(normalize_poly SHARED
-    src/normalize_edges/f2_extend_tool.cpp
-    src/normalize_edges/normalize_poly.cpp
-    src/normalize_edges/normalize_poly.rc
-    src/normalize_edges/normalize_poly.def
-    src/normalize_edges/resource.h
-    src/normalize_edges/smooth_bridge_tool.cpp
-)
-
-configure_max_plugin(normalize_poly normalize_poly dlm)
-target_include_directories(normalize_poly PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/normalize_edges"
-)
-target_link_libraries(normalize_poly PRIVATE
-    core.lib
-    maxutil.lib
-    Paramblk2.lib
-    Geom.lib
-    mesh.lib
-    MNMath.lib
-    poly.lib
-    comctl32.lib
-)
-if(MSVC)
-    target_compile_options(normalize_poly PRIVATE /EHsc /openmp)
+    target_compile_options(FlowState PRIVATE /EHa /O2 /fp:fast /openmp)
 endif()

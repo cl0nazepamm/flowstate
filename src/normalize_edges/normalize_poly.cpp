@@ -12,7 +12,6 @@
 #define NORMALIZE_POLY_NAME     _T("Normalize Poly")
 
 extern HINSTANCE hInstance;
-HINSTANCE hInstance = nullptr;
 
 enum { pblock_main };
 enum { pb_threshold, pb_select_only };
@@ -31,6 +30,10 @@ public:
 };
 
 static NormalizePolyClassDesc descInst;
+
+ClassDesc* GetNormalizePolyDesc() {
+    return &descInst;
+}
 
 static ParamBlockDesc2 paramblockDesc(
     pblock_main, _T("params"), 0, &descInst,
@@ -186,26 +189,3 @@ void NormalizePolyMod::ModifyObject(TimeValue t, ModContext& /*mc*/,
         }
     }
 }
-
-// ── DLL boilerplate ─────────────────────────────────────────────────
-BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
-    if (fdwReason == DLL_PROCESS_ATTACH) {
-        hInstance = hinstDLL;
-        DisableThreadLibraryCalls(hinstDLL);
-    }
-    return TRUE;
-}
-
-__declspec(dllexport) const TCHAR* LibDescription() {
-    return _T("Normalize Poly - vertex straightness cleaner");
-}
-
-__declspec(dllexport) int LibNumberClasses() { return 1; }
-
-__declspec(dllexport) ClassDesc* LibClassDesc(int i) {
-    return (i == 0) ? &descInst : nullptr;
-}
-
-__declspec(dllexport) ULONG LibVersion()    { return VERSION_3DSMAX; }
-__declspec(dllexport) int   LibInitialize() { return TRUE; }
-__declspec(dllexport) int   LibShutdown()   { return TRUE; }

@@ -28,14 +28,13 @@ echo [2/5] Building suite...
 %CMAKE% --build "%BUILD_DIR%" --config Release
 if %ERRORLEVEL% NEQ 0 goto :fail
 
-echo [3/5] Deploying plugins...
-for %%F in (FlowState.gup PowerCut.dlm normalize_poly.dlm) do (
-    copy /Y "%BUILD_DIR%\Release\%%F" "%MAX_PLUGINS%\%%F" >nul
-    if ERRORLEVEL 1 (
-        echo Deploy failed for %%F - need admin. Elevating...
-        powershell -Command "Start-Process cmd -ArgumentList '/c copy /Y \"%BUILD_DIR%\Release\%%F\" \"%MAX_PLUGINS%\%%F\"' -Verb RunAs -Wait"
-    )
+echo [3/5] Deploying plugin...
+copy /Y "%BUILD_DIR%\Release\FlowState.gup" "%MAX_PLUGINS%\FlowState.gup" >nul
+if ERRORLEVEL 1 (
+    echo Deploy failed for FlowState.gup - need admin. Elevating...
+    powershell -Command "Start-Process cmd -ArgumentList '/c copy /Y \"%BUILD_DIR%\Release\FlowState.gup\" \"%MAX_PLUGINS%\FlowState.gup\" && del /Q \"%MAX_PLUGINS%\PowerCut.dlm\" \"%MAX_PLUGINS%\normalize_poly.dlm\" 2^>nul' -Verb RunAs -Wait"
 )
+del /Q "%MAX_PLUGINS%\PowerCut.dlm" "%MAX_PLUGINS%\normalize_poly.dlm" >nul 2>&1
 
 echo [4/5] Deploying macros...
 if not exist "%USERMACROS%" mkdir "%USERMACROS%"
