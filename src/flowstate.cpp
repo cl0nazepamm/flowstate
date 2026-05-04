@@ -483,6 +483,44 @@ struct ModCacheEntry { std::wstring label; std::wstring normLabel; std::wstring 
 static std::vector<ModCacheEntry> g_modCache;
 static bool g_modCacheReady = false;
 
+static std::wstring MxsStringLiteral(const std::wstring& s) {
+    std::wstring out = L"\"";
+    for (wchar_t c : s) {
+        if (c == L'\\' || c == L'"') out += L'\\';
+        out += c;
+    }
+    out += L"\"";
+    return out;
+}
+
+static bool AddModifierViaModPanelScript(const std::wstring& primaryName,
+                                         const std::wstring& fallbackName = L"") {
+    if (primaryName.empty() && fallbackName.empty()) return false;
+
+    // This follows the same command-panel route as Max's modifier UI. It is
+    // safer for stack/selection setup than passing a raw C++ modifier pointer
+    // into AddModToSelection from this modeless panel.
+    std::wstring script =
+        L"try("
+        L"local before = if selection.count > 0 then selection[1].modifiers.count else -1;"
+        L"max modify mode;"
+        L"try(subObjectLevel = 0)catch();"
+        L"local names = #(" + MxsStringLiteral(primaryName) + L"," + MxsStringLiteral(fallbackName) + L");"
+        L"local m = undefined;"
+        L"for n in names while m == undefined do if n != \"\" do try(m = execute (n + \"()\"))catch();"
+        L"if m != undefined do "
+        L"(try(if modPanel.validModifier m then modPanel.addModToSelection m)catch();"
+        L"local mid = if selection.count > 0 then selection[1].modifiers.count else -1;"
+        L"if mid <= before do try(addModifier $ m)catch());"
+        L"local after = if selection.count > 0 then selection[1].modifiers.count else -1;"
+        L"if after > before then \"1\" else \"0\""
+        L")catch(\"0\")";
+    FPValue result;
+    BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic,
+        TRUE, &result);
+    return ok && result.type == TYPE_STRING && result.s && wcscmp(result.s, L"1") == 0;
+}
+
 static void EnsureModCache() {
     if (g_modCacheReady) return;
     g_modCache.clear();
@@ -543,21 +581,14 @@ static void ApplyModSearchResult() {
     Interface* ip = GetCOREInterface();
     if (!ip || ip->GetSelNodeCount() == 0) return;
 
-    // Create modifier via C++ SDK — bypasses MaxScript name issues
-    if (mc.cd) {
-        void* obj = mc.cd->Create(FALSE);
-        Modifier* mod = static_cast<Modifier*>(obj);
-        if (mod) {
-            theHold.Begin();
-            GetCOREInterface7()->AddModToSelection(mod);
-            theHold.Accept(_T("Add Modifier"));
-            ip->RedrawViews(ip->GetTime());
-            return;
-        }
+    std::wstring name = mc.internalName.empty() ? mc.label : mc.internalName;
+    if (AddModifierViaModPanelScript(name, mc.label)) {
+        ip->RedrawViews(ip->GetTime());
+        return;
     }
 
-    // Fallback to MaxScript if ClassDesc failed
-    std::wstring name = mc.internalName.empty() ? mc.label : mc.internalName;
+    // Fail closed through script-only add. Do not fall back to a raw C++
+    // Modifier* here; that path can crash Max for spline modifiers.
     std::wstring s = L"try(addModifier $ (" + name + L"()))catch()";
     ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
     ip->RedrawViews(ip->GetTime());
@@ -1230,12 +1261,12 @@ static void ApplyUVDrag(int dxPix, int dyPix, bool ctrl, bool shift) {
         // determined by cursor, never by the UV mapping's orientation
         // on the triangle. Scale is isotropic, derived from the hit
         // triangle at drag start (UV area / screen area).
-        //   cursor right (dx > 0) → U increases
-        //   cursor up    (dy < 0) → V increases  (V=1 is top of texture)
+        // Invert the cursor delta so dragging follows the visible texture
+        // motion in screen space instead of moving the UV island opposite it.
         float du = 0.0f, dv = 0.0f;
         if (s_uv.screenValid) {
-            du =  (float)dxPix * s_uv.screenScale;
-            dv = -(float)dyPix * s_uv.screenScale;
+            du = -(float)dxPix * s_uv.screenScale;
+            dv =  (float)dyPix * s_uv.screenScale;
         }
         for (size_t i = 0; i < s_uv.uvVerts.size(); i++) {
             const UVVert& o = s_uv.origUVs[i];
@@ -2344,6 +2375,41 @@ static int GetNextKeyOrdinal(const std::wstring& key) {
     return ord;
 }
 
+static bool HasEditKey(const std::wstring& key) {
+    for (const auto& ef : g_edits)
+        if (ef.key == key) return true;
+    return false;
+}
+
+static void AddScriptedIntParam(const std::wstring& groupTitle,
+                                const std::wstring& propName,
+                                const std::wstring& label,
+                                const std::wstring& msPath,
+                                int& total) {
+    if (total >= kMaxParams) return;
+    std::wstring key = groupTitle + L":" + propName;
+    if (HasEditKey(key)) return;
+    if (!g_visEditMode && g_hidden.count(key)) return;
+
+    EditField ef;
+    ef.label = label;
+    ef.key = key;
+    ef.msPath = msPath;
+    ef.keyOrdinal = GetNextKeyOrdinal(key);
+    ef.pb = nullptr;
+    ef.id = (ParamID)0;
+    ef.type = (ParamType2)TYPE_INT;
+    g_edits.push_back(ef);
+    total++;
+}
+
+static void AddSplineShapeExtraParams(ReferenceTarget* obj,
+                                      const std::wstring& groupTitle,
+                                      int& total) {
+    if (!obj || obj->ClassID() != splineShapeClassID) return;
+    AddScriptedIntParam(groupTitle, L"steps", L"Interpolation", L"$.baseObject", total);
+}
+
 // Find a param on the current node by its persistent key (ClassName:ParamName)
 static bool FindParam(INode* node, const std::wstring& key,
                       IParamBlock2*& outPB, ParamID& outID, ParamType2& outType) {
@@ -2555,6 +2621,7 @@ static void CollectAllParams(ReferenceTarget* obj, const std::wstring& groupTitl
             }
         }
     }
+    AddSplineShapeExtraParams(obj, groupTitle, tot);
 }
 
 // ── Find EPoly on BASE OBJECT only (not modifiers) ──────────────
@@ -3834,9 +3901,7 @@ static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 for (int i = 0; i < count; ++i) qBtns.push_back({g_quickMods[i].shortLabel.c_str(), i});
                 hit = HitBtnStrip(qBtns.data(), count, BtnStripW(count), pt);
                 if (hit >= 0 && hit < count) {
-                    std::wstring name = g_quickMods[hit].internalName;
-                    std::wstring s = L"try(addModifier $ (" + name + L"()))catch()";
-                    ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
+                    AddModifierViaModPanelScript(g_quickMods[hit].internalName, g_quickMods[hit].label);
                     if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
                     return 0;
                 }

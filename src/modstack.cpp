@@ -172,6 +172,44 @@ std::vector<std::wstring> TokenizeQuery(const std::wstring& query)
     return tokens;
 }
 
+std::wstring MxsStringLiteral(const std::wstring& s)
+{
+    std::wstring out = L"\"";
+    for (wchar_t c : s)
+    {
+        if (c == L'\\' || c == L'"') out += L'\\';
+        out += c;
+    }
+    out += L"\"";
+    return out;
+}
+
+bool AddModifierViaModPanelScript(const std::wstring& primaryName,
+                                  const std::wstring& fallbackName = L"")
+{
+    if (primaryName.empty() && fallbackName.empty()) return false;
+
+    std::wstring script =
+        L"try("
+        L"local before = if selection.count > 0 then selection[1].modifiers.count else -1;"
+        L"max modify mode;"
+        L"try(subObjectLevel = 0)catch();"
+        L"local names = #(" + MxsStringLiteral(primaryName) + L"," + MxsStringLiteral(fallbackName) + L");"
+        L"local m = undefined;"
+        L"for n in names while m == undefined do if n != \"\" do try(m = execute (n + \"()\"))catch();"
+        L"if m != undefined do "
+        L"(try(if modPanel.validModifier m then modPanel.addModToSelection m)catch();"
+        L"local mid = if selection.count > 0 then selection[1].modifiers.count else -1;"
+        L"if mid <= before do try(addModifier $ m)catch());"
+        L"local after = if selection.count > 0 then selection[1].modifiers.count else -1;"
+        L"if after > before then \"1\" else \"0\""
+        L")catch(\"0\")";
+    FPValue result;
+    BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic,
+        TRUE, &result);
+    return ok && result.type == TYPE_STRING && result.s && wcscmp(result.s, L"1") == 0;
+}
+
 int ScoreMatch(const std::wstring& search, const std::wstring& normLabel,
                const std::vector<std::wstring>& tokens)
 {
@@ -785,19 +823,13 @@ private:
 
         if (!ip || ip->GetSelNodeCount() == 0) { SetStatus(L"No selection."); return; }
 
-        // Modifier — add via C++ SDK
-        if (item.classDesc) {
-            void* obj = item.classDesc->Create(FALSE);
-            Modifier* mod = static_cast<Modifier*>(obj);
-            if (mod) {
-                theHold.Begin();
-                GetCOREInterface7()->AddModToSelection(mod);
-                theHold.Accept(_T("Add Modifier"));
-            }
-        }
+        // Modifier — prefer Max's command-panel route so stack context and
+        // modifier gizmos are initialized the same way as the native UI.
+        std::wstring ctorName = item.internalName.empty() ? item.label : item.internalName;
+        bool added = AddModifierViaModPanelScript(ctorName, item.label);
 
         if (ip) ip->RedrawViews(ip->GetTime());
-        SetStatus(L"Added: " + item.label);
+        SetStatus((added ? L"Added: " : L"Could not add: ") + item.label);
         Hide();
     }
 
