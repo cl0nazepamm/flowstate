@@ -1,17 +1,17 @@
 @echo off
 setlocal
 
-:: FlowState suite quick dev cycle for 3ds Max 2026.
+:: FlowState suite quick dev cycle for 3ds Max 2027.
 :: Kills Max, builds all suite plugins, deploys, and relaunches.
-:: Usage: dev.bat [scenefile.max]
+:: Usage: dev_2027.bat [scenefile.max]
 
 set NATIVE_DIR=%~dp0
 set CMAKE="C:\Program Files\CMake\bin\cmake.exe"
-set MAX_VERSION=2026
+set MAX_VERSION=2027
 set MAX_EXE="C:\Program Files\Autodesk\3ds Max %MAX_VERSION%\3dsmax.exe"
 set MAX_PLUGINS=C:\Program Files\Autodesk\3ds Max %MAX_VERSION%\plugins
 set MAXSDK=C:/Program Files/Autodesk/3ds Max %MAX_VERSION% SDK/maxsdk
-set BUILD_DIR=%NATIVE_DIR%build
+set BUILD_DIR=%NATIVE_DIR%build_%MAX_VERSION%
 set USERMACROS=%LOCALAPPDATA%\Autodesk\3dsMax\%MAX_VERSION% - 64bit\ENU\usermacros
 
 set SCENE=%~1

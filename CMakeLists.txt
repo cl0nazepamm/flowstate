@@ -1,19 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  CHANGE THESE for your plugin                               ║
-# ╚══════════════════════════════════════════════════════════════╝
-set(PLUGIN_NAME "FlowState")             # Output filename (FlowState.gup)
-set(PLUGIN_TYPE "gup")              # gup, dlo, dlm, dlt, dlr, dlu, dle, bmi
-
-project(${PLUGIN_NAME} VERSION 1.0.0 LANGUAGES CXX)
+project(FlowStateSuite VERSION 1.0.0 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ── Max SDK ──────────────────────────────────────────────────────
+# Pass -DMAX_VERSION=2027 to target a different Max install.
+if(NOT DEFINED MAX_VERSION)
+    set(MAX_VERSION "2026" CACHE STRING "Target 3ds Max version")
+endif()
+
 if(NOT DEFINED MAXSDK_PATH)
-    set(MAXSDK_PATH "C:/Program Files/Autodesk/3ds Max 2026 SDK/maxsdk"
+    set(MAXSDK_PATH "C:/Program Files/Autodesk/3ds Max ${MAX_VERSION} SDK/maxsdk"
         CACHE PATH "Path to 3ds Max SDK")
 endif()
 
@@ -21,52 +19,66 @@ if(NOT EXISTS "${MAXSDK_PATH}/include/max.h")
     message(FATAL_ERROR "Cannot find max.h at ${MAXSDK_PATH}/include/max.h. Set -DMAXSDK_PATH=...")
 endif()
 
-# ── Sources (add your .cpp files here) ───────────────────────────
-file(GLOB_RECURSE SOURCES "src/*.cpp")
-add_library(${PLUGIN_NAME} SHARED ${SOURCES})
+if(NOT DEFINED MAX_PLUGINS_DIR)
+    set(MAX_PLUGINS_DIR "C:/Program Files/Autodesk/3ds Max ${MAX_VERSION}/plugins"
+        CACHE PATH "3ds Max plugins directory")
+endif()
 
-# ── Output as plugin extension ───────────────────────────────────
-set_target_properties(${PLUGIN_NAME} PROPERTIES
-    SUFFIX ".${PLUGIN_TYPE}"
-    OUTPUT_NAME "${PLUGIN_NAME}"
+message(STATUS "Building FlowState plugin suite for 3ds Max ${MAX_VERSION}")
+message(STATUS "  SDK: ${MAXSDK_PATH}")
+
+set(MAXSDK_LIB_DIR "${MAXSDK_PATH}/lib/x64/Release")
+
+function(configure_max_plugin target_name output_name plugin_type)
+    set_target_properties(${target_name} PROPERTIES
+        SUFFIX ".${plugin_type}"
+        OUTPUT_NAME "${output_name}"
+    )
+
+    target_include_directories(${target_name} PRIVATE
+        "${MAXSDK_PATH}/include"
+    )
+
+    target_compile_definitions(${target_name} PRIVATE
+        NOMINMAX
+        _UNICODE UNICODE
+        WIN32 _WIN32
+        _USRDLL
+        _CRT_SECURE_NO_WARNINGS
+    )
+
+    target_link_directories(${target_name} PRIVATE
+        "${MAXSDK_LIB_DIR}"
+    )
+
+    if(MSVC)
+        target_compile_options(${target_name} PRIVATE /W3 /MP)
+        set_property(TARGET ${target_name} PROPERTY MSVC_RUNTIME_LIBRARY
+            "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    endif()
+
+    install(TARGETS ${target_name}
+        RUNTIME DESTINATION "${MAX_PLUGINS_DIR}"
+        LIBRARY DESTINATION "${MAX_PLUGINS_DIR}"
+    )
+endfunction()
+
+# FlowState.gup
+add_library(FlowState SHARED
+    src/flowstate.cpp
+    src/powershader.cpp
+    src/powershader.h
+    src/modstack.cpp
+    src/modstack.h
+    src/FlowState.def
 )
 
-# Module definition — exports LibVersion, LibDescription, etc.
-target_sources(${PLUGIN_NAME} PRIVATE "src/FlowState.def")
-
-# ── Includes ─────────────────────────────────────────────────────
-target_include_directories(${PLUGIN_NAME} PRIVATE
+configure_max_plugin(FlowState FlowState gup)
+target_include_directories(FlowState PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
-    "${MAXSDK_PATH}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
-
-# ── Preprocessor ─────────────────────────────────────────────────
-target_compile_definitions(${PLUGIN_NAME} PRIVATE
-    NOMINMAX
-    _UNICODE UNICODE
-    WIN32 _WIN32
-    _USRDLL
-    _CRT_SECURE_NO_WARNINGS
-)
-
-# ── Link Max SDK libs ────────────────────────────────────────────
-# Common libs — uncomment what you need:
-#   core.lib        — always needed
-#   maxutil.lib     — utilities, Class_ID, etc.
-#   gup.lib         — GUP plugins
-#   Geom.lib        — Point3, Matrix3, geometry math
-#   Paramblk2.lib   — ClassDesc2, ParamBlockDesc2
-#   Maxscrpt.lib    — MAXScript integration (mprintf, ExecuteMAXScriptScript)
-#   mesh.lib        — Mesh, MNMesh operations
-#   MNMath.lib      — MNMesh math
-#   poly.lib        — Editable Poly
-#   bmm.lib         — Bitmap Manager (render/viewport capture)
-
-target_link_directories(${PLUGIN_NAME} PRIVATE
-    "${MAXSDK_PATH}/lib/x64/Release"
-)
-
-target_link_libraries(${PLUGIN_NAME} PRIVATE
+target_link_libraries(FlowState PRIVATE
     core.lib
     maxutil.lib
     gup.lib
@@ -79,19 +91,68 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
     bmm.lib
     gdiplus.lib
 )
-
-# ── MSVC settings ────────────────────────────────────────────────
 if(MSVC)
-    target_compile_options(${PLUGIN_NAME} PRIVATE /W3 /MP /EHa)
-    set_property(TARGET ${PLUGIN_NAME} PROPERTY MSVC_RUNTIME_LIBRARY
-        "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    target_compile_options(FlowState PRIVATE /EHa)
 endif()
 
-# ── Deploy to Max ────────────────────────────────────────────────
-set(MAX_PLUGINS_DIR "C:/Program Files/Autodesk/3ds Max 2026/plugins"
-    CACHE PATH "3ds Max plugins directory")
-
-install(TARGETS ${PLUGIN_NAME}
-    RUNTIME DESTINATION "${MAX_PLUGINS_DIR}"
-    LIBRARY DESTINATION "${MAX_PLUGINS_DIR}"
+# PowerCut.dlm
+add_library(PowerCut SHARED
+    src/powercut/dllmain.cpp
+    src/powercut/MeshCutter.cpp
+    src/powercut/MeshCutter.h
+    src/powercut/PowerCut.rc
+    src/powercut/PowerCut.def
+    src/powercut/PowerCutDesc.h
+    src/powercut/PowerCutMod.cpp
+    src/powercut/PowerCutMod.h
+    src/powercut/SplineProjector.cpp
+    src/powercut/SplineProjector.h
+    src/powercut/DebugLog.h
+    src/powercut/resource.h
 )
+
+configure_max_plugin(PowerCut PowerCut dlm)
+target_include_directories(PowerCut PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/powercut"
+)
+target_link_libraries(PowerCut PRIVATE
+    core.lib
+    maxutil.lib
+    Geom.lib
+    Paramblk2.lib
+    mesh.lib
+    MNMath.lib
+    poly.lib
+    comctl32.lib
+)
+if(MSVC)
+    target_compile_options(PowerCut PRIVATE /EHsc /O2 /fp:fast)
+endif()
+
+# normalize_poly.dlm
+add_library(normalize_poly SHARED
+    src/normalize_edges/f2_extend_tool.cpp
+    src/normalize_edges/normalize_poly.cpp
+    src/normalize_edges/normalize_poly.rc
+    src/normalize_edges/normalize_poly.def
+    src/normalize_edges/resource.h
+    src/normalize_edges/smooth_bridge_tool.cpp
+)
+
+configure_max_plugin(normalize_poly normalize_poly dlm)
+target_include_directories(normalize_poly PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/normalize_edges"
+)
+target_link_libraries(normalize_poly PRIVATE
+    core.lib
+    maxutil.lib
+    Paramblk2.lib
+    Geom.lib
+    mesh.lib
+    MNMath.lib
+    poly.lib
+    comctl32.lib
+)
+if(MSVC)
+    target_compile_options(normalize_poly PRIVATE /EHsc /openmp)
+endif()

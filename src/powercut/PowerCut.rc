@@ -1,0 +1,62 @@
+#include <windows.h>
+#include "resource.h"
+
+STRINGTABLE
+BEGIN
+    IDS_PARAMS          "Parameters"
+    IDS_SPLINE_NODE     "Spline Nodes"
+    IDS_STEPS           "Steps"
+    IDS_FLIP            "Flip Depth"
+    IDS_WELD_THRESH     "Weld Threshold"
+    IDS_MODE            "Mode"
+    IDS_KEEP_TRIS       "Keep Triangulation"
+    IDS_PROJ_MODE       "Projection Mode"
+    IDS_DEPTH           "Depth"
+    IDS_SOLID           "Solid"
+    IDS_THICKNESS       "Thickness"
+    IDS_BEVEL           "Bevel"
+    IDS_BEVEL_AMOUNT    "Bevel Amount"
+    IDS_BEVEL_SEGMENTS  "Bevel Segments"
+END
+
+IDD_PANEL DIALOG 0, 0, 108, 218
+STYLE WS_CHILD | WS_VISIBLE
+FONT 8, "MS Sans Serif"
+BEGIN
+    LTEXT           "Splines:",     -1, 4, 4, 40, 8
+    LISTBOX         IDC_SPLINE_LIST, 4, 14, 100, 48,
+                    LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Add",     IDC_PICK_SPLINE, 4, 64, 48, 14
+    PUSHBUTTON      "Remove",  IDC_DEL_SPLINE,  56, 64, 48, 14
+
+    GROUPBOX        "Mode", -1, 4, 82, 100, 40
+    CONTROL         "Cut", IDC_MODE_CUT, "Button",
+                    BS_AUTORADIOBUTTON | WS_GROUP, 10, 92, 40, 10
+    CONTROL         "Split", IDC_MODE_SPLIT, "Button",
+                    BS_AUTORADIOBUTTON, 54, 92, 44, 10
+    CONTROL         "Subtract", IDC_MODE_SUBTRACT, "Button",
+                    BS_AUTORADIOBUTTON, 10, 106, 40, 10
+    CONTROL         "Intersect", IDC_MODE_INTERSECT, "Button",
+                    BS_AUTORADIOBUTTON, 54, 106, 44, 10
+
+    GROUPBOX        "Projection", -1, 4, 126, 100, 34
+    CONTROL         "Spline Z", IDC_PROJ_SPLINE_Z, "Button",
+                    BS_AUTORADIOBUTTON | WS_GROUP, 10, 136, 40, 10
+    CONTROL         "Normal", IDC_PROJ_NORMAL, "Button",
+                    BS_AUTORADIOBUTTON, 54, 136, 44, 10
+    PUSHBUTTON      "Flip Depth: Off", IDC_FLIP_CHECK, 10, 148, 48, 10
+
+    LTEXT           "Depth:",       -1, 4, 178, 28, 8
+    CONTROL         "", IDC_DEPTH_EDIT, "CustEdit", 0x0, 34, 176, 36, 10
+    CONTROL         "", IDC_DEPTH_SPIN, "SpinnerControl", 0x0, 72, 176, 7, 10
+    CONTROL         "Inf", IDC_DEPTH_INFINITE, "Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 82, 178, 22, 8
+
+    LTEXT           "Steps:",       -1, 4, 194, 30, 8
+    CONTROL         "", IDC_STEPS_EDIT, "CustEdit", 0x0, 38, 192, 36, 10
+    CONTROL         "", IDC_STEPS_SPIN, "SpinnerControl", 0x0, 76, 192, 7, 10
+
+    LTEXT           "Weld:",        -1, 4, 208, 30, 8
+    CONTROL         "", IDC_WELD_EDIT, "CustEdit", 0x0, 38, 206, 36, 10
+    CONTROL         "", IDC_WELD_SPIN, "SpinnerControl", 0x0, 76, 206, 7, 10
+END

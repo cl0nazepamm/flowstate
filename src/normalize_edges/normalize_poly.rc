@@ -1,0 +1,25 @@
+#include <windows.h>
+#include "resource.h"
+
+IDD_NORMALIZE_POLY DIALOGEX 0, 0, 108, 56
+STYLE WS_CHILD | WS_VISIBLE
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT           "Threshold:", IDC_STATIC, 6, 10, 40, 9
+    CONTROL         "", IDC_THRESHOLD, "CustEdit",
+                    WS_TABSTOP, 48, 8, 38, 12
+    CONTROL         "", IDC_THRESHOLD_SPIN, "SpinnerControl",
+                    0, 88, 8, 7, 12
+    CONTROL         "Select Only", IDC_SELECT_ONLY, "Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 6, 32, 96, 10
+END
+
+STRINGTABLE
+BEGIN
+    IDS_PARAMS          "Parameters"
+    IDS_THRESHOLD       "Threshold"
+    IDS_SELECT_ONLY     "Select Only"
+    IDS_CATEGORY        "Clone Tools"
+    IDS_CLASS_NAME      "Normalize Poly"
+    IDS_LIB_DESC        "Normalize Poly - vertex straightness cleaner"
+END

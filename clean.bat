@@ -1,5 +1,7 @@
 @echo off
-echo Cleaning build directory...
+echo Cleaning build directories...
 rmdir /s /q "%~dp0build" 2>nul
+rmdir /s /q "%~dp0build_2026" 2>nul
+rmdir /s /q "%~dp0build_2027" 2>nul
 echo Done.
 pause
