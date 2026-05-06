@@ -16,6 +16,7 @@
 #include <mesh.h>
 #include <channels.h>
 #include <cmdmode.h>
+#include <notify.h>
 #include <maxscript/maxscript.h>
 #include <hold.h>
 #include <windowsx.h>
@@ -149,16 +150,10 @@ static POINT           g_screenGrabLastScreenPt = { 0, 0 };
 static BaseObject*      g_screenGrabEditObj = nullptr;
 static bool             g_screenGrabHoldStarted = false;
 static bool             g_screenGrabMoved = false;
-static bool             g_orbitPivotLocked = false;
+static bool             g_autoOrbitLock = false;
+static bool             g_autoOrbitNotifyRegistered = false;
 
 static void ShowOSD(const std::wstring& text);
-
-static bool NormalizeRayDirection(Ray& ray) {
-    float len = Length(ray.dir);
-    if (len <= 1.0e-8f) return false;
-    ray.dir = ray.dir / len;
-    return true;
-}
 
 static bool TryGetViewportFromScreenPoint(const POINT& screenPt, HWND& viewHwnd, POINT* ptLocal = nullptr) {
     viewHwnd = nullptr;
@@ -182,102 +177,6 @@ static bool TryGetViewportFromScreenPoint(const POINT& screenPt, HWND& viewHwnd,
         *ptLocal = screenPt;
         ScreenToClient(viewHwnd, ptLocal);
     }
-    return true;
-}
-
-static bool OrbitRayIntersectTri(const Ray& r, const Point3& a, const Point3& b, const Point3& c, float& outT) {
-    const float EPS = 1.0e-7f;
-    Point3 e1 = b - a;
-    Point3 e2 = c - a;
-    Point3 p = r.dir ^ e2;
-    float det = e1 % p;
-    if (det > -EPS && det < EPS) return false;
-    float invDet = 1.0f / det;
-    Point3 s = r.p - a;
-    float u = invDet * (s % p);
-    if (u < 0.0f || u > 1.0f) return false;
-    Point3 q = s ^ e1;
-    float v = invDet * (r.dir % q);
-    if (v < 0.0f || u + v > 1.0f) return false;
-    float t = invDet * (e2 % q);
-    if (t <= EPS) return false;
-    outT = t;
-    return true;
-}
-
-static void OrbitPickNode(INode* node, TimeValue t, const Ray& rayWorld,
-    bool& found, float& bestDist, Point3& bestPoint) {
-    if (!node) return;
-
-    for (int i = 0; i < node->NumberOfChildren(); ++i)
-        OrbitPickNode(node->GetChildNode(i), t, rayWorld, found, bestDist, bestPoint);
-
-    if (node->IsNodeHidden(FALSE)) return;
-
-    ObjectState os = node->EvalWorldState(t);
-    if (!os.obj || !os.obj->CanConvertToType(Class_ID(TRIOBJ_CLASS_ID, 0)))
-        return;
-
-    TriObject* tri = (TriObject*)os.obj->ConvertToType(t, Class_ID(TRIOBJ_CLASS_ID, 0));
-    if (!tri) return;
-    bool needsDelete = (tri != (Object*)os.obj);
-
-    Matrix3 tm = node->GetObjectTM(t);
-    Matrix3 inv = Inverse(tm);
-    Ray rayObj;
-    rayObj.p = inv.PointTransform(rayWorld.p);
-    rayObj.dir = inv.VectorTransform(rayWorld.dir);
-    if (!NormalizeRayDirection(rayObj)) {
-        if (needsDelete) tri->DeleteThis();
-        return;
-    }
-
-    Mesh& mesh = tri->GetMesh();
-    int faceCount = mesh.getNumFaces();
-    for (int fi = 0; fi < faceCount; ++fi) {
-        Face& f = mesh.faces[fi];
-        Point3 a = mesh.verts[f.v[0]];
-        Point3 b = mesh.verts[f.v[1]];
-        Point3 c = mesh.verts[f.v[2]];
-        float hitT = 0.0f;
-        if (!OrbitRayIntersectTri(rayObj, a, b, c, hitT))
-            continue;
-
-        Point3 hitObj = rayObj.p + rayObj.dir * hitT;
-        Point3 hitWorld = tm.PointTransform(hitObj);
-        float dist = Length(hitWorld - rayWorld.p);
-        if (!found || dist < bestDist) {
-            found = true;
-            bestDist = dist;
-            bestPoint = hitWorld;
-        }
-    }
-
-    if (needsDelete) tri->DeleteThis();
-}
-
-static bool OrbitPickMeshSurface(HWND viewHwnd, const POINT& localPt, Point3& outPoint) {
-    Interface* ip = GetCOREInterface();
-    if (!ip || !viewHwnd || !IsWindow(viewHwnd)) return false;
-
-    ViewExp& vpt = ip->GetViewExp(viewHwnd);
-    Ray rayWorld;
-    vpt.MapScreenToWorldRay((float)localPt.x, (float)localPt.y, rayWorld);
-    if (!NormalizeRayDirection(rayWorld)) return false;
-
-    bool found = false;
-    float bestDist = 1.0e30f;
-    Point3 bestPoint(0.0f, 0.0f, 0.0f);
-    TimeValue t = ip->GetTime();
-
-    INode* root = ip->GetRootNode();
-    if (root) {
-        for (int i = 0; i < root->NumberOfChildren(); ++i)
-            OrbitPickNode(root->GetChildNode(i), t, rayWorld, found, bestDist, bestPoint);
-    }
-
-    if (!found) return false;
-    outPoint = bestPoint;
     return true;
 }
 
@@ -449,71 +348,104 @@ static bool BeginScreenGrab(const POINT& screenPt) {
     return true;
 }
 
-static bool ToggleOrbitPivotLock(const POINT& screenPt, HWND viewHwnd) {
-    POINT localPt{};
-    HWND resolvedViewHwnd = nullptr;
-    if (TryGetViewportFromScreenPoint(screenPt, resolvedViewHwnd, &localPt)) {
-        viewHwnd = resolvedViewHwnd;
-    } else if (viewHwnd && IsWindow(viewHwnd)) {
-        localPt = screenPt;
-        ScreenToClient(viewHwnd, &localPt);
-    } else {
-        return false;
+// Orbit toolbar flyoff: 0=Orbit  1=Orbit Selected  2=Orbit SubObject  3=Orbit POI
+constexpr int kOrbitFlyoffSubObject = 2;
+constexpr int kOrbitFlyoffPOI       = 3;
+constexpr UINT kOrbitFlyoffCtrlId   = 50018;
+
+static BOOL CALLBACK FindViewControlToolbarProc(HWND hwnd, LPARAM lp) {
+    wchar_t text[128] = {};
+    GetWindowTextW(hwnd, text, 128);
+    if (wcscmp(text, L"ViewControlPanelBottomToolbar") == 0) {
+        *(HWND*)lp = hwnd;
+        return FALSE;
     }
+    return TRUE;
+}
 
-    unsigned long long hwndValue = (unsigned long long)(ULONG_PTR)viewHwnd;
-    wchar_t script[4096] = {};
+static bool SetOrbitFlyoff(int idx) {
+    Interface* ip = GetCOREInterface();
+    if (!ip) return false;
+    HWND tb = nullptr;
+    EnumChildWindows(ip->GetMAXHWnd(), FindViewControlToolbarProc, (LPARAM)&tb);
+    if (!tb) return false;
+    HWND btnHwnd = GetDlgItem(tb, kOrbitFlyoffCtrlId);
+    if (!btnHwnd) return false;
+    ICustButton* btn = GetICustButton(btnHwnd);
+    if (!btn) return false;
 
-    if (g_orbitPivotLocked) {
-        swprintf(script, 4096,
-            L"try(IAutoCamMax.SetHoldPivotBallPosition false;"
-            L"try(IAutoCamMax.HidePivotBall %llu)catch();"
-            L"redrawViews();\"1\")catch(\"0\")",
-            hwndValue);
-        FPValue result;
-        BOOL ok = ExecuteMAXScriptScript(script, MAXScript::ScriptSource::Dynamic, TRUE, &result);
-        if (ok && result.type == TYPE_STRING && result.s && wcscmp(result.s, L"1") == 0) {
-            g_orbitPivotLocked = false;
-            ShowOSD(L"Orbit pivot unlocked");
-            return true;
-        }
-        return false;
-    }
-
-    if (Interface* ip = GetCOREInterface())
-        ip->SetActiveViewport(viewHwnd);
-    SetFocus(viewHwnd);
-
-    RECT rc{};
-    GetClientRect(viewHwnd, &rc);
-    int w = std::max(1, (int)(rc.right - rc.left));
-    int h = std::max(1, (int)(rc.bottom - rc.top));
-    int px = std::clamp((int)localPt.x, 0, w - 1);
-    int py = std::clamp((int)localPt.y, 0, h - 1);
-
-    Point3 hitPoint(0.0f, 0.0f, 0.0f);
-    POINT clampedLocalPt{ px, py };
-    if (!OrbitPickMeshSurface(viewHwnd, clampedLocalPt, hitPoint)) {
-        ShowOSD(L"Orbit pivot: no mesh hit");
-        return false;
-    }
-
-    std::wstring scriptText =
-        L"try(IAutoCamMax.SetHoldPivotBallPosition false;"
-        L"local mousePoint=[" + std::to_wstring(px) + L"," + std::to_wstring(py) + L"];"
-        L"local centerPoint=[0,0,0];"
-        L"IAutoCamMax.ShowPivotBall " + std::to_wstring(hwndValue) + L" &mousePoint &centerPoint true applyUIScaling:false;"
-        L"redrawViews();"
-        L"IAutoCamMax.SetHoldPivotBallPosition true;"
-        L"\"1\")catch(\"0\")";
-    FPValue result;
-    BOOL ok = ExecuteMAXScriptScript(scriptText.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &result);
-    if (ok && result.type == TYPE_STRING && result.s && wcscmp(result.s, L"1") == 0) {
-        g_orbitPivotLocked = true;
-        ShowOSD(L"Orbit pivot locked");
+    if (btn->GetCurFlyOff() == idx) {
+        ReleaseICustButton(btn);
         return true;
     }
-    return false;
+
+    CommandMode* prevMode = ip->GetCommandMode();
+    int prevId = prevMode ? prevMode->ID() : -1;
+
+    btn->SetCurFlyOff(idx, TRUE);
+    ReleaseICustButton(btn);
+
+    CommandMode* nowMode = ip->GetCommandMode();
+    if (nowMode && nowMode->ID() == CID_ROTATEVIEW && prevId != CID_ROTATEVIEW) {
+        ip->PopCommandMode();
+    }
+    return true;
+}
+
+static int DesiredOrbitFlyoff() {
+    Interface* ip = GetCOREInterface();
+    if (!ip) return kOrbitFlyoffPOI;
+    if (ip->GetSelNodeCount() > 0
+        && ip->GetSubObjectLevel() > 0
+        && ip->GetCommandPanelTaskMode() == TASK_MODE_MODIFY)
+        return kOrbitFlyoffSubObject;
+    return kOrbitFlyoffPOI;
+}
+
+static void EvaluateAutoOrbit() {
+    if (!g_autoOrbitLock) return;
+    SetOrbitFlyoff(DesiredOrbitFlyoff());
+}
+
+static void AutoOrbitNotifyCB(void* /*param*/, NotifyInfo* /*info*/) {
+    EvaluateAutoOrbit();
+}
+
+static UINT_PTR g_autoOrbitTimer = 0;
+
+static VOID CALLBACK AutoOrbitTimerProc(HWND, UINT, UINT_PTR, DWORD) {
+    EvaluateAutoOrbit();
+}
+
+static void SetAutoOrbitLock(bool enable) {
+    if (enable == g_autoOrbitLock) return;
+    g_autoOrbitLock = enable;
+    if (enable) {
+        if (!g_autoOrbitNotifyRegistered) {
+            RegisterNotification(AutoOrbitNotifyCB, nullptr, NOTIFY_SELECTIONSET_CHANGED);
+            RegisterNotification(AutoOrbitNotifyCB, nullptr, NOTIFY_MODPANEL_SUBOBJECTLEVEL_CHANGED);
+            g_autoOrbitNotifyRegistered = true;
+        }
+        if (!g_autoOrbitTimer)
+            g_autoOrbitTimer = SetTimer(nullptr, 0, 250, AutoOrbitTimerProc);
+        EvaluateAutoOrbit();
+        ShowOSD(L"Auto orbit lock: ON");
+    } else {
+        if (g_autoOrbitNotifyRegistered) {
+            UnRegisterNotification(AutoOrbitNotifyCB, nullptr, NOTIFY_SELECTIONSET_CHANGED);
+            UnRegisterNotification(AutoOrbitNotifyCB, nullptr, NOTIFY_MODPANEL_SUBOBJECTLEVEL_CHANGED);
+            g_autoOrbitNotifyRegistered = false;
+        }
+        if (g_autoOrbitTimer) {
+            KillTimer(nullptr, g_autoOrbitTimer);
+            g_autoOrbitTimer = 0;
+        }
+        ShowOSD(L"Auto orbit lock: OFF");
+    }
+}
+
+static void ToggleAutoOrbitLock() {
+    SetAutoOrbitLock(!g_autoOrbitLock);
 }
 
 static void EndScreenGrab(bool accept) {
@@ -1993,6 +1925,7 @@ static bool IsMaterialEditorFocused() {
 }
 
 static const UINT WM_PP_SHADER   = WM_USER + 104;
+static const UINT WM_FS_ORBIT_EVAL = WM_USER + 110;
 static const UINT WM_PP_MODSTACK = WM_USER + 105;
 
 // ── Forward declarations ────────────────────────────────────────
@@ -2446,11 +2379,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             bool alt   = (GetKeyState(VK_MENU) & 0x8000) != 0;
             bool matEd = IsMaterialEditorFocused();
             if (ctrl && !shift && !alt) {
-                POINT screenPt = ((MOUSEHOOKSTRUCT*)lp)->pt;
-                HWND viewHwnd = nullptr;
-                if (!TryGetViewportFromScreenPoint(screenPt, viewHwnd, nullptr))
-                    return 0;
-                ToggleOrbitPivotLock(screenPt, viewHwnd);
+                ToggleAutoOrbitLock();
                 return 1;
             } else if (alt && shift && !ctrl) {
                 // Alt+Shift+XButton2 -> swap V/H slider assignments
@@ -2482,6 +2411,10 @@ static LRESULT CALLBACK KbHookProc(int nCode, WPARAM wp, LPARAM lp) {
             PostMessage(g_panel, WM_PP_SHADER, 0, 0);
             return 1; // eat the Tab
         }
+    }
+    if (nCode >= 0 && g_autoOrbitLock && (lp & (1 << 31)) && g_panel) {
+        // Key-up: defer eval so hotkey-driven panel switch can complete first.
+        PostMessage(g_panel, WM_FS_ORBIT_EVAL, 0, 0);
     }
     return CallNextHookEx(g_kbHook, nCode, wp, lp);
 }
@@ -5177,6 +5110,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PP_MODSTACK:
         ModStack::Toggle(); return 0;
 
+    case WM_FS_ORBIT_EVAL:
+        EvaluateAutoOrbit(); return 0;
+
     }
     return DefWindowProc(hwnd, msg, wp, lp);
 }
@@ -5401,6 +5337,7 @@ public:
     }
 
     void Stop() override {
+        SetAutoOrbitLock(false);
         ModStack::Shutdown();
         PowerShader::Shutdown();
         if (g_screenGrabState != SCREEN_GRAB_NONE)
