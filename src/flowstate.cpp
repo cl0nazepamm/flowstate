@@ -150,7 +150,8 @@ static POINT           g_screenGrabLastScreenPt = { 0, 0 };
 static BaseObject*      g_screenGrabEditObj = nullptr;
 static bool             g_screenGrabHoldStarted = false;
 static bool             g_screenGrabMoved = false;
-static bool             g_autoOrbitLock = false;
+enum AutoOrbitMode { AUTO_ORBIT_OFF = 0, AUTO_ORBIT_STANDARD = 1, AUTO_ORBIT_SELECTED = 2, AUTO_ORBIT_POI = 3 };
+static AutoOrbitMode    g_autoOrbitMode = AUTO_ORBIT_OFF;
 static bool             g_autoOrbitNotifyRegistered = false;
 
 static void ShowOSD(const std::wstring& text);
@@ -349,6 +350,8 @@ static bool BeginScreenGrab(const POINT& screenPt) {
 }
 
 // Orbit toolbar flyoff: 0=Orbit  1=Orbit Selected  2=Orbit SubObject  3=Orbit POI
+constexpr int kOrbitFlyoffStandard  = 0;
+constexpr int kOrbitFlyoffSelected  = 1;
 constexpr int kOrbitFlyoffSubObject = 2;
 constexpr int kOrbitFlyoffPOI       = 3;
 constexpr UINT kOrbitFlyoffCtrlId   = 50018;
@@ -393,17 +396,20 @@ static bool SetOrbitFlyoff(int idx) {
 }
 
 static int DesiredOrbitFlyoff() {
+    int exitFlyoff = kOrbitFlyoffPOI;
+    if (g_autoOrbitMode == AUTO_ORBIT_STANDARD) exitFlyoff = kOrbitFlyoffStandard;
+    else if (g_autoOrbitMode == AUTO_ORBIT_SELECTED) exitFlyoff = kOrbitFlyoffSelected;
     Interface* ip = GetCOREInterface();
-    if (!ip) return kOrbitFlyoffPOI;
+    if (!ip) return exitFlyoff;
     if (ip->GetSelNodeCount() > 0
         && ip->GetSubObjectLevel() > 0
         && ip->GetCommandPanelTaskMode() == TASK_MODE_MODIFY)
         return kOrbitFlyoffSubObject;
-    return kOrbitFlyoffPOI;
+    return exitFlyoff;
 }
 
 static void EvaluateAutoOrbit() {
-    if (!g_autoOrbitLock) return;
+    if (g_autoOrbitMode == AUTO_ORBIT_OFF) return;
     SetOrbitFlyoff(DesiredOrbitFlyoff());
 }
 
@@ -417,35 +423,50 @@ static VOID CALLBACK AutoOrbitTimerProc(HWND, UINT, UINT_PTR, DWORD) {
     EvaluateAutoOrbit();
 }
 
-static void SetAutoOrbitLock(bool enable) {
-    if (enable == g_autoOrbitLock) return;
-    g_autoOrbitLock = enable;
-    if (enable) {
-        if (!g_autoOrbitNotifyRegistered) {
-            RegisterNotification(AutoOrbitNotifyCB, nullptr, NOTIFY_SELECTIONSET_CHANGED);
-            RegisterNotification(AutoOrbitNotifyCB, nullptr, NOTIFY_MODPANEL_SUBOBJECTLEVEL_CHANGED);
-            g_autoOrbitNotifyRegistered = true;
-        }
-        if (!g_autoOrbitTimer)
-            g_autoOrbitTimer = SetTimer(nullptr, 0, 250, AutoOrbitTimerProc);
-        EvaluateAutoOrbit();
-        ShowOSD(L"Auto orbit lock: ON");
-    } else {
-        if (g_autoOrbitNotifyRegistered) {
-            UnRegisterNotification(AutoOrbitNotifyCB, nullptr, NOTIFY_SELECTIONSET_CHANGED);
-            UnRegisterNotification(AutoOrbitNotifyCB, nullptr, NOTIFY_MODPANEL_SUBOBJECTLEVEL_CHANGED);
-            g_autoOrbitNotifyRegistered = false;
-        }
-        if (g_autoOrbitTimer) {
-            KillTimer(nullptr, g_autoOrbitTimer);
-            g_autoOrbitTimer = 0;
-        }
-        ShowOSD(L"Auto orbit lock: OFF");
+static void SetAutoOrbitMode(AutoOrbitMode mode) {
+    if (mode == g_autoOrbitMode) return;
+    bool wasOn = g_autoOrbitMode != AUTO_ORBIT_OFF;
+    bool nowOn = mode != AUTO_ORBIT_OFF;
+    g_autoOrbitMode = mode;
+
+    if (nowOn && !g_autoOrbitNotifyRegistered) {
+        RegisterNotification(AutoOrbitNotifyCB, nullptr, NOTIFY_SELECTIONSET_CHANGED);
+        RegisterNotification(AutoOrbitNotifyCB, nullptr, NOTIFY_MODPANEL_SUBOBJECTLEVEL_CHANGED);
+        g_autoOrbitNotifyRegistered = true;
+    } else if (!nowOn && g_autoOrbitNotifyRegistered) {
+        UnRegisterNotification(AutoOrbitNotifyCB, nullptr, NOTIFY_SELECTIONSET_CHANGED);
+        UnRegisterNotification(AutoOrbitNotifyCB, nullptr, NOTIFY_MODPANEL_SUBOBJECTLEVEL_CHANGED);
+        g_autoOrbitNotifyRegistered = false;
     }
+
+    if (nowOn && !g_autoOrbitTimer) {
+        g_autoOrbitTimer = SetTimer(nullptr, 0, 250, AutoOrbitTimerProc);
+    } else if (!nowOn && g_autoOrbitTimer) {
+        KillTimer(nullptr, g_autoOrbitTimer);
+        g_autoOrbitTimer = 0;
+    }
+
+    if (nowOn) EvaluateAutoOrbit();
+    else SetOrbitFlyoff(kOrbitFlyoffStandard);
+
+    switch (mode) {
+        case AUTO_ORBIT_OFF:      ShowOSD(L"Auto orbit: OFF"); break;
+        case AUTO_ORBIT_STANDARD: ShowOSD(L"Auto orbit: ORBIT"); break;
+        case AUTO_ORBIT_SELECTED: ShowOSD(L"Auto orbit: SELECTED"); break;
+        case AUTO_ORBIT_POI:      ShowOSD(L"Auto orbit: POI"); break;
+    }
+    (void)wasOn;
 }
 
-static void ToggleAutoOrbitLock() {
-    SetAutoOrbitLock(!g_autoOrbitLock);
+static void CycleAutoOrbitMode() {
+    AutoOrbitMode next = AUTO_ORBIT_OFF;
+    switch (g_autoOrbitMode) {
+        case AUTO_ORBIT_OFF:      next = AUTO_ORBIT_STANDARD; break;
+        case AUTO_ORBIT_STANDARD: next = AUTO_ORBIT_SELECTED; break;
+        case AUTO_ORBIT_SELECTED: next = AUTO_ORBIT_POI; break;
+        case AUTO_ORBIT_POI:      next = AUTO_ORBIT_OFF; break;
+    }
+    SetAutoOrbitMode(next);
 }
 
 static void EndScreenGrab(bool accept) {
@@ -2379,7 +2400,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             bool alt   = (GetKeyState(VK_MENU) & 0x8000) != 0;
             bool matEd = IsMaterialEditorFocused();
             if (ctrl && !shift && !alt) {
-                ToggleAutoOrbitLock();
+                CycleAutoOrbitMode();
                 return 1;
             } else if (alt && shift && !ctrl) {
                 // Alt+Shift+XButton2 -> swap V/H slider assignments
@@ -2412,7 +2433,7 @@ static LRESULT CALLBACK KbHookProc(int nCode, WPARAM wp, LPARAM lp) {
             return 1; // eat the Tab
         }
     }
-    if (nCode >= 0 && g_autoOrbitLock && (lp & (1 << 31)) && g_panel) {
+    if (nCode >= 0 && g_autoOrbitMode != AUTO_ORBIT_OFF && (lp & (1 << 31)) && g_panel) {
         // Key-up: defer eval so hotkey-driven panel switch can complete first.
         PostMessage(g_panel, WM_FS_ORBIT_EVAL, 0, 0);
     }
@@ -5337,7 +5358,7 @@ public:
     }
 
     void Stop() override {
-        SetAutoOrbitLock(false);
+        SetAutoOrbitMode(AUTO_ORBIT_OFF);
         ModStack::Shutdown();
         PowerShader::Shutdown();
         if (g_screenGrabState != SCREEN_GRAB_NONE)
