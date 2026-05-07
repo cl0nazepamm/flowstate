@@ -576,7 +576,7 @@ macroscript flowstate_Config
         "XButton2  --  Parameter panel",
         "Shift + XButton2  --  Shader search",
         "Tab (in SME)  --  Shader search",
-        "Ctrl + XButton2  --  Cycle auto orbit (Orbit / Selected / POI / Off)",
+        "Ctrl + XButton2  --  Cycle auto orbit (Orbit / Selected / POI / Dynamic / Off)",
         "Alt + Shift + XButton2  --  Swap V/H sliders",
         "",
         "Click value  --  Type value",

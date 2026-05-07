@@ -150,7 +150,13 @@ static POINT           g_screenGrabLastScreenPt = { 0, 0 };
 static BaseObject*      g_screenGrabEditObj = nullptr;
 static bool             g_screenGrabHoldStarted = false;
 static bool             g_screenGrabMoved = false;
-enum AutoOrbitMode { AUTO_ORBIT_OFF = 0, AUTO_ORBIT_STANDARD = 1, AUTO_ORBIT_SELECTED = 2, AUTO_ORBIT_POI = 3 };
+enum AutoOrbitMode {
+    AUTO_ORBIT_OFF      = 0,
+    AUTO_ORBIT_STANDARD = 1,
+    AUTO_ORBIT_SELECTED = 2,
+    AUTO_ORBIT_POI      = 3,
+    AUTO_ORBIT_DYNAMIC  = 4,
+};
 static AutoOrbitMode    g_autoOrbitMode = AUTO_ORBIT_OFF;
 static bool             g_autoOrbitNotifyRegistered = false;
 
@@ -366,6 +372,31 @@ static BOOL CALLBACK FindViewControlToolbarProc(HWND hwnd, LPARAM lp) {
     return TRUE;
 }
 
+static bool IsSafeOrbitSwapMode(int cid) {
+    // Skip flyoff swap during create / modify-param / pick / manipulate / etc.,
+    // where pushing CID_ROTATEVIEW would interrupt a user operation.
+    switch (cid) {
+        case -1:
+        case CID_NULL:
+        case CID_OBJSELECT:
+        case CID_OBJMOVE:
+        case CID_OBJROTATE:
+        case CID_OBJSCALE:
+        case CID_OBJUSCALE:
+        case CID_OBJSQUASH:
+        case CID_SUBOBJSELECT:
+        case CID_SUBOBJMOVE:
+        case CID_SUBOBJROTATE:
+        case CID_SUBOBJSCALE:
+        case CID_SUBOBJUSCALE:
+        case CID_SUBOBJSQUASH:
+        case CID_ROTATEVIEW:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool SetOrbitFlyoff(int idx) {
     Interface* ip = GetCOREInterface();
     if (!ip) return false;
@@ -384,6 +415,10 @@ static bool SetOrbitFlyoff(int idx) {
 
     CommandMode* prevMode = ip->GetCommandMode();
     int prevId = prevMode ? prevMode->ID() : -1;
+    if (!IsSafeOrbitSwapMode(prevId)) {
+        ReleaseICustButton(btn);
+        return false;
+    }
 
     btn->SetCurFlyOff(idx, TRUE);
     ReleaseICustButton(btn);
@@ -395,11 +430,79 @@ static bool SetOrbitFlyoff(int idx) {
     return true;
 }
 
+// Returns true if there's an effective sub-element selection (or active
+// gizmo) at the current sub-object level — covers Editable Poly/Mesh/Spline,
+// Edit_Poly/Edit_Mesh/Edit_Spline modifiers, and gizmo modifiers (Bend,
+// Twist, FFD, Skin, etc., where being in sub-obj level == active focus).
+static bool HasSubSelection() {
+    static const MCHAR* script =
+        _T("(local r=false;")
+        _T("if subobjectlevel!=0 then (")
+        _T("  local o=try(modPanel.getCurrentObject())catch undefined;")
+        _T("  local node=if selection.count>0 then selection[1] else undefined;")
+        _T("  local lvl=subobjectlevel;")
+        _T("  if o!=undefined then (")
+        _T("    local cls=classOf o;local sc=superClassOf o;")
+        _T("    if cls==Editable_Poly then (")
+        _T("      if lvl==1 do (if (polyOp.getVertSelection o).numberSet>0 do r=true);")
+        _T("      if lvl==2 do (if (polyOp.getEdgeSelection o).numberSet>0 do r=true);")
+        _T("      if lvl>=4 do (if (polyOp.getFaceSelection o).numberSet>0 do r=true)")
+        _T("    )")
+        _T("    else if cls==Editable_Mesh and node!=undefined then (")
+        _T("      if lvl==1 do (if (getVertSelection node).numberSet>0 do r=true);")
+        _T("      if lvl==2 do (if (getEdgeSelection node).numberSet>0 do r=true);")
+        _T("      if lvl==3 do (if (getFaceSelection node).numberSet>0 do r=true)")
+        _T("    )")
+        _T("    else if sc==shape and node!=undefined then try(")
+        _T("      local ns=numSplines node;")
+        _T("      if lvl==1 do (for i=1 to ns where not r do (local s=getKnotSelection node i;if s!=undefined and s.count>0 do r=true));")
+        _T("      if lvl==2 do (for i=1 to ns where not r do (local s=getSegmentSelection node i;if s!=undefined and s.count>0 do r=true));")
+        _T("      if lvl==3 do (local s=getSplineSelection node;if s!=undefined and s.count>0 do r=true)")
+        _T("    )catch()")
+        _T("    else if sc==modifier then (")
+        _T("      local handled=false;")
+        _T("      try(local sel=o.GetSelection #CurrentLevel;")
+        _T("        if sel!=undefined then (handled=true;if sel.numberSet>0 do r=true)")
+        _T("      )catch();")
+        _T("      if not handled and node!=undefined and cls==Edit_Mesh then (handled=true;")
+        _T("        if lvl==1 do (if (getVertSelection node).numberSet>0 do r=true);")
+        _T("        if lvl==2 do (if (getEdgeSelection node).numberSet>0 do r=true);")
+        _T("        if lvl==3 do (if (getFaceSelection node).numberSet>0 do r=true));")
+        _T("      if not handled and node!=undefined and cls==Edit_Spline then (handled=true;")
+        _T("        try(local ns=numSplines node;")
+        _T("          if lvl==1 do (for i=1 to ns where not r do (local s=getKnotSelection node i;if s!=undefined and s.count>0 do r=true));")
+        _T("          if lvl==2 do (for i=1 to ns where not r do (local s=getSegmentSelection node i;if s!=undefined and s.count>0 do r=true));")
+        _T("          if lvl==3 do (local s=getSplineSelection node;if s!=undefined and s.count>0 do r=true)")
+        _T("        )catch());")
+        _T("      if not handled do r=true")
+        _T("    )")
+        _T("  )")
+        _T(");")
+        _T("r)");
+    FPValue result;
+    BOOL ok = ExecuteMAXScriptScript(const_cast<MCHAR*>(script),
+                                     MAXScript::ScriptSource::Dynamic, TRUE, &result);
+    if (!ok) return false;
+    if (result.type == TYPE_BOOL) return result.b != 0;
+    return false;
+}
+
 static int DesiredOrbitFlyoff() {
+    Interface* ip = GetCOREInterface();
+
+    if (g_autoOrbitMode == AUTO_ORBIT_DYNAMIC) {
+        if (!ip) return kOrbitFlyoffPOI;
+        bool inModify = ip->GetCommandPanelTaskMode() == TASK_MODE_MODIFY;
+        int  level    = ip->GetSubObjectLevel();
+        if (!inModify || level == 0)
+            return ip->GetSelNodeCount() > 0 ? kOrbitFlyoffSubObject : kOrbitFlyoffPOI;
+        return HasSubSelection() ? kOrbitFlyoffSubObject : kOrbitFlyoffPOI;
+    }
+
     int exitFlyoff = kOrbitFlyoffPOI;
     if (g_autoOrbitMode == AUTO_ORBIT_STANDARD) exitFlyoff = kOrbitFlyoffStandard;
     else if (g_autoOrbitMode == AUTO_ORBIT_SELECTED) exitFlyoff = kOrbitFlyoffSelected;
-    Interface* ip = GetCOREInterface();
+
     if (!ip) return exitFlyoff;
     if (ip->GetSelNodeCount() > 0
         && ip->GetSubObjectLevel() > 0
@@ -450,10 +553,11 @@ static void SetAutoOrbitMode(AutoOrbitMode mode) {
     else SetOrbitFlyoff(kOrbitFlyoffStandard);
 
     switch (mode) {
-        case AUTO_ORBIT_OFF:      ShowOSD(L"Auto orbit: OFF"); break;
-        case AUTO_ORBIT_STANDARD: ShowOSD(L"Auto orbit: ORBIT"); break;
-        case AUTO_ORBIT_SELECTED: ShowOSD(L"Auto orbit: SELECTED"); break;
-        case AUTO_ORBIT_POI:      ShowOSD(L"Auto orbit: POI"); break;
+        case AUTO_ORBIT_OFF:      ShowOSD(L"Auto orbit: OFF");         break;
+        case AUTO_ORBIT_STANDARD: ShowOSD(L"Auto orbit: ORBIT");       break;
+        case AUTO_ORBIT_SELECTED: ShowOSD(L"Auto orbit: SELECTED");    break;
+        case AUTO_ORBIT_POI:      ShowOSD(L"Auto orbit: POI");         break;
+        case AUTO_ORBIT_DYNAMIC:  ShowOSD(L"Auto orbit: DYNAMIC POI"); break;
     }
     (void)wasOn;
 }
@@ -463,8 +567,9 @@ static void CycleAutoOrbitMode() {
     switch (g_autoOrbitMode) {
         case AUTO_ORBIT_OFF:      next = AUTO_ORBIT_STANDARD; break;
         case AUTO_ORBIT_STANDARD: next = AUTO_ORBIT_SELECTED; break;
-        case AUTO_ORBIT_SELECTED: next = AUTO_ORBIT_POI; break;
-        case AUTO_ORBIT_POI:      next = AUTO_ORBIT_OFF; break;
+        case AUTO_ORBIT_SELECTED: next = AUTO_ORBIT_POI;      break;
+        case AUTO_ORBIT_POI:      next = AUTO_ORBIT_DYNAMIC;  break;
+        case AUTO_ORBIT_DYNAMIC:  next = AUTO_ORBIT_OFF;      break;
     }
     SetAutoOrbitMode(next);
 }
