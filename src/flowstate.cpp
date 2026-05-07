@@ -37,7 +37,17 @@ HINSTANCE hInstance = nullptr;
 
 static const ActionTableId   kTableId   = 0x7A1CE201;
 static const ActionContextId kContextId = 0x7A1CE202;
-static const int             kToggleId  = 1;
+static const int             kToggleId          = 1;
+static const int             kOrbitCycleId      = 2;
+static const int             kAutoOffId         = 3;
+static const int             kAutoStandardId    = 4;
+static const int             kAutoSelectedId    = 5;
+static const int             kAutoPOIId         = 6;
+static const int             kAutoDynamicId     = 7;
+static const int             kSetOrbitId        = 8;
+static const int             kSetSelectedId     = 9;
+static const int             kSetSubObjectId    = 10;
+static const int             kSetPOIId          = 11;
 
 // ── Config ──────────────────────────────────────────────────────
 static const TCHAR* kWndClass = _T("PowerParamsPanel");
@@ -397,7 +407,7 @@ static bool IsSafeOrbitSwapMode(int cid) {
     }
 }
 
-static bool SetOrbitFlyoff(int idx) {
+static bool SetOrbitFlyoffImpl(int idx, bool force) {
     Interface* ip = GetCOREInterface();
     if (!ip) return false;
     HWND tb = nullptr;
@@ -415,7 +425,7 @@ static bool SetOrbitFlyoff(int idx) {
 
     CommandMode* prevMode = ip->GetCommandMode();
     int prevId = prevMode ? prevMode->ID() : -1;
-    if (!IsSafeOrbitSwapMode(prevId)) {
+    if (!force && !IsSafeOrbitSwapMode(prevId)) {
         ReleaseICustButton(btn);
         return false;
     }
@@ -430,11 +440,44 @@ static bool SetOrbitFlyoff(int idx) {
     return true;
 }
 
+static bool SetOrbitFlyoff(int idx)       { return SetOrbitFlyoffImpl(idx, false); }
+static bool SetOrbitFlyoffForced(int idx) { return SetOrbitFlyoffImpl(idx, true); }
+
 // Returns true if there's an effective sub-element selection (or active
 // gizmo) at the current sub-object level — covers Editable Poly/Mesh/Spline,
 // Edit_Poly/Edit_Mesh/Edit_Spline modifiers, and gizmo modifiers (Bend,
 // Twist, FFD, Skin, etc., where being in sub-obj level == active focus).
 static bool HasSubSelection() {
+    // C++ fast path: Editable_Poly object and Edit_Poly modifier both expose
+    // EPOLY_INTERFACE; walk MNMesh flags directly to skip the MAXScript trip.
+    if (Interface* ip0 = GetCOREInterface()) {
+        int lvl = ip0->GetSubObjectLevel();
+        if (lvl > 0) {
+            if (BaseObject* obj = ip0->GetCurEditObject()) {
+                if (EPoly* ep = (EPoly*)obj->GetInterface(EPOLY_INTERFACE)) {
+                    if (MNMesh* m = ep->GetMeshPtr()) {
+                        const DWORD skip = MN_DEAD;
+                        if (lvl == 1) {
+                            for (int i = 0; i < m->numv; ++i)
+                                if (!(m->v[i].GetFlag(skip)) && m->v[i].GetFlag(MN_SEL)) return true;
+                            return false;
+                        }
+                        if (lvl == 2 || lvl == 3) {
+                            for (int i = 0; i < m->nume; ++i)
+                                if (!(m->e[i].GetFlag(skip)) && m->e[i].GetFlag(MN_SEL)) return true;
+                            return false;
+                        }
+                        if (lvl == 4 || lvl == 5) {
+                            for (int i = 0; i < m->numf; ++i)
+                                if (!(m->f[i].GetFlag(skip)) && m->f[i].GetFlag(MN_SEL)) return true;
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     static const MCHAR* script =
         _T("(local r=false;")
         _T("if subobjectlevel!=0 then (")
@@ -572,6 +615,41 @@ static void CycleAutoOrbitMode() {
         case AUTO_ORBIT_DYNAMIC:  next = AUTO_ORBIT_OFF;      break;
     }
     SetAutoOrbitMode(next);
+}
+
+static void DisableAutoSilent() {
+    if (g_autoOrbitMode == AUTO_ORBIT_OFF) return;
+    g_autoOrbitMode = AUTO_ORBIT_OFF;
+    if (g_autoOrbitNotifyRegistered) {
+        UnRegisterNotification(AutoOrbitNotifyCB, nullptr, NOTIFY_SELECTIONSET_CHANGED);
+        UnRegisterNotification(AutoOrbitNotifyCB, nullptr, NOTIFY_MODPANEL_SUBOBJECTLEVEL_CHANGED);
+        g_autoOrbitNotifyRegistered = false;
+    }
+    if (g_autoOrbitTimer) { KillTimer(nullptr, g_autoOrbitTimer); g_autoOrbitTimer = 0; }
+}
+
+static BOOL DispatchOrbitAction(int id) {
+    switch (id) {
+        case kOrbitCycleId:    CycleAutoOrbitMode();                return TRUE;
+        case kAutoOffId:       SetAutoOrbitMode(AUTO_ORBIT_OFF);    return TRUE;
+        case kAutoStandardId:  SetAutoOrbitMode(AUTO_ORBIT_STANDARD); return TRUE;
+        case kAutoSelectedId:  SetAutoOrbitMode(AUTO_ORBIT_SELECTED); return TRUE;
+        case kAutoPOIId:       SetAutoOrbitMode(AUTO_ORBIT_POI);    return TRUE;
+        case kAutoDynamicId:   SetAutoOrbitMode(AUTO_ORBIT_DYNAMIC); return TRUE;
+        case kSetOrbitId:
+            DisableAutoSilent(); SetOrbitFlyoffForced(kOrbitFlyoffStandard);
+            ShowOSD(L"Orbit");            return TRUE;
+        case kSetSelectedId:
+            DisableAutoSilent(); SetOrbitFlyoffForced(kOrbitFlyoffSelected);
+            ShowOSD(L"Orbit: Selected");  return TRUE;
+        case kSetSubObjectId:
+            DisableAutoSilent(); SetOrbitFlyoffForced(kOrbitFlyoffSubObject);
+            ShowOSD(L"Orbit: SubObject"); return TRUE;
+        case kSetPOIId:
+            DisableAutoSilent(); SetOrbitFlyoffForced(kOrbitFlyoffPOI);
+            ShowOSD(L"Orbit: POI");       return TRUE;
+    }
+    return FALSE;
 }
 
 static void EndScreenGrab(bool accept) {
@@ -5376,17 +5454,51 @@ class PPActionCB : public ActionCallback {
 public:
     BOOL ExecuteAction(int id) override {
         if (id == kToggleId) { TogglePanel(); return TRUE; }
-        return FALSE;
+        return DispatchOrbitAction(id);
     }
+};
+
+class OrbitAction : public ActionItem {
+public:
+    int          id;
+    const TCHAR* label;
+    OrbitAction(int i, const TCHAR* l) : id(i), label(l) {}
+    int   GetId() override                     { return id; }
+    BOOL  ExecuteAction() override             { return DispatchOrbitAction(id); }
+    void  GetButtonText(MSTR& t) override      { t = label; }
+    void  GetMenuText(MSTR& t) override        { t = label; }
+    void  GetDescriptionText(MSTR& t) override { t = label; }
+    void  GetCategoryText(MSTR& t) override    { t = PPARAM_NAME; }
+    BOOL  IsChecked() override                 { return FALSE; }
+    BOOL  IsItemVisible() override             { return TRUE; }
+    BOOL  IsEnabled() override                 { return TRUE; }
+    void  DeleteThis() override                {}
 };
 
 static PPAction   g_action;
 static PPActionCB g_actionCB;
 
+static OrbitAction g_orbitActions[] = {
+    { kOrbitCycleId,   _T("FlowState: Cycle Auto Orbit") },
+    { kAutoOffId,      _T("FlowState: Auto Orbit Off") },
+    { kAutoStandardId, _T("FlowState: Auto Orbit") },
+    { kAutoSelectedId, _T("FlowState: Auto Selected") },
+    { kAutoPOIId,      _T("FlowState: Auto POI") },
+    { kAutoDynamicId,  _T("FlowState: Auto Dynamic POI") },
+    { kSetOrbitId,     _T("FlowState: Set Orbit") },
+    { kSetSelectedId,  _T("FlowState: Set Orbit Selected") },
+    { kSetSubObjectId, _T("FlowState: Set Orbit SubObject") },
+    { kSetPOIId,       _T("FlowState: Set Orbit POI") },
+};
+
 static ActionTable* MakeActionTable() {
     static ActionTable table(kTableId, kContextId, TSTR(PPARAM_NAME));
     static bool init = false;
-    if (!init) { table.AppendOperation(&g_action); init = true; }
+    if (!init) {
+        table.AppendOperation(&g_action);
+        for (OrbitAction& a : g_orbitActions) table.AppendOperation(&a);
+        init = true;
+    }
     return &table;
 }
 
@@ -5452,7 +5564,11 @@ public:
             kToolTipClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
 
         IActionManager* am = GetCOREInterface()->GetActionManager();
-        if (am) am->ActivateActionTable(&g_actionCB, kTableId);
+        if (am) {
+            am->RegisterActionContext(kContextId, PPARAM_NAME);
+            am->RegisterActionTable(MakeActionTable());
+            am->ActivateActionTable(&g_actionCB, kTableId);
+        }
         g_mouseHook = SetWindowsHookEx(WH_MOUSE, MouseHookProc, nullptr, GetCurrentThreadId());
         g_kbHook    = SetWindowsHookEx(WH_KEYBOARD, KbHookProc, nullptr, GetCurrentThreadId());
 
