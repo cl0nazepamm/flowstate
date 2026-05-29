@@ -1,75 +1,102 @@
-# PowerParams
+# flowstate
 
-A floating parameter panel for 3ds Max 2026. Spawns at your cursor, lets you edit object and modifier parameters without the command panel.
+3ds Max C++ GUP plugin suite for fast parameter editing, shader lookup,
+modifier-stack navigation, and viewport/modeling hotkeys.
 
-## What it does
+![FlowState logo](images/flowstate_logo.png)
 
-Press a mouse side button and a dark panel appears with editable parameters for the selected object. Scroll wheel to adjust values, type to override, close when done. Settings persist across sessions.
+## Features
 
-For Editable Poly, PowerParams detects your last operation (Connect, Bridge, Extrude, etc.) and shows only those params with live preview through the EPoly preview system.
+### Modifier Stack under mouse.
+
+Floating parameter panel for the selected object or modifier stack. It opens at
+the cursor, exposes editable parameters, supports favorite pins, and can take over
+Editable Poly caddy-style command parameters such as chamfer, bridge, extrude,
+bevel, inset, and outline.
+
+Main trigger: `Mouse4`.
+
+Highlights:
+
+- Object, modifier, and selected modifier parameters in one floating panel.
+- Multi-object writes where supported.
+- Favorite pin strip with reorder and V/H slider slot assignment.
+- Wheel, typed-value, and click-drag editing.
+- Collapsible and hideable parameter groups.
+- Editable Poly command-mode support through cached EPoly operation param blocks.
+
+### Search
+  
+Material and texmap search palette for the scene and available shader classes.
+It includes OSL category patching, pinned shader bricks, and texture preview.
+
+Main triggers:
+
+- `Shift+Mouse4`
+- `Tab` when Material Editor is in focus.
+
+### Config UI
+
+Dark .NET WinForms macroscript dialog in
+`macros/flowstate_config.ms`.
+
+It controls:
+
+- PowerParams and PowerShader module toggles.
+- Sub-object toggles.
+- SME `Tab` shader search.
+- Theme mode.
+- XButton1 action keymap.
+
+The macroscript self-installs a startup loader so the macros survive Max
+restarts.
+
+### Modeling Tools
+
+`FlowState.gup` also exports the bundled native classes/tools:
+
+- `Precision Cut` modifier from `src/precisioncut/`.
+- `Normalize Poly` plus function-published helper tools from
+  `src/normalize_edges/`.
+- `Smooth Bridge` and `F2 Extend` macros in `macros/flowstate_config.ms`.
 
 ## Controls
 
 | Input | Action |
-|-------|--------|
-| **XButton2** (back mouse) | Toggle PowerParams panel |
-| **XButton1** (front mouse) over Max spinner | Add that parameter to PowerParams |
-| **XButton1** over PowerParams param | Pin/unpin (★ marker) |
-| **Scroll wheel** | Adjust value |
-| **Shift+scroll** | 10x coarser |
-| **Ctrl+scroll** | 10x finer |
-| **Type + Tab/Enter** | Edit value (auto-applies on blur) |
-| **Click group header** | Collapse/expand group |
-| **Ctrl+click param** | Hide parameter |
-| **Shift+click group header** | Unhide all in that group |
-| **Right-click panel** | Unhide all hidden params |
-| **Escape** | Cancel and close (reverts EPoly preview) |
-| **Click outside** | Accept and close |
-| **Drag header** | Move panel |
+| --- | --- |
+| `XButton2` | Toggle PowerParams |
+| `Shift+XButton2` | Toggle PowerShader |
+| `Tab` in Slate Material Editor | Toggle PowerShader when enabled |
+| `Ctrl+XButton2` | Cycle auto-orbit mode |
+| `Alt+Shift+XButton2` | Swap V/H slider assignments |
+| `XButton1` combos | Run configurable drag/action keymap |
+| Mouse wheel over PowerParams value | Scrub value |
+| `Shift` while dragging/scrubbing | Coarse speed |
+| `Alt` while dragging/scrubbing | Fine speed |
+| Type then `Tab`/`Enter` | Apply typed value |
+| `Esc` | Cancel panel operation and close |
+| Click outside panel | Accept and close |
 
-Also bindable via **Customize > Keyboard** — search for "PowerParams" category.
+## Mouse5 Keymap
 
-## How parameters are collected
+Mouse5 actions are mapped by combo index, not hardcoded modifier checks.
 
-1. **EPoly operation detection** (one-shot) — if you just did a Connect, Bridge, Extrude, Bevel, Chamfer, Inset, or Outline, PowerParams shows only those operation params. Uses the EPoly preview system for live feedback. Detected once, forgotten after close.
+| Combo index | Modifiers | Default action |
+| --- | --- | --- |
+| `0` | none | Screen Grab |
+| `1` | `Shift` | Time Slider |
+| `2` | `Ctrl` | Param Slider |
+| `3` | `Ctrl+Shift` | Opacity Slider |
+| `4` | `Ctrl+Alt+Shift` | Clear Sliders |
 
-2. **Modifiers** — Bend, Taper, Twist, Shell, TurboSmooth, etc. All scalar params (float, int, bool) from their param blocks.
+The globals are:
 
-3. **Base objects** — Box, Sphere, Cylinder, etc. Length, width, height, segments, and so on.
+- `g_kmGrab`
+- `g_kmTime`
+- `g_kmSlider`
+- `g_kmOpacity`
+- `g_kmClear`
 
-4. **Pinned params** — any parameter you added via XButton1 on a spinner in the command panel. Always shown, persists across sessions.
-
-Editable Poly base objects are skipped in generic collection (their param block has 100+ internal settings). Use XButton1 on spinners in the command panel to add specific EPoly params.
-
-## Persistence
-
-Settings saved to `PowerParams.cfg` in Max's plugcfg directory:
-- Collapsed group states
-- Pinned parameters
-- Hidden parameters
-
-Survives Max restarts.
-
-## Building
-
-Requires:
-- 3ds Max 2026 SDK
-- Visual Studio 2022 Build Tools
-- CMake
-
-```
-build.bat
-```
-
-Builds the plugin and deploys `PowerParams.gup` to the 3ds Max plugins folder. Auto-elevates to admin for the copy.
-
-## Architecture
-
-Single-file C++ GUP plugin (`src/dllmain.cpp`). No dialog resources, no UI frameworks.
-
-- **UI** — Win32 popup window, GDI double-buffered painting, subclassed EDIT controls with dark theme
-- **Param detection** — `IParamBlock2` enumeration across modifier stack, `EPoly::getParamBlock()` for operation params
-- **Spinner grab** — `WindowFromPoint` + `IParamMap2::GetHWnd()` dialog matching + `ParamDef::ctrl_IDs` to identify which param a spinner belongs to
-- **EPoly preview** — `epfn_preview_begin` / `invalidate` / `accept` / `cancel` via FPInterface dispatch
-- **Hotkey** — Max ActionTable system + `WH_MOUSE_LL` low-level hook for mouse side buttons
-- **Config** — Line-based file with `C:` (collapsed), `P:` (pinned), `H:` (hidden) prefixed keys
+They persist as `Key:<action>=<comboIdx>` entries in `FlowState.cfg`. Drag-time
+speed modifiers are separate and remain hardcoded: `Shift` is coarse/faster,
+`Alt` is fine/slower.

@@ -204,6 +204,7 @@ namespace Theme
 constexpr UINT kHotkeyId = 0x514A;
 constexpr wchar_t kHotkeyClass[] = L"PowerShaderHotkeyWnd";
 constexpr wchar_t kPaletteClass[] = L"PowerShaderPaletteWnd";
+constexpr UINT_PTR kWarmCacheTimerId = 0x514B;
 constexpr int kSearchId  = 1001;
 constexpr int kListId    = 1002;
 constexpr int kLinkId    = 1003;
@@ -918,7 +919,7 @@ public:
         hotkeyWnd_ = CreateWindowExW(0, kHotkeyClass, L"", 0, 0, 0, 0, 0,
             HWND_MESSAGE, nullptr, hInstance, this);
         if (!hotkeyWnd_) return false;
-        // Class cache is built lazily on first PowerShader open
+        SetTimer(hotkeyWnd_, kWarmCacheTimerId, 750, nullptr);
         return true;
     }
 
@@ -951,6 +952,11 @@ private:
             return TRUE;
         }
         if (self && m == WM_HOTKEY && w == kHotkeyId) { self->Toggle(); return 0; }
+        if (self && m == WM_TIMER && w == kWarmCacheTimerId) {
+            KillTimer(h, kWarmCacheTimerId);
+            self->WarmClassCache();
+            return 0;
+        }
         return DefWindowProcW(h, m, w, l);
     }
 
@@ -1773,70 +1779,86 @@ private:
 
     void EnsureClassCache()
     {
-        if (classCacheReady_) return;
+        if (classCacheReady_ || classCacheBuilding_) return;
 
+        classCacheBuilding_ = true;
         classItems_.clear();
         classItems_.reserve(1024);
         AddClassList(MATERIAL_CLASS_ID, ItemKind::ClassMaterial, classItems_);
         AddClassList(TEXMAP_CLASS_ID, ItemKind::ClassMap, classItems_);
 
-        // Scan OSL folders to build name→category map, then patch existing items
-        {
-            std::map<std::wstring, std::wstring> oslCategories;
-
-            auto scanIfExists = [&](const std::wstring& dir, const std::wstring& cat) {
-                if (GetFileAttributesW(dir.c_str()) != INVALID_FILE_ATTRIBUTES)
-                    ScanOSLFolder(dir, cat, oslCategories);
-            };
-
-            Interface* ip = GetCOREInterface();
-            if (ip) {
-                MSTR maxRoot = ip->GetDir(APP_MAX_SYS_ROOT_DIR);
-                scanIfExists(std::wstring(maxRoot.data()) + L"\\OSL", L"OSL");
-            }
-
-            // ApplicationPlugins — scan plugin OSL folders
-            std::wstring appPlugins = L"C:\\ProgramData\\Autodesk\\ApplicationPlugins";
-            WIN32_FIND_DATAW fd;
-            HANDLE h = FindFirstFileW((appPlugins + L"\\*").c_str(), &fd);
-            if (h != INVALID_HANDLE_VALUE) {
-                do {
-                    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-                    if (fd.cFileName[0] == L'.') continue;
-                    std::wstring plugDir = appPlugins + L"\\" + fd.cFileName + L"\\Contents";
-                    WIN32_FIND_DATAW fd2;
-                    HANDLE h2 = FindFirstFileW((plugDir + L"\\*").c_str(), &fd2);
-                    if (h2 != INVALID_HANDLE_VALUE) {
-                        do {
-                            if (!(fd2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-                            if (fd2.cFileName[0] == L'.') continue;
-                            std::wstring oslDir = plugDir + L"\\" + fd2.cFileName + L"\\Contents\\OSL";
-                            scanIfExists(oslDir, std::wstring(fd2.cFileName));
-                        } while (FindNextFileW(h2, &fd2));
-                        FindClose(h2);
-                    }
-                } while (FindNextFileW(h, &fd));
-                FindClose(h);
-            }
-
-            // Patch categories on existing class items
-            if (!oslCategories.empty()) {
-                for (auto& item : classItems_) {
-                    auto it = oslCategories.find(item.normLabel);
-                    if (it != oslCategories.end()) {
-                        item.category = it->second;
-                        // Also add category to search string
-                        item.search = Normalize(
-                            item.label + L" " + it->second + L" OSL", true);
-                    }
-                }
-            }
-        }
-
         std::sort(classItems_.begin(), classItems_.end(),
             [](const Item& a, const Item& b) { return a.label < b.label; });
 
         classCacheReady_ = true;
+        oslCategoryReady_ = false;
+        classCacheBuilding_ = false;
+    }
+
+    void WarmClassCache()
+    {
+        if (!classCacheReady_) EnsureClassCache();
+        EnsureOSLCategories();
+    }
+
+    void EnsureOSLCategories()
+    {
+        if (!classCacheReady_ || oslCategoryReady_ || oslCategoryBuilding_) return;
+
+        oslCategoryBuilding_ = true;
+        std::map<std::wstring, std::wstring> oslCategories;
+
+        auto scanIfExists = [&](const std::wstring& dir, const std::wstring& cat) {
+            if (GetFileAttributesW(dir.c_str()) != INVALID_FILE_ATTRIBUTES)
+                ScanOSLFolder(dir, cat, oslCategories);
+        };
+
+        Interface* ip = GetCOREInterface();
+        if (ip) {
+            MSTR maxRoot = ip->GetDir(APP_MAX_SYS_ROOT_DIR);
+            scanIfExists(std::wstring(maxRoot.data()) + L"\\OSL", L"OSL");
+        }
+
+        std::wstring appPlugins = L"C:\\ProgramData\\Autodesk\\ApplicationPlugins";
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((appPlugins + L"\\*").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                if (fd.cFileName[0] == L'.') continue;
+                std::wstring plugDir = appPlugins + L"\\" + fd.cFileName + L"\\Contents";
+                WIN32_FIND_DATAW fd2;
+                HANDLE h2 = FindFirstFileW((plugDir + L"\\*").c_str(), &fd2);
+                if (h2 != INVALID_HANDLE_VALUE) {
+                    do {
+                        if (!(fd2.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                        if (fd2.cFileName[0] == L'.') continue;
+                        std::wstring oslDir = plugDir + L"\\" + fd2.cFileName + L"\\Contents\\OSL";
+                        scanIfExists(oslDir, std::wstring(fd2.cFileName));
+                    } while (FindNextFileW(h2, &fd2));
+                    FindClose(h2);
+                }
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+
+        if (!oslCategories.empty()) {
+            for (auto& item : classItems_) {
+                auto it = oslCategories.find(item.normLabel);
+                if (it == oslCategories.end()) continue;
+                item.category = it->second;
+                item.search = Normalize(item.label + L" " + it->second + L" OSL", true);
+            }
+            std::sort(classItems_.begin(), classItems_.end(),
+                [](const Item& a, const Item& b) { return a.label < b.label; });
+        }
+
+        oslCategoryReady_ = true;
+        oslCategoryBuilding_ = false;
+
+        if (wnd_ && IsWindowVisible(wnd_) && !IsSceneOnly()) {
+            Rebuild(true);
+        }
     }
 
     void CollectSceneItem(MtlBase* m, std::set<MtlBase*>& visited)
@@ -2378,6 +2400,9 @@ private:
     TabMode lastTab_ = TabMode::All;
     bool lastSceneOnly_ = false;
     bool classCacheReady_ = false;
+    bool classCacheBuilding_ = false;
+    bool oslCategoryReady_ = false;
+    bool oslCategoryBuilding_ = false;
     bool forcedAliasRetry_ = false;
     bool sceneCacheReady_ = false;
     bool rebuildPending_ = false;

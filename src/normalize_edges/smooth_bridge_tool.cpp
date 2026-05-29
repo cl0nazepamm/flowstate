@@ -5,11 +5,15 @@
 // the surrounding mesh; near-circular at tension≈1).
 //
 // MAXScript surface:
-//   SmoothBridge.bridge          segments tension     -- one-shot
-//   SmoothBridge.beginPreview                         -- snapshot mesh
-//   SmoothBridge.preview         segments tension     -- restore + apply
-//   SmoothBridge.commitPreview   segments tension     -- finalize w/ undo
-//   SmoothBridge.cancelPreview                        -- restore original
+//   SmoothBridge.bridge          segments tension flags twist bulge
+//   SmoothBridge.beginPreview                                              -- snapshot mesh
+//   SmoothBridge.preview         segments tension flags twist bulge
+//   SmoothBridge.commitPreview   segments tension flags twist bulge
+//   SmoothBridge.cancelPreview                                             -- restore original
+//
+// flags bit layout (VFN macros cap at 7 args, so booleans are packed):
+//   bit 0 = smoothA   bit 1 = smoothB
+//   bit 2 = flipA     bit 3 = flipB
 
 #include <max.h>
 #include <iparamb2.h>
@@ -34,6 +38,13 @@ enum {
     sb_fn_preview,
     sb_fn_commitPreview,
     sb_fn_cancelPreview,
+};
+
+enum SmoothBridgeFlags {
+    SB_FLAG_SMOOTH_A = 1 << 0,
+    SB_FLAG_SMOOTH_B = 1 << 1,
+    SB_FLAG_FLIP_A   = 1 << 2,
+    SB_FLAG_FLIP_B   = 1 << 3,
 };
 
 static void RefreshPolyObjectMesh(PolyObject* po);
@@ -168,6 +179,45 @@ static Point3 BoundaryTangent(MNMesh& mesh, int v,
     return (ls > 1e-8f) ? (sum / ls) : Point3(0, 0, 0);
 }
 
+// Average face normal at vertex v over its loop-edge-adjacent faces, projected
+// perpendicular to the chord. Used as the bulge axis: lifts the bridge midpoint
+// out of the chord plane in a direction the geometry suggests. On a flat inset
+// cap this resolves to the cap's plane normal; on curved geometry it resolves
+// to a chord-perpendicular component of the local surface normal.
+static Point3 LoopFaceNormal(MNMesh& mesh, int v,
+                             const std::vector<unsigned char>& isLoopEdge,
+                             const Point3& chordDir) {
+    const Tab<int>& edges = mesh.vedg[v];
+    Point3 sum(0, 0, 0);
+    int n = 0;
+    for (int i = 0; i < edges.Count(); ++i) {
+        const int e = edges[i];
+        if (e < 0 || (size_t)e >= isLoopEdge.size() || !isLoopEdge[e]) continue;
+        const MNEdge* edge = mesh.E(e);
+        if (!edge) continue;
+        const int f = (edge->f1 >= 0) ? edge->f1
+                    : (edge->f2 >= 0) ? edge->f2 : -1;
+        if (f < 0) continue;
+        const MNFace* face = mesh.F(f);
+        if (!face || face->deg < 3) continue;
+        Point3 nrm(0, 0, 0);
+        const Point3& a = mesh.P(face->vtx[0]);
+        for (int k = 1; k + 1 < face->deg; ++k) {
+            const Point3& b = mesh.P(face->vtx[k]);
+            const Point3& c = mesh.P(face->vtx[k + 1]);
+            nrm += CrossProd(b - a, c - a);
+        }
+        const float len = nrm.Length();
+        if (len > 1e-8f) { sum += nrm / len; ++n; }
+    }
+    if (n == 0) return Point3(0, 0, 0);
+    Point3 avg = sum / (float)n;
+    // Project perpendicular to chord so bulge stays out-of-chord-plane.
+    avg -= chordDir * DotProd(avg, chordDir);
+    const float ls = avg.Length();
+    return (ls > 1e-8f) ? (avg / ls) : Point3(0, 0, 0);
+}
+
 static Point3 Hermite(const Point3& p0, const Point3& p1,
                       const Point3& t0, const Point3& t1, float u) {
     const float u2 = u * u;
@@ -293,8 +343,28 @@ static bool MatchRings(const MNMesh& mesh, const EdgeRing& r1, const EdgeRing& r
 //                tangent there isn't already aligned with the chord)
 // Hermite with both tangents = chord vector reduces to linear lerp,
 // so G0/G0 is an exact straight line.
+// flipA / flipB invert the traversal direction of each ring independently,
+// giving the user a manual override when MatchRings' chord² minimizer locks
+// onto a twisted pairing (the classic "flipped bridge" issue on symmetric
+// rings). Toggling both is a no-op for open rings.
+//
+// twist adds a cyclical shift to the auto-picked vertex pairing — only
+// meaningful for closed rings (rotates which ring1 vert connects to which
+// ring2 vert). Ignored for open rings since shifting would leave dangling
+// unpaired verts.
+//
+// bulge lifts the bridge midpoint out of the chord plane along an axis derived
+// from the loop-edge-adjacent face normals (projected perpendicular to the
+// chord). Useful for flat / coplanar rings where BoundaryTangent produces a
+// degenerate in-plane curve — bulge gives explicit out-of-plane lift.
+// Displacement profile is parabolic: peak at u=0.5, zero at endpoints.
 static bool DoSmoothBridge(PolyObject* po, int segments, float tension,
-                           bool smoothA, bool smoothB) {
+                           int flags, int twist, float bulge) {
+    const bool smoothA = (flags & SB_FLAG_SMOOTH_A) != 0;
+    const bool smoothB = (flags & SB_FLAG_SMOOTH_B) != 0;
+    const bool flipA   = (flags & SB_FLAG_FLIP_A)   != 0;
+    const bool flipB   = (flags & SB_FLAG_FLIP_B)   != 0;
+
     if (!po) return false;
     if (segments < 1)    segments = 1;
     if (tension <= 0.0f) tension  = 1.0f;
@@ -324,13 +394,22 @@ static bool DoSmoothBridge(PolyObject* po, int segments, float tension,
     int  offset;
     if (!MatchRings(mesh, rings[0], rings[1], reverse, offset)) return false;
 
+    // Apply user flip overrides on top of the auto-picked pairing.
+    // flipB toggles ring2's traversal (the `reverse` flag already represents
+    // ring2 direction). flipA reverses ring1's iteration directly below.
+    if (flipB) reverse = !reverse;
+
     const int N    = (int)rings[0].verts.size();
     const int cols = segments + 1;
+
+    // Fold user twist into the auto-picked offset, modulo N (closed only).
+    if (rings[0].closed) offset = ((offset + twist) % N + N) % N;
 
     // Pair each vertex on ring1 with its match on ring2
     std::vector<std::pair<int,int>> pairs;
     pairs.reserve(N);
     for (int i = 0; i < N; ++i) {
+        const int i1 = flipA ? (N - 1 - i) : i;
         int j;
         if (rings[0].closed) {
             j = reverse ? ((offset - i) % N + N) % N
@@ -338,7 +417,7 @@ static bool DoSmoothBridge(PolyObject* po, int segments, float tension,
         } else {
             j = reverse ? (N - 1 - i) : i;
         }
-        pairs.push_back({rings[0].verts[i], rings[1].verts[j]});
+        pairs.push_back({rings[0].verts[i1], rings[1].verts[j]});
     }
 
     // Build a (rows × cols) vertex grid: rows = pairs, cols = curve samples.
@@ -371,9 +450,30 @@ static bool DoSmoothBridge(PolyObject* po, int segments, float tension,
             tB = chord;        // G0: chord vector → linear arrival at B
         }
 
+        // Per-row bulge axes: derived from loop-edge-adjacent face normals at
+        // each endpoint, projected perpendicular to the chord. Blended along u.
+        Point3 nA(0, 0, 0), nB(0, 0, 0);
+        const bool wantBulge = (std::fabs(bulge) > 1e-8f) && (chordLen > 1e-8f);
+        if (wantBulge) {
+            const Point3 chordDir = chord / chordLen;
+            nA = LoopFaceNormal(mesh, pairs[i].first,  isLoopEdge, chordDir);
+            nB = LoopFaceNormal(mesh, pairs[i].second, isLoopEdge, chordDir);
+        }
+
         for (int j = 1; j < cols - 1; ++j) {
             const float u = (float)j / (float)segments;
-            grid[i][j] = mesh.NewVert(Hermite(PA, PB, tA, tB, u));
+            Point3 p = Hermite(PA, PB, tA, tB, u);
+            if (wantBulge) {
+                Point3 nBlend = nA * (1.0f - u) + nB * u;
+                const float nLen = nBlend.Length();
+                if (nLen > 1e-8f) {
+                    nBlend /= nLen;
+                    // 4u(1-u) → parabola peaking at u=0.5 with value 1
+                    const float profile = 4.0f * u * (1.0f - u);
+                    p += nBlend * (profile * bulge * chordLen);
+                }
+            }
+            grid[i][j] = mesh.NewVert(p);
         }
     }
 
@@ -431,17 +531,17 @@ class SmoothBridgeTool : public FPStaticInterface {
 public:
     DECLARE_DESCRIPTOR(SmoothBridgeTool)
 
-    void Bridge       (int segments, float tension, BOOL smoothA, BOOL smoothB);
+    void Bridge       (int segments, float tension, int flags, int twist, float bulge);
     void BeginPreview ();
-    void Preview      (int segments, float tension, BOOL smoothA, BOOL smoothB);
-    void CommitPreview(int segments, float tension, BOOL smoothA, BOOL smoothB);
+    void Preview      (int segments, float tension, int flags, int twist, float bulge);
+    void CommitPreview(int segments, float tension, int flags, int twist, float bulge);
     void CancelPreview();
 
     BEGIN_FUNCTION_MAP
-        VFN_4(sb_fn_bridge,        Bridge,        TYPE_INT, TYPE_FLOAT, TYPE_BOOL, TYPE_BOOL)
+        VFN_5(sb_fn_bridge,        Bridge,        TYPE_INT, TYPE_FLOAT, TYPE_INT, TYPE_INT, TYPE_FLOAT)
         VFN_0(sb_fn_beginPreview,  BeginPreview)
-        VFN_4(sb_fn_preview,       Preview,       TYPE_INT, TYPE_FLOAT, TYPE_BOOL, TYPE_BOOL)
-        VFN_4(sb_fn_commitPreview, CommitPreview, TYPE_INT, TYPE_FLOAT, TYPE_BOOL, TYPE_BOOL)
+        VFN_5(sb_fn_preview,       Preview,       TYPE_INT, TYPE_FLOAT, TYPE_INT, TYPE_INT, TYPE_FLOAT)
+        VFN_5(sb_fn_commitPreview, CommitPreview, TYPE_INT, TYPE_FLOAT, TYPE_INT, TYPE_INT, TYPE_FLOAT)
         VFN_0(sb_fn_cancelPreview, CancelPreview)
     END_FUNCTION_MAP
 
@@ -454,35 +554,38 @@ static SmoothBridgeTool theBridgeTool(
     SMOOTH_BRIDGE_INTERFACE_ID, _T("SmoothBridge"),
     -1, NULL, FP_CORE,
 
-    sb_fn_bridge,        _T("bridge"),         -1, TYPE_VOID, 0, 4,
+    sb_fn_bridge,        _T("bridge"),         -1, TYPE_VOID, 0, 5,
         _T("segments"), -1, TYPE_INT,
         _T("tension"),  -1, TYPE_FLOAT,
-        _T("smoothA"),  -1, TYPE_BOOL,
-        _T("smoothB"),  -1, TYPE_BOOL,
+        _T("flags"),    -1, TYPE_INT,
+        _T("twist"),    -1, TYPE_INT,
+        _T("bulge"),    -1, TYPE_FLOAT,
     sb_fn_beginPreview,  _T("beginPreview"),   -1, TYPE_VOID, 0, 0,
-    sb_fn_preview,       _T("preview"),        -1, TYPE_VOID, 0, 4,
+    sb_fn_preview,       _T("preview"),        -1, TYPE_VOID, 0, 5,
         _T("segments"), -1, TYPE_INT,
         _T("tension"),  -1, TYPE_FLOAT,
-        _T("smoothA"),  -1, TYPE_BOOL,
-        _T("smoothB"),  -1, TYPE_BOOL,
-    sb_fn_commitPreview, _T("commitPreview"),  -1, TYPE_VOID, 0, 4,
+        _T("flags"),    -1, TYPE_INT,
+        _T("twist"),    -1, TYPE_INT,
+        _T("bulge"),    -1, TYPE_FLOAT,
+    sb_fn_commitPreview, _T("commitPreview"),  -1, TYPE_VOID, 0, 5,
         _T("segments"), -1, TYPE_INT,
         _T("tension"),  -1, TYPE_FLOAT,
-        _T("smoothA"),  -1, TYPE_BOOL,
-        _T("smoothB"),  -1, TYPE_BOOL,
+        _T("flags"),    -1, TYPE_INT,
+        _T("twist"),    -1, TYPE_INT,
+        _T("bulge"),    -1, TYPE_FLOAT,
     sb_fn_cancelPreview, _T("cancelPreview"),  -1, TYPE_VOID, 0, 0,
 
     p_end
 );
 
 void SmoothBridgeTool::Bridge(int segments, float tension,
-                              BOOL smoothA, BOOL smoothB) {
+                              int flags, int twist, float bulge) {
     PolyObject* po = ActiveEPolyObject();
     if (!po) return;
 
     theHold.Begin();
     theHold.Put(new MNMeshRestore(po));
-    if (!DoSmoothBridge(po, segments, tension, smoothA != FALSE, smoothB != FALSE)) {
+    if (!DoSmoothBridge(po, segments, tension, flags, twist, bulge)) {
         theHold.Cancel();
         return;
     }
@@ -499,15 +602,15 @@ void SmoothBridgeTool::BeginPreview() {
 }
 
 void SmoothBridgeTool::Preview(int segments, float tension,
-                               BOOL smoothA, BOOL smoothB) {
+                               int flags, int twist, float bulge) {
     if (!mPreviewPo || !mPreviewSnap) return;
     mPreviewPo->GetMesh() = *mPreviewSnap;     // restore to snapshot
-    DoSmoothBridge(mPreviewPo, segments, tension, smoothA != FALSE, smoothB != FALSE);
+    DoSmoothBridge(mPreviewPo, segments, tension, flags, twist, bulge);
     NotifyAndRedraw(mPreviewPo);
 }
 
 void SmoothBridgeTool::CommitPreview(int segments, float tension,
-                                     BOOL smoothA, BOOL smoothB) {
+                                     int flags, int twist, float bulge) {
     if (!mPreviewPo || !mPreviewSnap) return;
 
     // Rewind to the snapshot, then run the bridge inside a Hold so the
@@ -517,7 +620,7 @@ void SmoothBridgeTool::CommitPreview(int segments, float tension,
 
     theHold.Begin();
     theHold.Put(new MNMeshRestore(mPreviewPo));
-    DoSmoothBridge(mPreviewPo, segments, tension, smoothA != FALSE, smoothB != FALSE);
+    DoSmoothBridge(mPreviewPo, segments, tension, flags, twist, bulge);
     NotifyAndRedraw(mPreviewPo);
     theHold.Accept(_T("Smooth Bridge"));
 

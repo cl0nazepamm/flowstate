@@ -6,11 +6,11 @@
 #include <maxtypes.h>
 
 // ── Plugin identity ─────────────────────────────────────────────
-#define POWERCUT_CLASS_ID  Class_ID(0x7B3F19A2, 0x4E8C05D1)
+#define PRECISIONCUT_CLASS_ID  Class_ID(0x5C4B7D89, 0x2E3F6A14)
 #define PBLOCK_REF             0
 
 // ── Parameter IDs ───────────────────────────────────────────────
-enum PowerCutParams : ParamID {
+enum PrecisionCutParams : ParamID {
     pb_spline_node = 0,
     pb_steps,
     pb_flip_normals,       // kept for file compat, replaced by pb_mode

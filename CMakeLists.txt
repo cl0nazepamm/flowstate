@@ -71,17 +71,17 @@ add_library(FlowState SHARED
     src/modstack.cpp
     src/modstack.h
     src/FlowState.def
-    src/powercut/dllmain.cpp
-    src/powercut/MeshCutter.cpp
-    src/powercut/MeshCutter.h
-    src/powercut/PowerCut.rc
-    src/powercut/PowerCutDesc.h
-    src/powercut/PowerCutMod.cpp
-    src/powercut/PowerCutMod.h
-    src/powercut/SplineProjector.cpp
-    src/powercut/SplineProjector.h
-    src/powercut/DebugLog.h
-    src/powercut/resource.h
+    src/precisioncut/dllmain.cpp
+    src/precisioncut/MeshCutter.cpp
+    src/precisioncut/MeshCutter.h
+    src/precisioncut/PrecisionCut.rc
+    src/precisioncut/PrecisionCutDesc.h
+    src/precisioncut/PrecisionCutMod.cpp
+    src/precisioncut/PrecisionCutMod.h
+    src/precisioncut/SplineProjector.cpp
+    src/precisioncut/SplineProjector.h
+    src/precisioncut/DebugLog.h
+    src/precisioncut/resource.h
     src/normalize_edges/f2_extend_tool.cpp
     src/normalize_edges/normalize_poly.cpp
     src/normalize_edges/normalize_poly.rc
@@ -93,7 +93,7 @@ configure_max_plugin(FlowState FlowState gup)
 target_include_directories(FlowState PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/powercut"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/precisioncut"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/normalize_edges"
 )
 target_link_libraries(FlowState PRIVATE

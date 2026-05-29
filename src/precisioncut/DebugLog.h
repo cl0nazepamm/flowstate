@@ -3,12 +3,12 @@
 #include <cstdarg>
 #include <windows.h>
 
-// Writes to C:\temp\powercut.log — create C:\temp if it doesn't exist
+// Writes to C:\temp\precisioncut.log — create C:\temp if it doesn't exist
 inline void PBLog(const char* fmt, ...) {
     static FILE* fp = nullptr;
     if (!fp) {
         CreateDirectoryA("C:\\temp", nullptr);
-        fp = fopen("C:\\temp\\powercut.log", "w");
+        fp = fopen("C:\\temp\\precisioncut.log", "w");
         if (!fp) return;
     }
     va_list args;

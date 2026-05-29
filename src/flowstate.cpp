@@ -171,9 +171,11 @@ static AutoOrbitMode    g_autoOrbitMode = AUTO_ORBIT_OFF;
 static bool             g_autoOrbitNotifyRegistered = false;
 
 static void ShowOSD(const std::wstring& text);
+static void HideOSD();
 
 static bool TryGetViewportFromScreenPoint(const POINT& screenPt, HWND& viewHwnd, POINT* ptLocal = nullptr) {
     viewHwnd = nullptr;
+#if MAX_VERSION_MAJOR >= 28  // Interface17::GetViewportFromScreenCoord is 2026+ only
     if (Interface17* ip17 = GetCOREInterface17()) {
         int panelIndex = 0, vptIndex = 0, vptID = 0;
         POINT localPt{};
@@ -184,6 +186,7 @@ static bool TryGetViewportFromScreenPoint(const POINT& screenPt, HWND& viewHwnd,
             return true;
         }
     }
+#endif
 
     Interface* ip = GetCOREInterface();
     if (!ip) return false;
@@ -556,6 +559,12 @@ static int DesiredOrbitFlyoff() {
 
 static void EvaluateAutoOrbit() {
     if (g_autoOrbitMode == AUTO_ORBIT_OFF) return;
+    // SDK hack: SetCurFlyOff(..,TRUE) briefly pushes CID_ROTATEVIEW which
+    // cancels in-progress LMB drags. CID_OBJMOVE is in IsSafeOrbitSwapMode
+    // (for normal scrubbing), so object-mode shift+drag-clone — which also
+    // runs under CID_OBJMOVE — gets killed by the 250ms timer mid-drag.
+    // Gate on physical mouse state since the CID can't tell the two apart.
+    if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) return;
     SetOrbitFlyoff(DesiredOrbitFlyoff());
 }
 
@@ -1846,6 +1855,16 @@ static void ShowOSD(const std::wstring& text) {
     SetTimer(g_osdWnd, 1, 1200, nullptr);
 }
 
+// Immediately hide the OSD and kill its auto-hide timer. Called at drag-start
+// sites so a still-visible OSD from a recent action (slot assign, mode switch)
+// doesn't linger into the drag — WM_TIMER can get starved by the high-frequency
+// mouse-move/redraw pump during scrub, leaving the OSD apparently stuck.
+static void HideOSD() {
+    if (!g_osdWnd) return;
+    KillTimer(g_osdWnd, 1);
+    ShowWindow(g_osdWnd, SW_HIDE);
+}
+
 static std::wstring FmtFloat(float v) {
     wchar_t buf[32];
     float a = v < 0 ? -v : v;
@@ -2486,6 +2505,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                         initDisplayVal(g_xb1V);
                         initDisplayVal(g_xb1H);
                         if (g_xb1V.Active() || g_xb1H.Active()) {
+                            HideOSD();
                             s_lastMouseX = ((MOUSEHOOKSTRUCT*)lp)->pt.x;
                             s_lastMouseY = ((MOUSEHOOKSTRUCT*)lp)->pt.y;
                             s_xb1Dragging = true;
@@ -5621,7 +5641,7 @@ public:
 
 static PPClassDesc ppDesc;
 
-ClassDesc* GetPowerCutClassDesc();
+ClassDesc* GetPrecisionCutClassDesc();
 ClassDesc* GetNormalizePolyDesc();
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
@@ -5638,7 +5658,7 @@ __declspec(dllexport) int          LibNumberClasses()  { return 3; }
 __declspec(dllexport) ClassDesc*   LibClassDesc(int i) {
     switch (i) {
     case 0: return &ppDesc;
-    case 1: return GetPowerCutClassDesc();
+    case 1: return GetPrecisionCutClassDesc();
     case 2: return GetNormalizePolyDesc();
     default: return nullptr;
     }

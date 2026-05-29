@@ -1,4 +1,4 @@
-#include "PowerCutMod.h"
+#include "PrecisionCutMod.h"
 #include "resource.h"
 #include <polyobj.h>
 #include <triobj.h>
@@ -49,8 +49,8 @@ static bool IsSelectedSplineMirrorParam(ParamID pid) {
 // ═════════════════════════════════════════════════════════════════
 //  PARAMETER BLOCK DESCRIPTOR
 // ═════════════════════════════════════════════════════════════════
-static ParamBlockDesc2 powercut_param_blk(
-    0, _T("PowerCutParams"), IDS_PARAMS, GetPowerCutDesc(),
+static ParamBlockDesc2 precisioncut_param_blk(
+    0, _T("PrecisionCutParams"), IDS_PARAMS, GetPrecisionCutDesc(),
     P_AUTO_CONSTRUCT, PBLOCK_REF,
 
     pb_spline_node, _T("splineNodes"), TYPE_INODE_TAB, 0, P_VARIABLE_SIZE, IDS_SPLINE_NODE,
@@ -158,7 +158,7 @@ static ParamBlockDesc2 powercut_param_blk(
 // ═════════════════════════════════════════════════════════════════
 class SplinePickModeCallback : public PickModeCallback, public PickNodeCallback {
 public:
-    PowerCutMod* mod;
+    PrecisionCutMod* mod;
     HWND hPanel;
 
     SplinePickModeCallback() : mod(nullptr), hPanel(nullptr) {}
@@ -192,7 +192,7 @@ public:
     }
 
     void ExitMode(IObjParam* ip) override {
-        PowerCutMod::inPickMode = false;
+        PrecisionCutMod::inPickMode = false;
         if (hPanel) {
             SetDlgItemText(hPanel, IDC_PICK_SPLINE, _T("Add"));
         }
@@ -217,10 +217,10 @@ public:
 // ═════════════════════════════════════════════════════════════════
 //  DIALOG PROC — spline list + per-spline mode radio buttons
 // ═════════════════════════════════════════════════════════════════
-class PowerCutDlgProc : public ParamMap2UserDlgProc {
+class PrecisionCutDlgProc : public ParamMap2UserDlgProc {
 public:
-    PowerCutMod* mod;
-    PowerCutDlgProc(PowerCutMod* m) : mod(m) {}
+    PrecisionCutMod* mod;
+    PrecisionCutDlgProc(PrecisionCutMod* m) : mod(m) {}
 
     INT_PTR DlgProc(TimeValue t, IParamMap2* map, HWND hWnd, UINT msg,
                      WPARAM wParam, LPARAM lParam) override {
@@ -262,7 +262,7 @@ public:
             // ── Add splines (pick mode toggle / H-key fallback) ──
             if (id == IDC_PICK_SPLINE) {
                 if (mod) {
-                    if (PowerCutMod::inPickMode) {
+                    if (PrecisionCutMod::inPickMode) {
                         mod->ExitPickMode();
                     } else {
                         // If Ctrl+click or H-key: open name dialog as fallback
@@ -288,8 +288,8 @@ public:
                             UpdateDepthUI(hWnd);
                         } else {
                             // Set the panel HWND on the callback so it can refresh
-                            if (PowerCutMod::pickCB) {
-                                PowerCutMod::pickCB->hPanel = hWnd;
+                            if (PrecisionCutMod::pickCB) {
+                                PrecisionCutMod::pickCB->hPanel = hWnd;
                             }
                             mod->EnterPickMode();
                         }
@@ -513,17 +513,17 @@ public:
 // ═════════════════════════════════════════════════════════════════
 //  CONSTRUCTOR / DESTRUCTOR
 // ═════════════════════════════════════════════════════════════════
-IObjParam* PowerCutMod::ip = nullptr;
-SplinePickModeCallback* PowerCutMod::pickCB = nullptr;
-bool PowerCutMod::inPickMode = false;
+IObjParam* PrecisionCutMod::ip = nullptr;
+SplinePickModeCallback* PrecisionCutMod::pickCB = nullptr;
+bool PrecisionCutMod::inPickMode = false;
 
-PowerCutMod::PowerCutMod() : pblock2(nullptr), pmapParam(nullptr) {
-    GetPowerCutDesc()->MakeAutoParamBlocks(this);
+PrecisionCutMod::PrecisionCutMod() : pblock2(nullptr), pmapParam(nullptr) {
+    GetPrecisionCutDesc()->MakeAutoParamBlocks(this);
 }
 
-PowerCutMod::~PowerCutMod() {}
+PrecisionCutMod::~PrecisionCutMod() {}
 
-void PowerCutMod::GetGlobalSettings(TimeValue t, SplineSettings& settings) const {
+void PrecisionCutMod::GetGlobalSettings(TimeValue t, SplineSettings& settings) const {
     if (!pblock2)
         return;
 
@@ -542,7 +542,7 @@ void PowerCutMod::GetGlobalSettings(TimeValue t, SplineSettings& settings) const
     pblock2->GetValue(pb_bevel_segments, t, settings.bevelSegs, iv);
 }
 
-void PowerCutMod::GetSplineSettings(TimeValue t, int index, SplineSettings& settings) const {
+void PrecisionCutMod::GetSplineSettings(TimeValue t, int index, SplineSettings& settings) const {
     GetGlobalSettings(t, settings);
     if (!pblock2 || index < 0)
         return;
@@ -574,7 +574,7 @@ void PowerCutMod::GetSplineSettings(TimeValue t, int index, SplineSettings& sett
         pblock2->GetValue(pb_spline_bevel_segments, t, settings.bevelSegs, iv, index);
 }
 
-void PowerCutMod::EnsureSplineSettingsCount(TimeValue t) {
+void PrecisionCutMod::EnsureSplineSettingsCount(TimeValue t) {
     if (!pblock2)
         return;
 
@@ -611,7 +611,7 @@ void PowerCutMod::EnsureSplineSettingsCount(TimeValue t) {
         pblock2->Append(pb_spline_bevel_segments, 1, &defaults.bevelSegs);
 }
 
-void PowerCutMod::AppendSpline(INode* splineNode, TimeValue t) {
+void PrecisionCutMod::AppendSpline(INode* splineNode, TimeValue t) {
     if (!pblock2 || !splineNode)
         return;
 
@@ -633,7 +633,7 @@ void PowerCutMod::AppendSpline(INode* splineNode, TimeValue t) {
     pblock2->Append(pb_spline_bevel_segments, 1, &settings.bevelSegs);
 }
 
-void PowerCutMod::DeleteSpline(int index) {
+void PrecisionCutMod::DeleteSpline(int index) {
     if (!pblock2 || index < 0 || index >= pblock2->Count(pb_spline_node))
         return;
 
@@ -664,7 +664,7 @@ void PowerCutMod::DeleteSpline(int index) {
         pblock2->Delete(pb_spline_bevel_segments, index, 1);
 }
 
-void PowerCutMod::SyncSelectedSplineToGlobals(TimeValue t) {
+void PrecisionCutMod::SyncSelectedSplineToGlobals(TimeValue t) {
     if (!pblock2)
         return;
 
@@ -693,7 +693,7 @@ void PowerCutMod::SyncSelectedSplineToGlobals(TimeValue t) {
     syncingSelectedSpline_ = false;
 }
 
-void PowerCutMod::SyncGlobalParamToSelectedSpline(TimeValue t, ParamID pid) {
+void PrecisionCutMod::SyncGlobalParamToSelectedSpline(TimeValue t, ParamID pid) {
     if (!pblock2 || syncingSelectedSpline_)
         return;
 
@@ -785,19 +785,19 @@ void PowerCutMod::SyncGlobalParamToSelectedSpline(TimeValue t, ParamID pid) {
 // ═════════════════════════════════════════════════════════════════
 //  CHANNELS
 // ═════════════════════════════════════════════════════════════════
-ChannelMask PowerCutMod::ChannelsUsed()    { return GEOM_CHANNEL | TOPO_CHANNEL; }
-ChannelMask PowerCutMod::ChannelsChanged() { return GEOM_CHANNEL | TOPO_CHANNEL; }
-Class_ID PowerCutMod::InputType() { return defObjectClassID; }
+ChannelMask PrecisionCutMod::ChannelsUsed()    { return GEOM_CHANNEL | TOPO_CHANNEL; }
+ChannelMask PrecisionCutMod::ChannelsChanged() { return GEOM_CHANNEL | TOPO_CHANNEL; }
+Class_ID PrecisionCutMod::InputType() { return defObjectClassID; }
 
 // ═════════════════════════════════════════════════════════════════
 //  REFERENCE MANAGEMENT
 // ═════════════════════════════════════════════════════════════════
-void PowerCutMod::SetReference(int i, RefTargetHandle rtarg) {
+void PrecisionCutMod::SetReference(int i, RefTargetHandle rtarg) {
     if (i == PBLOCK_REF)
         pblock2 = (IParamBlock2*)rtarg;
 }
 
-RefResult PowerCutMod::NotifyRefChanged(const Interval& iv,
+RefResult PrecisionCutMod::NotifyRefChanged(const Interval& iv,
                                              RefTargetHandle hTarg,
                                              PartID& partID,
                                              RefMessage msg,
@@ -819,8 +819,8 @@ RefResult PowerCutMod::NotifyRefChanged(const Interval& iv,
 // ═════════════════════════════════════════════════════════════════
 //  CLONE
 // ═════════════════════════════════════════════════════════════════
-RefTargetHandle PowerCutMod::Clone(RemapDir& remap) {
-    PowerCutMod* mod = new PowerCutMod();
+RefTargetHandle PrecisionCutMod::Clone(RemapDir& remap) {
+    PrecisionCutMod* mod = new PrecisionCutMod();
     mod->ReplaceReference(PBLOCK_REF, remap.CloneRef(pblock2));
     BaseClone(this, mod, remap);
     return mod;
@@ -829,7 +829,7 @@ RefTargetHandle PowerCutMod::Clone(RemapDir& remap) {
 // ═════════════════════════════════════════════════════════════════
 //  VALIDITY — depend on every spline node's transform
 // ═════════════════════════════════════════════════════════════════
-Interval PowerCutMod::LocalValidity(TimeValue t) {
+Interval PrecisionCutMod::LocalValidity(TimeValue t) {
     Interval iv = FOREVER;
     if (!pblock2) return iv;
 
@@ -850,22 +850,22 @@ Interval PowerCutMod::LocalValidity(TimeValue t) {
     return iv;
 }
 
-void PowerCutMod::NotifyInputChanged(const Interval&, PartID, RefMessage, ModContext*) {}
+void PrecisionCutMod::NotifyInputChanged(const Interval&, PartID, RefMessage, ModContext*) {}
 
 // ═════════════════════════════════════════════════════════════════
 //  UI
 // ═════════════════════════════════════════════════════════════════
-void PowerCutMod::BeginEditParams(IObjParam* objParam, ULONG flags, Animatable* prev) {
+void PrecisionCutMod::BeginEditParams(IObjParam* objParam, ULONG flags, Animatable* prev) {
     ip = objParam;
     if (!pickCB) pickCB = new SplinePickModeCallback();
     pickCB->mod = this;
 
     pmapParam = CreateCPParamMap2(pblock2, objParam, hInstance,
         MAKEINTRESOURCE(IDD_PANEL), GetString(IDS_PARAMS), 0,
-        new PowerCutDlgProc(this));
+        new PrecisionCutDlgProc(this));
 }
 
-void PowerCutMod::EndEditParams(IObjParam* objParam, ULONG flags, Animatable* next) {
+void PrecisionCutMod::EndEditParams(IObjParam* objParam, ULONG flags, Animatable* next) {
     ExitPickMode();
     if (pmapParam) { DestroyCPParamMap2(pmapParam); pmapParam = nullptr; }
     if (pickCB) pickCB->mod = nullptr;
@@ -875,14 +875,14 @@ void PowerCutMod::EndEditParams(IObjParam* objParam, ULONG flags, Animatable* ne
 // ═════════════════════════════════════════════════════════════════
 //  PICK MODE
 // ═════════════════════════════════════════════════════════════════
-void PowerCutMod::EnterPickMode() {
+void PrecisionCutMod::EnterPickMode() {
     if (!ip || !pickCB) return;
     pickCB->mod = this;
     ip->SetPickMode(pickCB);
     inPickMode = true;
 }
 
-void PowerCutMod::ExitPickMode() {
+void PrecisionCutMod::ExitPickMode() {
     if (!ip || !inPickMode) return;
     ip->ClearPickMode();
     inPickMode = false;
@@ -903,7 +903,7 @@ public:
     }
 };
 
-INode* PowerCutMod::FindOwnNode() {
+INode* PrecisionCutMod::FindOwnNode() {
     FindNodeDEP dep;
     DoEnumDependents(&dep);
     return dep.node;
@@ -912,7 +912,7 @@ INode* PowerCutMod::FindOwnNode() {
 // ═════════════════════════════════════════════════════════════════
 //  EXTRACT POLYLINES — spline node-local -> world -> mesh node-local
 // ═════════════════════════════════════════════════════════════════
-std::vector<ProjectedPolyline> PowerCutMod::ExtractPolylines(
+std::vector<ProjectedPolyline> PrecisionCutMod::ExtractPolylines(
     INode* splineNode, INode* meshNode, TimeValue t, int steps,
     Point3& outProjDir, int projMode, MNMesh* targetMesh) {
 
@@ -1060,7 +1060,7 @@ std::vector<ProjectedPolyline> PowerCutMod::ExtractPolylines(
 // ═════════════════════════════════════════════════════════════════
 //  MODIFY OBJECT
 // ═════════════════════════════════════════════════════════════════
-void PowerCutMod::ModifyObject(TimeValue t, ModContext& mc,
+void PrecisionCutMod::ModifyObject(TimeValue t, ModContext& mc,
                                     ObjectState* os, INode* node) {
     if (!os || !os->obj || !pblock2) return;
 

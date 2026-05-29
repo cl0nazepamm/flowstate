@@ -776,6 +776,101 @@ macroscript flowstate_Config
     frm.Show()
 )
 
+macroScript SmoothBridge
+    category:"CloneTools"
+    tooltip:"Smooth Bridge (G1/G0)"
+    buttontext:"Smooth Bridge"
+(
+    rollout sbDlg "Smooth Bridge" width:200 height:218
+    (
+        spinner spnSegments "Segments:" pos:[10,10]  width:180 \
+            range:[1,100,5]   type:#integer
+        spinner spnTension  "Tension: " pos:[10,32]  width:180 \
+            range:[0.0,3.0,1.0] type:#float scale:0.05
+        spinner spnTwist    "Twist:    " pos:[10,54] width:180 \
+            range:[-100,100,0] type:#integer
+        spinner spnBulge    "Bulge:    " pos:[10,76] width:180 \
+            range:[-5.0,5.0,0.0] type:#float scale:0.05
+
+        groupBox grp "Border Continuity" pos:[6,102] width:188 height:50
+        checkbox cbSmoothA "Smooth A" pos:[14,120]  width:78 checked:true
+        checkbox cbFlipA   "Flip A"   pos:[100,120] width:78
+        checkbox cbSmoothB "Smooth B" pos:[14,136]  width:78 checked:true
+        checkbox cbFlipB   "Flip B"   pos:[100,136] width:78
+
+        button btnApply  "Apply"  pos:[10,162]  width:85 height:30
+        button btnCancel "Cancel" pos:[105,162] width:85 height:30
+
+        fn computeFlags = (
+            local f = 0
+            if cbSmoothA.checked do f += 1
+            if cbSmoothB.checked do f += 2
+            if cbFlipA.checked   do f += 4
+            if cbFlipB.checked   do f += 8
+            f
+        )
+
+        fn refresh = (
+            try (
+                SmoothBridge.preview spnSegments.value spnTension.value \
+                    (computeFlags()) spnTwist.value spnBulge.value
+            ) catch ()
+        )
+
+        on spnSegments changed val do refresh()
+        on spnTension  changed val do refresh()
+        on spnTwist    changed val do refresh()
+        on spnBulge    changed val do refresh()
+        on cbSmoothA   changed val do refresh()
+        on cbSmoothB   changed val do refresh()
+        on cbFlipA     changed val do refresh()
+        on cbFlipB     changed val do refresh()
+
+        on btnApply pressed do (
+            SmoothBridge.commitPreview spnSegments.value spnTension.value \
+                (computeFlags()) spnTwist.value spnBulge.value
+            destroyDialog sbDlg
+        )
+        on btnCancel pressed do (
+            SmoothBridge.cancelPreview()
+            destroyDialog sbDlg
+        )
+        on sbDlg close do (
+            -- treat window-close (X) as cancel
+            SmoothBridge.cancelPreview()
+        )
+    )
+
+    on execute do (
+        if classof $ != Editable_Poly then (
+            messagebox "Object must be Editable Poly. Right-click \xBB Convert To: Editable Poly." \
+                title:"Smooth Bridge"
+        ) else (
+            SmoothBridge.beginPreview()
+            -- default flags = smoothA(1) | smoothB(2) = 3
+            SmoothBridge.preview 5 1.0 3 0 0.0
+            -- Modal: prevents touching the gizmo / sub-object tools during
+            -- preview (which would crash because the in-progress preview
+            -- mesh is in an inconsistent state vs EPoly's internal caches).
+            -- Viewport orbit/pan/zoom still work via middle-mouse nav.
+            createDialog sbDlg modal:true
+        )
+    )
+)
+
+macroScript CloneF2Extend
+    category:"CloneTools"
+    tooltip:"F2 Extend / Make Face"
+    buttontext:"F2 Extend"
+(
+    on execute do (
+        if classof $ == Editable_Poly do (
+            local ok = false
+            try (ok = F2Extend.extend()) catch (ok = false)
+        )
+    )
+)
+
 (
     local selfPath = getSourceFileName()
     if selfPath != undefined and selfPath != "" do

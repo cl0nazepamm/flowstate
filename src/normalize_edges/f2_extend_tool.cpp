@@ -8,6 +8,7 @@
 #include <iFnPub.h>
 #include <plugapi.h>
 #include <maxapi.h>
+#include <iepoly.h>
 #include <polyobj.h>
 #include <mnmesh.h>
 #include <hold.h>
@@ -29,6 +30,13 @@ static void RefreshPolyObjectMesh(PolyObject* po) {
     mesh.InvalidateTopoCache();
     mesh.InvalidateGeomCache();
     po->InvalidateChannels(GEOM_CHANNEL | TOPO_CHANNEL | SELECT_CHANNEL);
+    // EPoly's UI shell caches selection / topology separately from the bare
+    // MNMesh. Without LocalDataChanged + RefreshScreen the modify panel and
+    // viewport keep stale state — selection appears random after spam-F2.
+    if (EPoly* ep = (EPoly*)po->GetInterface(EPOLY_INTERFACE)) {
+        ep->LocalDataChanged(GEOM_CHANNEL | TOPO_CHANNEL | SELECT_CHANNEL);
+        ep->RefreshScreen();
+    }
     po->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
 }
 
@@ -507,18 +515,6 @@ static bool DoF2EdgeExtend(PolyObject* po, const std::vector<int>& selEdges) {
     Point3 madePts[4] = { mesh.P(a), mesh.P(b), mesh.P(b2), mesh.P(a2) };
     if (!IsUsableF2Quad(madePts)) return restoreAndFail();
 
-    const int newEdge = FindEdgeByVerts(mesh, a2, b2);
-    if (newEdge < 0) return restoreAndFail();
-
-    BitArray esel(mesh.ENum());
-    esel.ClearAll();
-    esel.Set(newEdge);
-    mesh.EdgeSelect(esel);
-
-    BitArray fsel(mesh.FNum());
-    fsel.ClearAll();
-    fsel.Set(newFace);
-    mesh.FaceSelect(fsel);
     return true;
 }
 
@@ -576,15 +572,10 @@ static bool DoF2VertexFill(PolyObject* po, const std::vector<int>& selVerts) {
         }
         if (FindEdgeByVerts(mesh, a, b) >= 0) return false;
 
-        const int edge = mesh.SimpleNewEdge(a, b);
+        mesh.SimpleNewEdge(a, b);
         mesh.FillInMesh();
         mesh.InvalidateTopoCache();
         mesh.InvalidateGeomCache();
-
-        BitArray esel(mesh.ENum());
-        esel.ClearAll();
-        if (edge >= 0 && edge < mesh.ENum()) esel.Set(edge);
-        mesh.EdgeSelect(esel);
         return true;
     }
 
@@ -595,11 +586,6 @@ static bool DoF2VertexFill(PolyObject* po, const std::vector<int>& selVerts) {
     mesh.FillInMesh();
     mesh.InvalidateTopoCache();
     mesh.InvalidateGeomCache();
-
-    BitArray fsel(mesh.FNum());
-    fsel.ClearAll();
-    if (face < mesh.FNum()) fsel.Set(face);
-    mesh.FaceSelect(fsel);
     return true;
 }
 

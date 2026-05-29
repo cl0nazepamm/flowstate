@@ -18,14 +18,14 @@
 #include <object.h>
 #include <ref.h>
 #include <maxapi.h>
-#include "PowerCutDesc.h"
+#include "PrecisionCutDesc.h"
 #include "SplineProjector.h"
 #include "MeshCutter.h"
 #include <vector>
 
 // ── Forward declarations ────────────────────────────────────────
-class PowerCutMod;
-class PowerCutClassDesc;
+class PrecisionCutMod;
+class PrecisionCutClassDesc;
 class SplinePickModeCallback;
 
 struct SplineSettings {
@@ -44,10 +44,10 @@ struct SplineSettings {
 };
 
 // ── Class descriptor singleton ──────────────────────────────────
-PowerCutClassDesc* GetPowerCutDesc();
+PrecisionCutClassDesc* GetPrecisionCutDesc();
 
 // ── The Modifier ────────────────────────────────────────────────
-class PowerCutMod : public Modifier {
+class PrecisionCutMod : public Modifier {
 public:
     IParamBlock2* pblock2;
     IParamMap2*   pmapParam;   // manual param map for UI
@@ -55,8 +55,8 @@ public:
     static SplinePickModeCallback* pickCB;
     static bool inPickMode;
 
-    PowerCutMod();
-    ~PowerCutMod() override;
+    PrecisionCutMod();
+    ~PrecisionCutMod() override;
 
     // ── Modifier overrides ──────────────────────────────────────
     ChannelMask ChannelsUsed() override;
@@ -66,10 +66,10 @@ public:
 
     // ── Animatable ──────────────────────────────────────────────
     void DeleteThis() override { delete this; }
-    void GetClassName(TSTR& s, bool localized) const override { s = _T("PowerCuttt"); }
+    void GetClassName(TSTR& s, bool localized) const override { s = _T("Precision Cut"); }
     SClass_ID SuperClassID() override { return OSM_CLASS_ID; }
-    Class_ID ClassID() override { return POWERCUT_CLASS_ID; }
-    const TCHAR* GetObjectName(bool localized) const override { return _T("PowerCuttt"); }
+    Class_ID ClassID() override { return PRECISIONCUT_CLASS_ID; }
+    const TCHAR* GetObjectName(bool localized) const override { return _T("Precision Cut"); }
 
     // ── Reference management ────────────────────────────────────
     int NumRefs() override { return 1; }
@@ -135,15 +135,15 @@ private:
 };
 
 // ── Class Descriptor ────────────────────────────────────────────
-class PowerCutClassDesc : public ClassDesc2 {
+class PrecisionCutClassDesc : public ClassDesc2 {
 public:
     int IsPublic() override { return TRUE; }
-    void* Create(BOOL) override { return new PowerCutMod(); }
-    const TCHAR* ClassName() override { return _T("PowerCuttt"); }
-    const TCHAR* NonLocalizedClassName() override { return _T("PowerCuttt"); }
+    void* Create(BOOL) override { return new PrecisionCutMod(); }
+    const TCHAR* ClassName() override { return _T("Precision Cut"); }
+    const TCHAR* NonLocalizedClassName() override { return _T("Precision Cut"); }
     SClass_ID SuperClassID() override { return OSM_CLASS_ID; }
-    Class_ID ClassID() override { return POWERCUT_CLASS_ID; }
+    Class_ID ClassID() override { return PRECISIONCUT_CLASS_ID; }
     const TCHAR* Category() override { return _T("Clone Pipeline"); }
-    const TCHAR* InternalName() override { return _T("PowerCuttt"); }
+    const TCHAR* InternalName() override { return _T("Precision Cut"); }
     HINSTANCE HInstance() override { return hInstance; }
 };

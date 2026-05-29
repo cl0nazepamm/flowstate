@@ -1,4 +1,4 @@
-LIBRARY PowerCut.dlm
+LIBRARY PrecisionCut.dlm
 EXPORTS
     LibDescription      @1
     LibNumberClasses    @2
