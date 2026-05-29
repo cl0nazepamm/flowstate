@@ -3,7 +3,7 @@
 3ds Max C++ GUP plugin suite for fast parameter editing, shader lookup,
 modifier-stack navigation, and viewport/modeling hotkeys.
 
-![FlowState logo](images/flowstate_logo.png)
+FlowState logo
 
 ## Features
 
@@ -26,7 +26,7 @@ Highlights:
 - Editable Poly command-mode support through cached EPoly operation param blocks.
 
 ### Search
-  
+
 Material and texmap search palette for the scene and available shader classes.
 It includes OSL category patching, pinned shader bricks, and texture preview.
 
@@ -53,41 +53,42 @@ restarts.
 
 ### Modeling Tools
 
-`FlowState.gup` also exports the bundled native classes/tools:
-
-- `Precision Cut` modifier from `src/precisioncut/`.
-- `Normalize Poly` plus function-published helper tools from
-  `src/normalize_edges/`.
-- `Smooth Bridge` and `F2 Extend` macros in `macros/flowstate_config.ms`.
+- `Precision Cut` (WIP) Cut meshes with splines (MODIFIER)
+- `Normalize Poly` C++ accelerated version of ShivaTools vertex cleaner script. (MODIFIER)
+- `Smooth Bridge` Supports twist and flip with tangency controls. (TOOL)
 
 ## Controls
 
-| Input | Action |
-| --- | --- |
-| `XButton2` | Toggle PowerParams |
-| `Shift+XButton2` | Toggle PowerShader |
-| `Tab` in Slate Material Editor | Toggle PowerShader when enabled |
-| `Ctrl+XButton2` | Cycle auto-orbit mode |
-| `Alt+Shift+XButton2` | Swap V/H slider assignments |
-| `XButton1` combos | Run configurable drag/action keymap |
-| Mouse wheel over PowerParams value | Scrub value |
-| `Shift` while dragging/scrubbing | Coarse speed |
-| `Alt` while dragging/scrubbing | Fine speed |
-| Type then `Tab`/`Enter` | Apply typed value |
-| `Esc` | Cancel panel operation and close |
-| Click outside panel | Accept and close |
+
+| Input                              | Action                              |
+| ---------------------------------- | ----------------------------------- |
+| `XButton2`                         | Toggle PowerParams                  |
+| `Shift+XButton2`                   | Toggle PowerShader                  |
+| `Tab` in Slate Material Editor     | Toggle PowerShader when enabled     |
+| `Ctrl+XButton2`                    | Cycle auto-orbit mode               |
+| `Alt+Shift+XButton2`               | Swap V/H slider assignments         |
+| `XButton1` combos                  | Run configurable drag/action keymap |
+| Mouse wheel over PowerParams value | Scrub value                         |
+| `Shift` while dragging/scrubbing   | Coarse speed                        |
+| `Alt` while dragging/scrubbing     | Fine speed                          |
+| Type then `Tab`/`Enter`            | Apply typed value                   |
+| `Esc`                              | Cancel panel operation and close    |
+| Click outside panel                | Accept and close                    |
+
 
 ## Mouse5 Keymap
 
 Mouse5 actions are mapped by combo index, not hardcoded modifier checks.
 
-| Combo index | Modifiers | Default action |
-| --- | --- | --- |
-| `0` | none | Screen Grab |
-| `1` | `Shift` | Time Slider |
-| `2` | `Ctrl` | Param Slider |
-| `3` | `Ctrl+Shift` | Opacity Slider |
-| `4` | `Ctrl+Alt+Shift` | Clear Sliders |
+
+| Combo index | Modifiers        | Default action |
+| ----------- | ---------------- | -------------- |
+| `0`         | none             | Screen Grab    |
+| `1`         | `Shift`          | Time Slider    |
+| `2`         | `Ctrl`           | Param Slider   |
+| `3`         | `Ctrl+Shift`     | Opacity Slider |
+| `4`         | `Ctrl+Alt+Shift` | Clear Sliders  |
+
 
 The globals are:
 
@@ -100,3 +101,14 @@ The globals are:
 They persist as `Key:<action>=<comboIdx>` entries in `FlowState.cfg`. Drag-time
 speed modifiers are separate and remain hardcoded: `Shift` is coarse/faster,
 `Alt` is fine/slower.
+
+## License
+
+FlowState is licensed under the **GNU General Public License v3.0** with an
+additional permission (a linking exception) that allows it to be linked,
+combined, and distributed together with the proprietary Autodesk 3ds Max SDK.
+
+See [LICENSE](LICENSE) for the GPLv3 text and
+[LICENSE-EXCEPTION](LICENSE-EXCEPTION) for the exception.
+
+Copyright (C) 2026 cl0nazepamm

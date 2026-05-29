@@ -1,0 +1,26 @@
+FlowState linking exception
+===========================
+
+Additional permission under GNU GPL version 3 section 7
+
+FlowState is distributed under the terms of the GNU General Public License,
+version 3, as published by the Free Software Foundation (see the LICENSE
+file), with the following additional permission granted under section 7 of
+that license:
+
+    As an additional permission under section 7 of the GNU General Public
+    License version 3, you have permission to link or combine FlowState with
+    the Autodesk(R) 3ds Max(R) Software Development Kit, the Autodesk 3ds Max
+    application, and their associated runtime libraries (collectively, "the
+    Autodesk SDK"), and to copy, convey, and distribute the resulting
+    combined work, notwithstanding that the Autodesk SDK is not licensed
+    under the GNU GPL. You must still comply with the GNU General Public
+    License version 3 in all respects for all of the FlowState code used in
+    addition to the Autodesk SDK.
+
+    If you modify FlowState, you may extend this exception to your modified
+    version, but you are not obligated to do so. If you do not wish to do so,
+    delete this exception statement from your version.
+
+The Autodesk SDK is the property of Autodesk, Inc. and is governed by its own
+license terms; nothing in this exception grants any rights in the Autodesk SDK.
