@@ -3,3 +3,7 @@ build_*/
 *.user
 *.suo
 .vs/
+
+# Local build/dev scripts — only build.bat is tracked
+*.bat
+!build.bat
