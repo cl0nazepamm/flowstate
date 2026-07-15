@@ -6023,8 +6023,6 @@ public:
 
 static PPClassDesc ppDesc;
 
-// PrecisionCut is intentionally excluded from release builds until its crash
-// paths are fixed. To re-enable it, restore its CMake sources and class export.
 ClassDesc* GetNormalizePolyDesc();
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {

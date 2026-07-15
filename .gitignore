@@ -8,3 +8,11 @@ build_log.txt
 # Local build/dev scripts — only build.bat is tracked
 *.bat
 !build.bat
+
+# Local agent / IDE tooling
+.claude/
+.agents/
+.codex/
+.cursor/
+AGENTS.md
+CLAUDE.md

@@ -34,7 +34,7 @@ if %ERRORLEVEL% NEQ 0 goto :fail
 echo [3/4] Deploying plugin...
 copy /Y "%BUILD_DIR%\Release\FlowState.gup" "%MAX_PLUGINS%\FlowState.gup"
 if ERRORLEVEL 1 goto :fail
-del /Q "%MAX_PLUGINS%\PowerCut.dlm" "%MAX_PLUGINS%\normalize_poly.dlm" >nul 2>&1
+del /Q "%MAX_PLUGINS%\normalize_poly.dlm" >nul 2>&1
 
 echo [4/4] Deploying macros...
 if not exist "%USERMACROS%" mkdir "%USERMACROS%"
