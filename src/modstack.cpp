@@ -34,6 +34,7 @@ namespace {
 // ═════════════════════════════════════════════════════════════════
 namespace Theme
 {
+    bool lightTheme = false;
     COLORREF bg;
     COLORREF panel;
     COLORREF panelLt;
@@ -53,6 +54,7 @@ namespace Theme
 
     void Update(bool light)
     {
+        lightTheme = light;
         if (light) {
             bg       = RGB(215, 218, 222);
             panel    = RGB(225, 228, 232);
@@ -134,7 +136,8 @@ struct ModItem
     std::wstring category;
     std::wstring internalName;
     ModKind kind = ModKind::OSM;
-    ClassDesc* classDesc = nullptr;
+    SClass_ID superClassId = 0;
+    Class_ID classId = Class_ID(0, 0);
     MacroID macroId = -1; // for macroscripts
 };
 
@@ -191,18 +194,18 @@ bool AddModifierViaModPanelScript(const std::wstring& primaryName,
 
     std::wstring script =
         L"try("
-        L"local before = if selection.count > 0 then selection[1].modifiers.count else -1;"
-        L"max modify mode;"
-        L"try(subObjectLevel = 0)catch();"
         L"local names = #(" + MxsStringLiteral(primaryName) + L"," + MxsStringLiteral(fallbackName) + L");"
         L"local m = undefined;"
         L"for n in names while m == undefined do if n != \"\" do try(m = execute (n + \"()\"))catch();"
-        L"if m != undefined do "
-        L"(try(if modPanel.validModifier m then modPanel.addModToSelection m)catch();"
-        L"local mid = if selection.count > 0 then selection[1].modifiers.count else -1;"
-        L"if mid <= before do try(addModifier $ m)catch());"
-        L"local after = if selection.count > 0 then selection[1].modifiers.count else -1;"
-        L"if after > before then \"1\" else \"0\""
+        L"if m == undefined then \"0\" else "
+        L"(undo \"Add Modifier\" on ("
+        L"local before=0;for o in selection do try(before+=o.modifiers.count)catch();"
+        L"max modify mode;try(subObjectLevel = 0)catch();"
+        L"try(if modPanel.validModifier m then modPanel.addModToSelection m)catch();"
+        L"local mid=0;for o in selection do try(mid+=o.modifiers.count)catch();"
+        L"if mid <= before do (for o in selection do try(addModifier o m)catch());"
+        L"local after=0;for o in selection do try(after+=o.modifiers.count)catch();"
+        L"if after > before then \"1\" else \"0\"))"
         L")catch(\"0\")";
     FPValue result;
     BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic,
@@ -241,11 +244,14 @@ public:
 
         WNDCLASSEXW wc{ sizeof(wc) };
         wc.lpfnWndProc   = WndProc;
-        wc.hbrBackground = Theme::brBg;
+        wc.hbrBackground = nullptr; // WM_ERASEBKGND paints with the live theme brush
         wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
         wc.hInstance      = hInstance;
         wc.lpszClassName  = kWndClass;
-        RegisterClassExW(&wc);
+        if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            Theme::Shutdown();
+            return false;
+        }
         inited_ = true;
         return true;
     }
@@ -253,8 +259,15 @@ public:
     void Shutdown()
     {
         CancelPendingRebuild();
+        RestoreAccelerators();
         if (wnd_) { DestroyWindow(wnd_); wnd_ = nullptr; }
+        edit_ = list_ = status_ = nullptr;
+        cache_.clear();
+        filtered_.clear();
+        cacheReady_ = rebuildPending_ = false;
+        UnregisterClassW(kWndClass, hInstance);
         Theme::Shutdown();
+        inited_ = false;
     }
 
     void Toggle()
@@ -264,6 +277,23 @@ public:
     }
 
     bool IsOpen() const { return wnd_ && IsWindowVisible(wnd_); }
+
+    void ReloadTheme(bool light)
+    {
+        Theme::Update(light);
+        if (!wnd_) return;
+        if (list_) {
+            HMODULE hUx = LoadLibraryW(L"uxtheme.dll");
+            if (hUx) {
+                typedef HRESULT(WINAPI* SWTF)(HWND, LPCWSTR, LPCWSTR);
+                auto swt = reinterpret_cast<SWTF>(GetProcAddress(hUx, "SetWindowTheme"));
+                if (swt) swt(list_, Theme::lightTheme ? L"Explorer" : L"DarkMode_Explorer", nullptr);
+                FreeLibrary(hUx);
+            }
+        }
+        RedrawWindow(wnd_, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    }
 
 private:
     // ─── Window proc ────────────────────────────────────────────
@@ -297,14 +327,16 @@ private:
             FillRect(hdc, &rc, Theme::brBg);
             HPEN bp = CreatePen(PS_SOLID, 1, Theme::border);
             HPEN oldP = (HPEN)SelectObject(hdc, bp);
-            SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            HBRUSH oldB = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
             Rectangle(hdc, 0, 0, rc.right, rc.bottom);
+            SelectObject(hdc, oldB);
             SelectObject(hdc, oldP); DeleteObject(bp);
 
             SetBkMode(hdc, TRANSPARENT);
             HFONT oldF = (HFONT)SelectObject(hdc, Theme::fontBold);
             SetTextColor(hdc, Theme::accent);
-            TextOutW(hdc, 10, 10, L"Extended Search", 9);
+            constexpr wchar_t title[] = L"Modifier Stack";
+            TextOutW(hdc, 10, 10, title, static_cast<int>(_countof(title) - 1));
 
             if (self->hoverClose_) {
                 HBRUSH hov = CreateSolidBrush(RGB(200, 60, 60));
@@ -434,7 +466,7 @@ private:
                             self->SetStatus(L"Cannot quick-access macros yet");
                         } else {
                             extern void TogglePowerParamsQuickModifier(const wchar_t*, const wchar_t*);
-                            std::wstring internalName = item.internalName.empty() ? item.label : item.internalName;
+                            std::wstring internalName = self->ResolveConstructorName(item);
                             TogglePowerParamsQuickModifier(internalName.c_str(), item.label.c_str());
                             self->SetStatus(L"Quick Access toggled: " + item.label);
                             InvalidateRect(h, nullptr, FALSE);
@@ -499,7 +531,8 @@ private:
         if (hUx) {
             typedef HRESULT(WINAPI* SWTF)(HWND, LPCWSTR, LPCWSTR);
             auto swt = reinterpret_cast<SWTF>(GetProcAddress(hUx, "SetWindowTheme"));
-            if (swt) swt(list_, L"DarkMode_Explorer", nullptr);
+            if (swt) swt(list_, Theme::lightTheme ? L"Explorer" : L"DarkMode_Explorer", nullptr);
+            FreeLibrary(hUx);
         }
     }
 
@@ -575,36 +608,28 @@ private:
 
         // Show window immediately so it appears before cache build
         POINT p{}; GetCursorPos(&p);
-        RECT wa{}; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+        RECT wa{};
+        MONITORINFO mi{ sizeof(mi) };
+        HMONITOR monitor = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);
+        if (monitor && GetMonitorInfoW(monitor, &mi)) wa = mi.rcWork;
+        else SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
         int x = std::clamp(static_cast<long>(p.x - kWindowWidth / 2),
                            wa.left, wa.right - static_cast<long>(kWindowWidth));
         int y = std::clamp(static_cast<long>(p.y - 36),
                            wa.top, wa.bottom - static_cast<long>(kWindowHeight));
-        int startY = y + 15;
         SetLayeredWindowAttributes(wnd_, 0, 0, LWA_ALPHA);
-        SetWindowPos(wnd_, HWND_TOPMOST, x, startY, kWindowWidth, kWindowHeight, 0);
+        SetWindowPos(wnd_, HWND_TOPMOST, x, y, kWindowWidth, kWindowHeight,
+            SWP_NOACTIVATE);
         ShowWindow(wnd_, SW_SHOW);
-        // Fade & slide in — cubic ease-out, 80ms
-        DWORD t0 = GetTickCount();
-        for (;;) {
-            float t = (float)(GetTickCount() - t0) / 80.0f;
-            if (t >= 1.0f) { 
-                SetLayeredWindowAttributes(wnd_, 0, 255, LWA_ALPHA); 
-                SetWindowPos(wnd_, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                break; 
-            }
-            float ease = 1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t);
-            BYTE a = (BYTE)(255.0f * ease);
-            int curY = startY - (int)(15.0f * ease);
-            SetLayeredWindowAttributes(wnd_, 0, a, LWA_ALPHA);
-            SetWindowPos(wnd_, nullptr, x, curY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            MSG msg; while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
-        }
+        SetLayeredWindowAttributes(wnd_, 0, 255, LWA_ALPHA);
         SetActiveWindow(wnd_);
         SetForegroundWindow(wnd_);
         SetFocus(edit_);
         SendMessageW(edit_, EM_SETSEL, 0, -1);
-        DisableAccelerators();
+        if (!acceleratorsDisabled_) {
+            DisableAccelerators();
+            acceleratorsDisabled_ = true;
+        }
 
         // Build cache and populate list after window is visible
         EnsureCache();
@@ -614,25 +639,16 @@ private:
     void Hide()
     {
         CancelPendingRebuild();
-        // Fade & slide out — 50ms
-        if (IsWindowVisible(wnd_)) {
-            RECT r; GetWindowRect(wnd_, &r);
-            int x = r.left, y = r.top;
-            DWORD t0 = GetTickCount();
-            for (;;) {
-                float t = (float)(GetTickCount() - t0) / 50.0f;
-                if (t >= 1.0f) break;
-                float ease = t * t * t; // cubic ease-in
-                BYTE a = (BYTE)(255.0f * (1.0f - ease));
-                int curY = y + (int)(10.0f * ease);
-                SetLayeredWindowAttributes(wnd_, 0, a, LWA_ALPHA);
-                SetWindowPos(wnd_, nullptr, x, curY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                MSG msg; while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
-            }
-        }
         ShowWindow(wnd_, SW_HIDE);
         SetLayeredWindowAttributes(wnd_, 0, 255, LWA_ALPHA);
+        RestoreAccelerators();
+    }
+
+    void RestoreAccelerators()
+    {
+        if (!acceleratorsDisabled_) return;
         EnableAccelerators();
+        acceleratorsDisabled_ = false;
     }
 
     // ─── Commands ───────────────────────────────────────────────
@@ -688,19 +704,28 @@ private:
              i = list->GetNext(ACC_PUBLIC))
         {
             ClassEntry& ce = (*list)[i];
-            // Use CD() instead of FullCD() to avoid triggering DLL loads.
-            // Returns null for plugins not yet loaded — those are rarely needed.
-            ClassDesc* cd = ce.CD();
-            if (!cd) continue;
-
             const Class_ID classId = ce.ClassID();
             if (!seen.insert({classId.PartA(), classId.PartB()}).second)
                 continue;
 
-            const MCHAR* nonLocalized = cd->NonLocalizedClassName();
-            const MCHAR* className    = cd->ClassName();
-            const MCHAR* intName      = cd->InternalName();
-            const MCHAR* catName      = cd->Category();
+            // ClassEntry exposes display metadata without force-loading deferred
+            // third-party DLLs. The selected entry is resolved on activation.
+            MSTR nonLocalizedStr = ce.NonLocalizedClassName();
+            MSTR classNameStr    = ce.ClassName();
+            MSTR categoryStr     = ce.Category();
+            const MCHAR* nonLocalized = nonLocalizedStr.data();
+            const MCHAR* className    = classNameStr.data();
+            const MCHAR* catName      = categoryStr.data();
+
+            MSTR internalNameStr;
+            if (ce.IsLoaded()) {
+                if (ClassDesc* cd = ce.CD()) {
+                    const MCHAR* intName = cd->InternalName();
+                    if (intName && intName[0]) internalNameStr = intName;
+                }
+            }
+            const MCHAR* intName = internalNameStr.data();
+            if (!intName || !intName[0]) intName = nonLocalized;
 
             std::wstring name = (nonLocalized && nonLocalized[0])
                 ? std::wstring(nonLocalized)
@@ -721,7 +746,8 @@ private:
             item.category     = (catName && catName[0]) ? std::wstring(catName) : L"";
             item.internalName = (intName && intName[0]) ? std::wstring(intName) : L"";
             item.kind         = kind;
-            item.classDesc    = cd;
+            item.superClassId = sid;
+            item.classId      = classId;
             cache_.push_back(std::move(item));
         }
     }
@@ -780,7 +806,7 @@ private:
         }
 
         if (!tokens.empty())
-            std::sort(scored.begin(), scored.end(),
+            std::stable_sort(scored.begin(), scored.end(),
                 [](const Scored& a, const Scored& b) { return a.score > b.score; });
 
         filtered_.clear();
@@ -799,6 +825,19 @@ private:
     }
 
     // ─── Actions ────────────────────────────────────────────────
+    std::wstring ResolveConstructorName(const ModItem& item)
+    {
+        std::wstring ctorName = item.internalName;
+        if (ClassEntry* ce = ClassDirectory::GetInstance().FindClassEntry(
+                item.superClassId, item.classId)) {
+            if (ClassDesc* cd = ce->FullCD()) {
+                const MCHAR* internalName = cd->InternalName();
+                if (internalName && internalName[0]) ctorName = internalName;
+            }
+        }
+        return ctorName.empty() ? item.label : ctorName;
+    }
+
     void ApplyCurrent()
     {
         if (rebuildPending_) { CancelPendingRebuild(); Rebuild(); }
@@ -825,7 +864,9 @@ private:
 
         // Modifier — prefer Max's command-panel route so stack context and
         // modifier gizmos are initialized the same way as the native UI.
-        std::wstring ctorName = item.internalName.empty() ? item.label : item.internalName;
+        // Resolve/load only the class the user chose. Deferred entries do not
+        // always expose their MAXScript constructor through cached display data.
+        std::wstring ctorName = ResolveConstructorName(item);
         bool added = AddModifierViaModPanelScript(ctorName, item.label);
 
         if (ip) ip->RedrawViews(ip->GetTime());
@@ -837,29 +878,21 @@ private:
     {
         Interface* ip = GetCOREInterface();
         if (!ip || ip->GetSelNodeCount() == 0) { SetStatus(L"No selection."); return; }
-        INode* node = ip->GetSelNode(0);
-        if (!node) return;
 
-        Object* obj = node->GetObjectRef();
-        if (!obj || obj->SuperClassID() != GEN_DERIVOB_CLASS_ID)
-        {
-            SetStatus(L"No modifiers.");
-            return;
+        FPValue result;
+        BOOL ok = ExecuteMAXScriptScript(
+            _T("try(undo \"Remove Top Modifiers\" on (local n=0;for o in selection do try(if o.modifiers.count>0 do(deleteModifier o o.modifiers[1];n+=1))catch();n as string))catch(\"0\")"),
+            MAXScript::ScriptSource::Dynamic, TRUE, &result);
+        const int removed = (ok && result.type == TYPE_STRING && result.s)
+            ? _wtoi(result.s) : 0;
+
+        if (removed > 0) {
+            ip->RedrawViews(ip->GetTime());
+            SetStatus(L"Removed top modifier from " + std::to_wstring(removed) +
+                (removed == 1 ? L" object." : L" objects."));
+        } else {
+            SetStatus(L"Could not remove modifier.");
         }
-
-        IDerivedObject* dobj = static_cast<IDerivedObject*>(obj);
-        if (dobj->NumModifiers() == 0) { SetStatus(L"No modifiers."); return; }
-
-        Modifier* top = dobj->GetModifier(0);
-        MSTR cn;
-        if (top) top->GetClassName(cn, false);
-
-        ExecuteMAXScriptScript(
-            _T("deleteModifier $ $.modifiers[1]"),
-            MAXScript::ScriptSource::Dynamic);
-
-        ip->RedrawViews(ip->GetTime());
-        SetStatus(L"Removed: " + std::wstring(cn.data() ? cn.data() : L"modifier"));
     }
 
     // ─── Helpers ────────────────────────────────────────────────
@@ -889,6 +922,7 @@ private:
     bool  trackingMouse_ = false;
     bool  rebuildPending_ = false;
     bool  cacheReady_ = false;
+    bool  acceleratorsDisabled_ = false;
     std::vector<ModItem> cache_;
     std::vector<int> filtered_;
 };
@@ -896,10 +930,10 @@ private:
 } // anonymous namespace
 
 // ── Exported API ────────────────────────────────────────────────
-void Init(HINSTANCE, bool lightTheme)  { Palette::Get().Init(lightTheme); }
+bool Init(HINSTANCE, bool lightTheme)  { return Palette::Get().Init(lightTheme); }
 void Shutdown()       { Palette::Get().Shutdown(); }
 void Toggle()         { Palette::Get().Toggle(); }
 bool IsOpen()         { return Palette::Get().IsOpen(); }
-void ReloadTheme(bool lightTheme) { Theme::Update(lightTheme); }
+void ReloadTheme(bool lightTheme) { Palette::Get().ReloadTheme(lightTheme); }
 
 } // namespace ModStack

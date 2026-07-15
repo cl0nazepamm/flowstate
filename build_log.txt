@@ -1,5 +1,0 @@
-MSBuild version 17.14.40+3e7442088 for .NET Framework
-
-  dllmain.cpp
-C:\Users\ogulc\Clone Library\ClonePipeline\flowstate\src\dllmain.cpp(408,13): error C3861: 'PositionBtnStrips': identifier not found [C:\Users\ogulc\Clone Library\ClonePipeline\flowstate\build\PowerParams.vcxproj]
-C:\Users\ogulc\Clone Library\ClonePipeline\flowstate\src\dllmain.cpp(424,5): error C3861: 'PositionBtnStrips': identifier not found [C:\Users\ogulc\Clone Library\ClonePipeline\flowstate\build\PowerParams.vcxproj]

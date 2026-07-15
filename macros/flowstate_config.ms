@@ -102,15 +102,26 @@ macroscript flowstate_Config
 
     local iniPath = (getDir #plugcfg) + "\\FlowState.cfg"
 
-    -- Read flag from FlowState.cfg (scans all lines, section-agnostic)
+    -- Read an exact flag from the canonical [config] section.
     fn readFlag path key default:true = (
         local f = openFile path mode:"r"
         if f == undefined do return default
         local result = default
+        local inConfig = false
+        local tag = key + "="
         while not eof f do (
             local ln = readLine f
-            if findString ln (key + "=0") != undefined do result = false
-            if findString ln (key + "=1") != undefined do result = true
+            if ln == "[config]" then (
+                inConfig = true
+            ) else (
+                local isHeader = ln.count >= 2 and findString ln "[" == 1 and findString ln "]" == ln.count
+                if isHeader then inConfig = false
+                else if inConfig and findString ln tag == 1 do (
+                    local value = substring ln (tag.count + 1) (ln.count - tag.count)
+                    if value == "0" do result = false
+                    if value == "1" do result = true
+                )
+            )
         )
         close f
         result
@@ -349,11 +360,17 @@ macroscript flowstate_Config
     pic.Size     = dotNetObject szC W 175
     pic.SizeMode = smC.Zoom
     pic.BackColor = cBg
+    local logoStream = undefined
+    local sourceImage = undefined
     try (
         local bytes = (dotNetClass "System.Convert").FromBase64String logoB64
-        local ms = dotNetObject "System.IO.MemoryStream" bytes
-        pic.Image = (dotNetClass "System.Drawing.Image").FromStream ms
+        logoStream = dotNetObject "System.IO.MemoryStream" bytes
+        sourceImage = (dotNetClass "System.Drawing.Image").FromStream logoStream
+        pic.Image = sourceImage.Clone()
     ) catch()
+    try(if sourceImage != undefined do sourceImage.Dispose())catch()
+    try(if logoStream != undefined do logoStream.Dispose())catch()
+    frm.Tag = pic.Image
     logoP.controls.add pic
 
     local vLbl = mkLabel "v1.3" 0 180 W 18 fObj:fSmall cObj:cDim
@@ -406,14 +423,21 @@ macroscript flowstate_Config
         local f = openFile path mode:"r"
         if f == undefined do return default
         local result = default
+        local inConfig = false
+        local tag = "Key:" + key + "="
         while not eof f do (
             local ln = readLine f
-            local tag = "Key:" + key + "="
-            if findString ln tag == 1 do (
-                local n = ln.count - tag.count
-                local v = if n > 0 then (substring ln (tag.count + 1) n) else ""
-                local iv = v as integer
-                if iv != undefined and iv >= -1 and iv <= 7 do result = iv
+            if ln == "[config]" then (
+                inConfig = true
+            ) else (
+                local isHeader = ln.count >= 2 and findString ln "[" == 1 and findString ln "]" == ln.count
+                if isHeader then inConfig = false
+                else if inConfig and findString ln tag == 1 do (
+                    local n = ln.count - tag.count
+                    local v = if n > 0 then (substring ln (tag.count + 1) n) else ""
+                    local iv = v as integer
+                    if iv != undefined and iv >= -1 and iv <= 7 do result = iv
+                )
             )
         )
         close f
@@ -422,10 +446,9 @@ macroscript flowstate_Config
 
     -- Modifiers 0..7 at most once each; -1 = Off (multiple rows may be Off). Later duplicate mods -> Off.
     fn flowstate_normalizeKmSel src = (
-        if src.count != 5 do return src
         local used = #(false, false, false, false, false, false, false, false)
         local out = #()
-        for i = 1 to 5 do (
+        for i = 1 to src.count do (
             local v = src[i]
             if v < -1 or v > 7 do v = -1
             if v == -1 then (
@@ -457,7 +480,7 @@ macroscript flowstate_Config
         local jj = parts[2] as integer
         if slot < 1 or slot > flowstate_kmBtns.count do return()
         if jj < -1 or jj > 7 do return()
-        -- Each modifier 0..4 may only drive one action (Off does not consume a modifier)
+        -- Each modifier 0..7 may only drive one action (Off does not consume a modifier)
         if jj >= 0 do (
             for o = 1 to flowstate_kmSel.count do (
                 if o != slot and flowstate_kmSel[o] == jj do (
@@ -547,7 +570,7 @@ macroscript flowstate_Config
     )
     -- Repair duplicate assignments from older configs / hand-edited files
     local kmFixed = flowstate_normalizeKmSel flowstate_kmSel
-    for i = 1 to 5 do (
+    for i = 1 to kmFixed.count do (
         flowstate_kmSel[i] = kmFixed[i]
         try (
             local jj = kmFixed[i]
@@ -613,8 +636,16 @@ macroscript flowstate_Config
     frm.controls.add crLbl
     Y += 22
 
-    -- Fit form to content
-    frm.Size = dotNetObject szC W Y
+    -- Fit to the working area and keep every control reachable on smaller displays.
+    local sysInfo = dotNetClass "System.Windows.Forms.SystemInformation"
+    local maxFormH = sysInfo.WorkingArea.Height - 48
+    if maxFormH < 320 do maxFormH = 320
+    local needsScroll = Y > maxFormH
+    local formH = if needsScroll then maxFormH else Y
+    local formW = if needsScroll then (W + sysInfo.VerticalScrollBarWidth) else W
+    frm.AutoScroll = true
+    frm.AutoScrollMinSize = dotNetObject szC 0 Y
+    frm.Size = dotNetObject szC formW formH
 
     -- Gradient background + 1px border via Paint
     fn onPaint s e = (
@@ -699,55 +730,138 @@ macroscript flowstate_Config
     fn onSave s e = (
         global flowstate_kmSel
         local cfg = (getDir #plugcfg) + "\\FlowState.cfg"
-        -- Read existing lines, keep everything except the flags we manage
-        local keep = #()
+        local proc = (dotNetClass "System.Diagnostics.Process").GetCurrentProcess()
+        local instanceSuffix = "." + (proc.Id as string)
+        try(proc.Dispose())catch()
+        local tmp = cfg + instanceSuffix + ".tmp"
+        local bak = cfg + instanceSuffix + ".bak"
+        local configKeep = #()
+        local bodyKeep = #()
+        local inConfig = false
+
+        -- Preserve unknown [config] entries (including XB1 mappings) and all
+        -- non-config sections, while discarding duplicate [config] headers.
         local f = openFile cfg mode:"r"
         if f != undefined do (
             while not eof f do (
                 local ln = readLine f
-                if findString ln "PowerParams=" != undefined then ()
-                else if findString ln "PowerShader=" != undefined then ()
-                else if findString ln "SubObjToggles=" != undefined then ()
-                else if findString ln "TabShader=" != undefined then ()
-                else if findString ln "LightTheme=" != undefined then ()
-                else if findString ln "Key:" == 1 then ()
-                else append keep ln
+                if ln == "[config]" then (
+                    inConfig = true
+                ) else (
+                    local isHeader = ln.count >= 2 and findString ln "[" == 1 and findString ln "]" == ln.count
+                    if isHeader then (
+                        inConfig = false
+                        append bodyKeep ln
+                    ) else if inConfig then (
+                        local managed =
+                            findString ln "PowerParams=" == 1 or
+                            findString ln "PowerShader=" == 1 or
+                            findString ln "SubObjToggles=" == 1 or
+                            findString ln "TabShader=" == 1 or
+                            findString ln "LightTheme=" == 1 or
+                            findString ln "Key:grab=" == 1 or
+                            findString ln "Key:time=" == 1 or
+                            findString ln "Key:slider=" == 1 or
+                            findString ln "Key:opacity=" == 1 or
+                            findString ln "Key:clear=" == 1 or
+                            findString ln "Key:uvgrab=" == 1
+                        if not managed do append configKeep ln
+                    ) else (
+                        append bodyKeep ln
+                    )
+                )
             )
             close f
         )
-        f = createFile cfg
-        if f == undefined do return()
-        -- Write preserved lines first
-        for ln in keep do format "%\n" ln to:f
-        -- Write our flags (only non-defaults)
-        format "\n[config]\n" to:f
-        if not flowstate_chkPP.Checked     do format "PowerParams=0\n" to:f
-        if not flowstate_chkPS.Checked     do format "PowerShader=0\n" to:f
-        if flowstate_chkSubObj.Checked      do format "SubObjToggles=1\n" to:f
-        if not flowstate_chkTab.Checked     do format "TabShader=0\n" to:f
-        if flowstate_chkLight.Checked       do format "LightTheme=1\n" to:f
-        -- Write keymap (only non-defaults)
-        local kmKeys = #("grab", "time", "slider", "opacity", "clear", "uvgrab")
-        local kmDefs = #(0, 1, 2, 3, 4, 5)
-        for i = 1 to flowstate_kmSel.count do (
-            local idx = flowstate_kmSel[i]
-            if idx != kmDefs[i] do format "Key:%=%\n" kmKeys[i] idx to:f
+
+        try(if doesFileExist tmp do deleteFile tmp)catch()
+        local writeOK = false
+        f = createFile tmp
+        if f != undefined do (
+            try (
+                format "[config]\n" to:f
+                for ln in configKeep do format "%\n" ln to:f
+                if not flowstate_chkPP.Checked  do format "PowerParams=0\n" to:f
+                if not flowstate_chkPS.Checked  do format "PowerShader=0\n" to:f
+                if flowstate_chkSubObj.Checked  do format "SubObjToggles=1\n" to:f
+                if not flowstate_chkTab.Checked do format "TabShader=0\n" to:f
+                if flowstate_chkLight.Checked   do format "LightTheme=1\n" to:f
+
+                local kmKeys = #("grab", "time", "slider", "opacity", "clear", "uvgrab")
+                local kmDefs = #(0, 1, 2, 3, 4, 5)
+                local kmCount = flowstate_kmSel.count
+                if kmCount > kmKeys.count do kmCount = kmKeys.count
+                for i = 1 to kmCount do (
+                    local idx = flowstate_kmSel[i]
+                    if idx != kmDefs[i] do format "Key:%=%\n" kmKeys[i] idx to:f
+                )
+
+                if bodyKeep.count > 0 do format "\n" to:f
+                for ln in bodyKeep do format "%\n" ln to:f
+                close f
+                f = undefined
+                writeOK = true
+            ) catch (
+                try(if f != undefined do close f)catch()
+                f = undefined
+            )
         )
-        close f
-        messageBox "Configuration saved.\nRestart 3ds Max for changes to take effect." title:"flowstate"
+
+        local saved = false
+        local fileIO = dotNetClass "System.IO.File"
+        if writeOK do (
+            try (
+                if doesFileExist cfg then (
+                    try(if doesFileExist bak do fileIO.Delete bak)catch()
+                    fileIO.Replace tmp cfg bak
+                    try(if doesFileExist bak do fileIO.Delete bak)catch()
+                ) else (
+                    fileIO.Move tmp cfg
+                )
+                saved = true
+            ) catch ()
+        )
+        if not saved do try(if doesFileExist tmp do fileIO.Delete tmp)catch()
+
+        if saved then (
+            -- Synchronize native state before another pin/favorite save can
+            -- overwrite these values with stale in-memory settings.
+            local applied = false
+            try(applied = actionMan.executeAction 2048713217 "12")catch()
+            if applied then
+                messageBox "Configuration saved and applied." title:"flowstate"
+            else
+                messageBox "Configuration saved.\nRestart 3ds Max to apply it." title:"flowstate"
+        ) else (
+            messageBox "Could not replace the configuration file.\nThe previous settings were left unchanged." title:"flowstate"
+        )
     )
     dotNet.addEventHandler flowstate_btnSave "Click" onSave
 
     -- Reset
     fn onReset s e = (
         if queryBox "Clear all flowstate settings?\n\nThis will reset collapsed groups, hidden params,\nfavorites, and XB1 assignments." title:"flowstate" then (
-            try(deleteFile ((getDir #plugcfg) + "\\FlowState.cfg"))catch()
-            -- Clean up legacy files if they exist
-            try(deleteFile ((getDir #plugcfg) + "\\PowerParams.cfg"))catch()
-            try(deleteFile ((getDir #plugcfg) + "\\PowerShader.cfg"))catch()
-            try(deleteFile ((getDir #plugcfg) + "\\PowerShader_Pins.cfg"))catch()
-            try(deleteFile ((getDir #plugcfg) + "\\flowstate.ini"))catch()
-            messageBox "Settings cleared.\nRestart 3ds Max to apply." title:"flowstate"
+            local cfgDir = getDir #plugcfg
+            local resetFiles = #(
+                cfgDir + "\\FlowState.cfg",
+                cfgDir + "\\PowerParams.cfg",
+                cfgDir + "\\PowerShader.cfg",
+                cfgDir + "\\PowerShader_Pins.cfg",
+                cfgDir + "\\flowstate.ini")
+            for path in resetFiles do try(if doesFileExist path do deleteFile path)catch()
+            local cleared = true
+            for path in resetFiles do if doesFileExist path do cleared = false
+            if cleared then (
+                local applied = false
+                try(applied = actionMan.executeAction 2048713217 "12")catch()
+                if applied then
+                    messageBox "Settings cleared and defaults applied." title:"flowstate"
+                else
+                    messageBox "Settings cleared.\nRestart 3ds Max to apply defaults." title:"flowstate"
+                try(flowstate_ConfigForm.Close())catch()
+            ) else (
+                messageBox "Could not clear one or more settings files.\nNo runtime reset was applied." title:"flowstate"
+            )
         )
     )
     dotNet.addEventHandler flowstate_btnReset "Click" onReset
@@ -762,17 +876,23 @@ macroscript flowstate_Config
     -- Cancel drag on focus loss
     dotNet.addEventHandler frm "Deactivate" onDeactivate
 
-    -- Cleanup global on close
-    -- Never clear flowstate_ConfigForm here — FormClosed can fire late
-    -- via the .NET message pump and wipe a newly created form instance
-    fn onClosed s e = (global flowstate_handlers = undefined)
+    -- Dispose only resources owned by the form that actually closed. Never
+    -- clear global form/handler references here: FormClosed may arrive late.
+    fn onClosed s e = (
+        try (
+            if s.Tag != undefined do (
+                s.Tag.Dispose()
+                s.Tag = undefined
+            )
+        ) catch ()
+    )
     dotNet.addEventHandler frm "FormClosed" onClosed
 
     -- Pin handler references so GC can't collect them while the form is alive
     global flowstate_handlers = #(onPaint, onClose, onXEnter, onXLeave, onDragDown, onDragMove, onDragUp, onDeactivate, onSave, onReset, onKey, onClosed, flowstate_onKmMenuPick, flowstate_onKmBtnClick)
 
     -- Show
-    try (format "[flowstate] config UI v1.3 — KEYMAP includes Off; restart Max after Save for plugin.\n" to:listener) catch ()
+    try (format "[flowstate] config UI v1.3 -- Save applies settings to the loaded plugin.\n" to:listener) catch ()
     frm.Show()
 )
 

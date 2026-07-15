@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cwctype>
 #include <iterator>
 #include <map>
@@ -116,6 +117,7 @@ bool IsCursorOverSme()
 // ═══════════════════════════════════════════════════════════════
 namespace Theme
 {
+    bool lightTheme = false;
     COLORREF bg;
     COLORREF panel;
     COLORREF panelLt;
@@ -137,6 +139,7 @@ namespace Theme
 
     void Update(bool light)
     {
+        lightTheme = light;
         if (light) {
             bg       = RGB(215, 218, 222);
             panel    = RGB(225, 228, 232);
@@ -201,10 +204,7 @@ namespace Theme
 // ═══════════════════════════════════════════════════════════════
 //  Constants
 // ═══════════════════════════════════════════════════════════════
-constexpr UINT kHotkeyId = 0x514A;
-constexpr wchar_t kHotkeyClass[] = L"PowerShaderHotkeyWnd";
 constexpr wchar_t kPaletteClass[] = L"PowerShaderPaletteWnd";
-constexpr UINT_PTR kWarmCacheTimerId = 0x514B;
 constexpr int kSearchId  = 1001;
 constexpr int kListId    = 1002;
 constexpr int kLinkId    = 1003;
@@ -292,9 +292,10 @@ static bool IsImageFile(const wchar_t* path) {
            ext == L".tga" || ext == L".dds" || ext == L".psd" || ext == L".tx";
 }
 
-// Extract texture file path from any Texmap
-static std::wstring ExtractTexPath(Texmap* tex) {
-    if (!tex) return {};
+// Extract texture file path from any Texmap. Texmap graphs are allowed to be
+// cyclic, so keep a per-search visited set rather than assuming a tree.
+static std::wstring ExtractTexPathImpl(Texmap* tex, std::set<Texmap*>& visited) {
+    if (!tex || !visited.insert(tex).second) return {};
     // BitmapTex — direct path
     if (tex->ClassID() == Class_ID(BMTEX_CLASS_ID, 0)) {
         const MCHAR* n = static_cast<BitmapTex*>(tex)->GetMapName();
@@ -315,10 +316,15 @@ static std::wstring ExtractTexPath(Texmap* tex) {
     }
     // Recurse into sub-texmaps
     for (int i = 0; i < tex->NumSubTexmaps(); i++) {
-        std::wstring p = ExtractTexPath(tex->GetSubTexmap(i));
+        std::wstring p = ExtractTexPathImpl(tex->GetSubTexmap(i), visited);
         if (!p.empty()) return p;
     }
     return {};
+}
+
+static std::wstring ExtractTexPath(Texmap* tex) {
+    std::set<Texmap*> visited;
+    return ExtractTexPathImpl(tex, visited);
 }
 
 // Walk material tree, collect PBR map entries
@@ -362,17 +368,45 @@ static bool ResizeBitmapFile(const std::wstring& src, const std::wstring& dst, i
     if (!srcBmp) return false;
     BitmapInfo dstBi;
     dstBi.SetName(dst.c_str());
-    dstBi.SetWidth(static_cast<WORD>(res));
-    dstBi.SetHeight(static_cast<WORD>(res));
+    const int srcW = srcBmp->Width();
+    const int srcH = srcBmp->Height();
+    int dstW = res;
+    int dstH = res;
+    if (srcW > 0 && srcH > 0) {
+        if (srcW > srcH)
+            dstH = std::max(1, static_cast<int>((static_cast<long long>(res) * srcH) / srcW));
+        else if (srcH > srcW)
+            dstW = std::max(1, static_cast<int>((static_cast<long long>(res) * srcW) / srcH));
+    }
+    dstBi.SetWidth(static_cast<WORD>(dstW));
+    dstBi.SetHeight(static_cast<WORD>(dstH));
     dstBi.SetType(BMM_TRUE_32);
     Bitmap* dstBmp = TheManager->Create(&dstBi);
     if (!dstBmp) { srcBmp->DeleteThis(); return false; }
-    dstBmp->CopyImage(srcBmp, COPY_IMAGE_RESIZE_HI_QUALITY, BMM_Color_64(0,0,0,0));
-    bool ok = (dstBmp->OpenOutput(&dstBi) == BMMRES_SUCCESS);
-    if (ok) { dstBmp->Write(&dstBi); dstBmp->Close(&dstBi); }
+    bool ok = dstBmp->CopyImage(srcBmp, COPY_IMAGE_RESIZE_HI_QUALITY,
+        BMM_Color_64(0,0,0,0)) != 0;
+    if (ok) ok = (dstBmp->OpenOutput(&dstBi) == BMMRES_SUCCESS);
+    if (ok) {
+        ok = (dstBmp->Write(&dstBi) == BMMRES_SUCCESS);
+        dstBmp->Close(&dstBi);
+    }
     srcBmp->DeleteThis();
     dstBmp->DeleteThis();
     return ok;
+}
+
+static std::wstring SourcePathPrefix(const std::wstring& path) {
+    // Stable FNV-1a hash keeps common names such as BaseColor.png from
+    // overwriting another selected asset's resized texture.
+    std::uint64_t hash = 14695981039346656037ull;
+    for (wchar_t ch : path) {
+        wchar_t normalized = (ch == L'/') ? L'\\' : static_cast<wchar_t>(towlower(ch));
+        hash ^= static_cast<std::uint64_t>(normalized);
+        hash *= 1099511628211ull;
+    }
+    wchar_t text[18] = {};
+    swprintf_s(text, std::size(text), L"%016llx_", static_cast<unsigned long long>(hash));
+    return text;
 }
 
 // Resize with UDIM support — returns path to use (with <UDIM> preserved)
@@ -384,6 +418,7 @@ static std::wstring ResizeTexture(const std::wstring& srcPath, const std::wstrin
     std::wstring file = srcPath.substr(slash == srcPath.npos ? 0 : slash + 1,
         dot == srcPath.npos ? srcPath.npos : dot - (slash == srcPath.npos ? 0 : slash + 1));
     std::wstring ext  = (dot != srcPath.npos) ? srcPath.substr(dot) : L"";
+    const std::wstring prefix = SourcePathPrefix(srcPath);
 
     // UDIM handling
     if (file.find(L"<UDIM>") != file.npos) {
@@ -396,16 +431,16 @@ static std::wstring ResizeTexture(const std::wstring& srcPath, const std::wstrin
         bool anyOk = false;
         do {
             std::wstring tileSrc = dir + fd.cFileName;
-            std::wstring tileDst = tmpDir + L"\\" + fd.cFileName;
+            std::wstring tileDst = tmpDir + L"\\" + prefix + fd.cFileName;
             if (ResizeBitmapFile(tileSrc, tileDst, res)) anyOk = true;
         } while (FindNextFileW(hFind, &fd));
         FindClose(hFind);
-        return anyOk ? (tmpDir + L"\\" + file + ext) : std::wstring{};
+        return anyOk ? (tmpDir + L"\\" + prefix + file + ext) : std::wstring{};
     }
 
     // Single file
     if (GetFileAttributesW(srcPath.c_str()) == INVALID_FILE_ATTRIBUTES) return {};
-    std::wstring outName = file + ext;
+    std::wstring outName = prefix + file + ext;
     std::wstring dst = tmpDir + L"\\" + outName;
     return ResizeBitmapFile(srcPath, dst, res) ? dst : srcPath;
 }
@@ -419,7 +454,7 @@ static bool SetPB2Texmap(MtlBase* m, const wchar_t* name, Texmap* tex) {
             ParamID pid = pb->IndextoID(i);
             const ParamDef& d = pb->GetParamDef(pid);
             if (d.int_name && _wcsicmp(d.int_name, name) == 0 && d.type == TYPE_TEXMAP)
-                { pb->SetValue(pid, 0, tex); return true; }
+                return pb->SetValue(pid, 0, tex) != FALSE;
         }
     }
     return false;
@@ -432,7 +467,7 @@ static bool SetPB2Bool(MtlBase* m, const wchar_t* name, BOOL val) {
             ParamID pid = pb->IndextoID(i);
             const ParamDef& d = pb->GetParamDef(pid);
             if (d.int_name && _wcsicmp(d.int_name, name) == 0 && d.type == TYPE_BOOL)
-                { pb->SetValue(pid, 0, val); return true; }
+                return pb->SetValue(pid, 0, val) != FALSE;
         }
     }
     return false;
@@ -446,7 +481,7 @@ static bool SetPB2Int(MtlBase* m, const wchar_t* name, int val) {
             const ParamDef& d = pb->GetParamDef(pid);
             if (d.int_name && _wcsicmp(d.int_name, name) == 0 &&
                 (d.type == TYPE_INT || d.type == TYPE_RADIOBTN_INDEX || d.type == TYPE_INDEX))
-                { pb->SetValue(pid, 0, val); return true; }
+                return pb->SetValue(pid, 0, val) != FALSE;
         }
     }
     return false;
@@ -459,7 +494,7 @@ static bool SetPB2Mtl(MtlBase* m, const wchar_t* name, Mtl* sub) {
             ParamID pid = pb->IndextoID(i);
             const ParamDef& d = pb->GetParamDef(pid);
             if (d.int_name && _wcsicmp(d.int_name, name) == 0 && d.type == TYPE_MTL)
-                { pb->SetValue(pid, 0, sub); return true; }
+                return pb->SetValue(pid, 0, sub) != FALSE;
         }
     }
     return false;
@@ -471,7 +506,7 @@ static ClassDesc* FindClassByName(SClass_ID sid, const wchar_t* name) {
     if (!list) return nullptr;
     for (int i = list->GetFirst(ACC_PUBLIC); i != -1; i = list->GetNext(ACC_PUBLIC)) {
         ClassEntry& ce = (*list)[i];
-        ClassDesc* cd = ce.CD();
+        ClassDesc* cd = ce.FullCD();
         if (cd && _wcsicmp(cd->ClassName(), name) == 0) return cd;
     }
     return nullptr;
@@ -515,6 +550,8 @@ static void ExecuteShellCommand(int resolution) {
 
     std::map<Mtl*, Mtl*> shellCache; // srcMat → shellMat
     int done = 0;
+    const bool ownHold = !theHold.Holding();
+    if (ownHold) theHold.Begin();
 
     for (int ni = 0; ni < ip->GetSelNodeCount(); ni++) {
         INode* node = ip->GetSelNode(ni);
@@ -537,11 +574,11 @@ static void ExecuteShellCommand(int resolution) {
         // Create PhysicalMaterial for preview
         Mtl* phys = NewPhysicalMaterial();
         if (!phys) continue;
-        MSTR srcName; src->GetClassName(srcName, false);
         std::wstring bn = src->GetName().data();
         phys->SetName(MSTR((L"preview_" + bn).c_str()));
 
         // Wire each PBR map
+        int wiredMaps = 0;
         for (auto& mp : maps) {
             std::wstring resized = ResizeTexture(mp.path, tmpDir, resolution);
             if (resized.empty()) continue;
@@ -549,55 +586,84 @@ static void ExecuteShellCommand(int resolution) {
             Texmap* tx = CreatePreviewTexmap(resized);
             if (!tx) continue;
 
+            bool assigned = false;
             switch (mp.slot) {
             case PBR::BaseColor:
-                SetPB2Texmap(phys, L"base_color_map", tx);
-                SetPB2Bool(phys, L"base_color_map_on", TRUE);
+                assigned = SetPB2Texmap(phys, L"base_color_map", tx);
+                if (assigned) SetPB2Bool(phys, L"base_color_map_on", TRUE);
                 break;
             case PBR::Roughness:
-                SetPB2Texmap(phys, L"roughness_map", tx);
-                SetPB2Bool(phys, L"roughness_map_on", TRUE);
+                assigned = SetPB2Texmap(phys, L"roughness_map", tx);
+                if (assigned) SetPB2Bool(phys, L"roughness_map_on", TRUE);
                 break;
             case PBR::Metalness:
-                SetPB2Texmap(phys, L"metalness_map", tx);
-                SetPB2Bool(phys, L"metalness_map_on", TRUE);
+                assigned = SetPB2Texmap(phys, L"metalness_map", tx);
+                if (assigned) SetPB2Bool(phys, L"metalness_map_on", TRUE);
                 break;
-            case PBR::Normal:
+            case PBR::Normal: {
+                Texmap* normalWrapper = nullptr;
                 if (normalBumpCD) {
-                    Texmap* nb = static_cast<Texmap*>(normalBumpCD->Create(FALSE));
-                    if (nb) {
-                        SetPB2Texmap(nb, L"normal_map", tx);
-                        SetPB2Texmap(phys, L"bump_map", nb);
-                        SetPB2Bool(phys, L"bump_map_on", TRUE);
+                    normalWrapper = static_cast<Texmap*>(normalBumpCD->Create(FALSE));
+                    if (normalWrapper) {
+                        if (SetPB2Texmap(normalWrapper, L"normal_map", tx))
+                            assigned = SetPB2Texmap(phys, L"bump_map", normalWrapper);
+                        if (assigned) SetPB2Bool(phys, L"bump_map_on", TRUE);
                     }
-                } else {
-                    SetPB2Texmap(phys, L"bump_map", tx);
-                    SetPB2Bool(phys, L"bump_map_on", TRUE);
+                }
+                if (!assigned) {
+                    assigned = SetPB2Texmap(phys, L"bump_map", tx);
+                    if (assigned) SetPB2Bool(phys, L"bump_map_on", TRUE);
+                    if (normalWrapper) {
+                        // If direct assignment also failed, destroy the target
+                        // first so the wrapper receives reference-deletion
+                        // notification before it is itself destroyed.
+                        if (!assigned) {
+                            tx->DeleteThis();
+                            tx = nullptr;
+                        }
+                        normalWrapper->DeleteThis();
+                    }
                 }
                 break;
+            }
             case PBR::Bump:
-                SetPB2Texmap(phys, L"bump_map", tx);
-                SetPB2Bool(phys, L"bump_map_on", TRUE);
+                assigned = SetPB2Texmap(phys, L"bump_map", tx);
+                if (assigned) SetPB2Bool(phys, L"bump_map_on", TRUE);
                 break;
             case PBR::Emission:
-                SetPB2Texmap(phys, L"emission_color_map", tx);
-                SetPB2Bool(phys, L"emission_color_map_on", TRUE);
+                assigned = SetPB2Texmap(phys, L"emit_color_map", tx);
+                if (assigned) SetPB2Bool(phys, L"emit_color_map_on", TRUE);
                 break;
             case PBR::Opacity:
-                SetPB2Texmap(phys, L"cutout_map", tx);
-                SetPB2Bool(phys, L"cutout_map_on", TRUE);
+                assigned = SetPB2Texmap(phys, L"cutout_map", tx);
+                if (assigned) SetPB2Bool(phys, L"cutout_map_on", TRUE);
                 break;
             default: break;
             }
+            if (!assigned && tx) tx->DeleteThis();
+            if (assigned) ++wiredMaps;
+        }
+
+        if (wiredMaps == 0) {
+            phys->DeleteThis();
+            continue;
         }
 
         // Create Shell_Material
         Mtl* shell = static_cast<Mtl*>(
             ip->CreateInstance(MATERIAL_CLASS_ID, Class_ID(BAKE_SHELL_CLASS_ID, 0)));
-        if (!shell) continue;
+        if (!shell) {
+            phys->DeleteThis();
+            continue;
+        }
         shell->SetName(MSTR((L"shell_" + bn).c_str()));
-        SetPB2Mtl(shell, L"originalMaterial", src);
-        SetPB2Mtl(shell, L"bakedMaterial", phys);
+        const bool originalSet = SetPB2Mtl(shell, L"originalMaterial", src);
+        const bool bakedSet = SetPB2Mtl(shell, L"bakedMaterial", phys);
+        if (!originalSet || !bakedSet) {
+            phys->DeleteThis();
+            shell->DeleteThis();
+            continue;
+        }
         SetPB2Int(shell, L"viewportMtlIndex", 1);
         SetPB2Int(shell, L"renderMtlIndex", 0);
 
@@ -606,7 +672,12 @@ static void ExecuteShellCommand(int resolution) {
         done++;
     }
 
-    if (done > 0) ip->RedrawViews(ip->GetTime());
+    if (done > 0) {
+        if (ownHold) theHold.Accept(_T("Create SHLL Preview Materials"));
+        ip->RedrawViews(ip->GetTime());
+    } else if (ownHold) {
+        theHold.Cancel();
+    }
 }
 
 static const wchar_t* kLinkScript =
@@ -667,6 +738,13 @@ std::wstring Normalize(const std::wstring& s, bool spaces)
     }
     while (!out.empty() && out.back() == L' ') out.pop_back();
     return out;
+}
+
+std::wstring StripOSLVersionSuffix(const std::wstring& value)
+{
+    size_t end = value.size();
+    while (end > 0 && iswdigit(value[end - 1])) --end;
+    return end == value.size() ? value : value.substr(0, end);
 }
 
 std::vector<std::wstring> TokenizeQuery(const std::wstring& query)
@@ -760,23 +838,13 @@ static const wchar_t* kDragScript =
     L")";
 
 // ═══════════════════════════════════════════════════════════════
-//  DWM dark title bar
-// ═══════════════════════════════════════════════════════════════
-void EnableDarkTitleBar(HWND hwnd)
-{
-    HMODULE hDwm = LoadLibraryW(L"dwmapi.dll");
-    if (!hDwm) return;
-    typedef HRESULT(WINAPI* FN)(HWND, DWORD, LPCVOID, DWORD);
-    auto fn = reinterpret_cast<FN>(GetProcAddress(hDwm, "DwmSetWindowAttribute"));
-    if (fn) { BOOL v = TRUE; fn(hwnd, 20, &v, sizeof(v)); }
-}
-
-// ═══════════════════════════════════════════════════════════════
 //  Texture Preview Popup
 // ═══════════════════════════════════════════════════════════════
 static ULONG_PTR     g_gdipToken = 0;
 static HWND          g_previewWnd = nullptr;
 static Gdiplus::Image* g_previewImg = nullptr;
+static bool          g_previewClassRegistered = false;
+constexpr wchar_t kPreviewClass[] = L"FlowStatePreview";
 constexpr int kPreviewSize = 128;
 
 static void InitGdiPlus() {
@@ -788,22 +856,11 @@ static void InitGdiPlus() {
 
 static std::wstring GetTexmapFilename(MtlBase* m) {
     if (!m) return {};
-    // BitmapTex
-    if (m->ClassID() == Class_ID(BMTEX_CLASS_ID, 0)) {
-        BitmapTex* bt = static_cast<BitmapTex*>(m);
-        const MCHAR* fn = bt->GetMapName();
-        if (fn && fn[0]) return fn;
-    }
-    // Generic: try MaxScript .filename property
-    std::wstring name = m->GetName().data();
-    // Try first sub-texmap recursively
+    if (m->SuperClassID() == TEXMAP_CLASS_ID)
+        return ExtractTexPath(static_cast<Texmap*>(m));
     for (int i = 0; i < m->NumSubTexmaps(); i++) {
-        Texmap* sub = m->GetSubTexmap(i);
-        if (!sub) continue;
-        if (sub->ClassID() == Class_ID(BMTEX_CLASS_ID, 0)) {
-            const MCHAR* fn = static_cast<BitmapTex*>(sub)->GetMapName();
-            if (fn && fn[0]) return fn;
-        }
+        std::wstring path = ExtractTexPath(m->GetSubTexmap(i));
+        if (!path.empty()) return path;
     }
     return {};
 }
@@ -818,8 +875,9 @@ static LRESULT CALLBACK PreviewProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         // Border
         HPEN pen = CreatePen(PS_SOLID, 1, RGB(55, 55, 55));
         HPEN op = (HPEN)SelectObject(hdc, pen);
-        SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        HBRUSH ob = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
         Rectangle(hdc, 0, 0, rc.right, rc.bottom);
+        SelectObject(hdc, ob);
         SelectObject(hdc, op); DeleteObject(pen);
         // Image
         if (g_previewImg) {
@@ -827,11 +885,13 @@ static LRESULT CALLBACK PreviewProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             gfx.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
             // Fit image in the box with aspect ratio
             int iw = g_previewImg->GetWidth(), ih = g_previewImg->GetHeight();
-            int bw = rc.right - 4, bh = rc.bottom - 4;
-            float scale = (std::min)((float)bw / iw, (float)bh / ih);
-            int dw = (int)(iw * scale), dh = (int)(ih * scale);
-            int dx = 2 + (bw - dw) / 2, dy = 2 + (bh - dh) / 2;
-            gfx.DrawImage(g_previewImg, dx, dy, dw, dh);
+            if (iw > 0 && ih > 0) {
+                int bw = rc.right - 4, bh = rc.bottom - 4;
+                float scale = (std::min)((float)bw / iw, (float)bh / ih);
+                int dw = (int)(iw * scale), dh = (int)(ih * scale);
+                int dx = 2 + (bw - dw) / 2, dy = 2 + (bh - dh) / 2;
+                gfx.DrawImage(g_previewImg, dx, dy, dw, dh);
+            }
         }
         EndPaint(h, &ps);
         return 0;
@@ -843,6 +903,8 @@ static LRESULT CALLBACK PreviewProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 static void ShowPreview(const std::wstring& path, HWND paletteWnd) {
     if (path.empty() || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
         if (g_previewWnd) ShowWindow(g_previewWnd, SW_HIDE);
+        delete g_previewImg;
+        g_previewImg = nullptr;
         return;
     }
     InitGdiPlus();
@@ -856,25 +918,37 @@ static void ShowPreview(const std::wstring& path, HWND paletteWnd) {
     }
     // Create window if needed
     if (!g_previewWnd) {
-        static bool regCls = false;
-        if (!regCls) {
+        if (!g_previewClassRegistered) {
             WNDCLASSEXW wc{ sizeof(wc) };
             wc.lpfnWndProc = PreviewProc;
             wc.hInstance = hInstance;
-            wc.lpszClassName = L"FlowStatePreview";
-            RegisterClassExW(&wc);
-            regCls = true;
+            wc.lpszClassName = kPreviewClass;
+            g_previewClassRegistered = RegisterClassExW(&wc) != 0 ||
+                GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
         }
-        g_previewWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            L"FlowStatePreview", L"", WS_POPUP, 0, 0, kPreviewSize, kPreviewSize,
-            nullptr, nullptr, hInstance, nullptr);
+        if (g_previewClassRegistered) {
+            g_previewWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                kPreviewClass, L"", WS_POPUP, 0, 0, kPreviewSize, kPreviewSize,
+                nullptr, nullptr, hInstance, nullptr);
+        }
+    }
+    if (!g_previewWnd) {
+        delete g_previewImg;
+        g_previewImg = nullptr;
+        return;
     }
     // Position to the left of the palette
     RECT pr; GetWindowRect(paletteWnd, &pr);
+    RECT wa{};
+    MONITORINFO mi{ sizeof(mi) };
+    HMONITOR monitor = MonitorFromWindow(paletteWnd, MONITOR_DEFAULTTONEAREST);
+    if (monitor && GetMonitorInfoW(monitor, &mi)) wa = mi.rcWork;
+    else SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
     int x = pr.left - kPreviewSize - 4;
-    int y = pr.top;
-    // If it would go off-screen left, put it on the right
-    if (x < 0) x = pr.right + 4;
+    if (x < wa.left) x = pr.right + 4;
+    if (x + kPreviewSize > wa.right)
+        x = (std::max)(wa.left, pr.left - kPreviewSize - 4);
+    int y = std::clamp(pr.top, wa.top, wa.bottom - kPreviewSize);
     SetWindowPos(g_previewWnd, HWND_TOPMOST, x, y, kPreviewSize, kPreviewSize,
         SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(g_previewWnd, nullptr, FALSE);
@@ -899,27 +973,22 @@ public:
 
     bool Init(bool light)
     {
-        if (hotkeyWnd_) return true;
+        if (inited_) return true;
         Theme::Init(light);
         INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES };
         InitCommonControlsEx(&icc);
 
         WNDCLASSEXW wc{ sizeof(wc) };
-        wc.lpfnWndProc   = HotkeyProc;
-        wc.hInstance      = hInstance;
-        wc.lpszClassName  = kHotkeyClass;
-        RegisterClassExW(&wc);
-
         wc.lpfnWndProc   = PaletteProc;
-        wc.hbrBackground = Theme::brBg;
+        wc.hbrBackground = nullptr; // WM_ERASEBKGND paints with the live theme brush
         wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+        wc.hInstance     = hInstance;
         wc.lpszClassName = kPaletteClass;
-        RegisterClassExW(&wc);
-
-        hotkeyWnd_ = CreateWindowExW(0, kHotkeyClass, L"", 0, 0, 0, 0, 0,
-            HWND_MESSAGE, nullptr, hInstance, this);
-        if (!hotkeyWnd_) return false;
-        SetTimer(hotkeyWnd_, kWarmCacheTimerId, 750, nullptr);
+        if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            Theme::Shutdown();
+            return false;
+        }
+        inited_ = true;
         return true;
     }
 
@@ -927,11 +996,40 @@ public:
     {
         CancelPendingRebuild();
         HidePreview();
+        RestoreAccelerators();
         if (g_previewWnd) { DestroyWindow(g_previewWnd); g_previewWnd = nullptr; }
-        if (hotkeyWnd_) { DestroyWindow(hotkeyWnd_); hotkeyWnd_ = nullptr; }
         if (wnd_) { DestroyWindow(wnd_); wnd_ = nullptr; }
+        edit_ = list_ = link_ = shll_ = scene_ = apply_ = status_ = nullptr;
+        renameEdit_ = nullptr;
+        brickBtns_.clear();
+        renameIdx_ = brickDragId_ = -1;
+        renaming_ = brickDragging_ = dragging_ = false;
+        activeItems_ = nullptr;
+        filtered_.clear();
+        classItems_.clear();
+        sceneItems_.clear();
+        filePins_.clear();
+        brickFavs_.clear();
+        lastQuery_.clear();
+        tab_ = lastTab_ = TabMode::All;
+        lastSceneOnly_ = false;
+        classCacheReady_ = classCacheBuilding_ = false;
+        oslCategoryReady_ = oslCategoryBuilding_ = false;
+        forcedAliasRetry_ = false;
+        sceneCacheReady_ = rebuildPending_ = false;
+        sceneOnly_ = applyToSel_ = false;
+        hoverClose_ = trackingMouse_ = false;
+        closeRect_ = {};
+        dragStart_ = {};
+        shllRes_ = 256;
+        UnregisterClassW(kPaletteClass, hInstance);
+        if (g_previewClassRegistered) {
+            UnregisterClassW(kPreviewClass, hInstance);
+            g_previewClassRegistered = false;
+        }
         Theme::Shutdown();
         if (g_gdipToken) { Gdiplus::GdiplusShutdown(g_gdipToken); g_gdipToken = 0; }
+        inited_ = false;
     }
 
     void Toggle()
@@ -940,26 +1038,29 @@ public:
         if (IsWindowVisible(wnd_)) Hide(); else Show();
     }
 
-private:
-    // ─── Window procedures ──────────────────────────────────────
-    static LRESULT CALLBACK HotkeyProc(HWND h, UINT m, WPARAM w, LPARAM l)
+    bool IsOpen() const { return wnd_ && IsWindowVisible(wnd_); }
+
+    void ReloadTheme(bool light)
     {
-        auto* self = reinterpret_cast<Palette*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-        if (m == WM_NCCREATE)
-        {
-            self = static_cast<Palette*>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
-            SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
-            return TRUE;
+        Theme::Update(light);
+        if (!wnd_) return;
+        if (list_) {
+            HMODULE hUx = LoadLibraryW(L"uxtheme.dll");
+            if (hUx) {
+                typedef HRESULT(WINAPI* SWTF)(HWND, LPCWSTR, LPCWSTR);
+                auto swt = reinterpret_cast<SWTF>(GetProcAddress(hUx, "SetWindowTheme"));
+                if (swt) swt(list_, Theme::lightTheme ? L"Explorer" : L"DarkMode_Explorer", nullptr);
+                FreeLibrary(hUx);
+            }
         }
-        if (self && m == WM_HOTKEY && w == kHotkeyId) { self->Toggle(); return 0; }
-        if (self && m == WM_TIMER && w == kWarmCacheTimerId) {
-            KillTimer(h, kWarmCacheTimerId);
-            self->WarmClassCache();
-            return 0;
-        }
-        return DefWindowProcW(h, m, w, l);
+        RedrawWindow(wnd_, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+        Rebuild(true);
+        RebuildBrickUI(false);
     }
 
+private:
+    // ─── Window procedures ──────────────────────────────────────
     static LRESULT CALLBACK PaletteProc(HWND h, UINT m, WPARAM w, LPARAM l)
     {
         auto* self = reinterpret_cast<Palette*>(GetWindowLongPtrW(h, GWLP_USERDATA));
@@ -1005,8 +1106,12 @@ private:
             FillRect(hdc, &rc, Theme::brBg);
             // Border
             HPEN bp = CreatePen(PS_SOLID, 1, Theme::border);
-            SelectObject(hdc, bp); SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            Rectangle(hdc, 0, 0, rc.right, rc.bottom); DeleteObject(bp);
+            HPEN oldP = static_cast<HPEN>(SelectObject(hdc, bp));
+            HBRUSH oldB = static_cast<HBRUSH>(SelectObject(hdc, GetStockObject(NULL_BRUSH)));
+            Rectangle(hdc, 0, 0, rc.right, rc.bottom);
+            SelectObject(hdc, oldB);
+            SelectObject(hdc, oldP);
+            DeleteObject(bp);
             // Title
             SetBkMode(hdc, TRANSPARENT);
             HFONT oldF = static_cast<HFONT>(SelectObject(hdc, Theme::fontBold));
@@ -1022,9 +1127,10 @@ private:
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             // Separator
             HPEN sep = CreatePen(PS_SOLID, 1, Theme::border);
-            SelectObject(hdc, sep);
+            HPEN oldS = static_cast<HPEN>(SelectObject(hdc, sep));
             MoveToEx(hdc, 8, kHeaderH - 4, nullptr);
             LineTo(hdc, rc.right - 8, kHeaderH - 4);
+            SelectObject(hdc, oldS);
             DeleteObject(sep);
             SelectObject(hdc, oldF);
             return 1;
@@ -1393,7 +1499,7 @@ private:
         SetWindowSubclass(list_, ListProc, 1, reinterpret_cast<DWORD_PTR>(this));
 
         // Status bar
-        status_ = CreateWindowExW(0, L"STATIC", L"Ready r4",
+        status_ = CreateWindowExW(0, L"STATIC", L"Ready",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             pad, cr.bottom - 22, cw, 18, h, nullptr, hInstance, nullptr);
         SendMessageW(status_, WM_SETFONT, reinterpret_cast<WPARAM>(Theme::fontUI), TRUE);
@@ -1404,7 +1510,8 @@ private:
         {
             typedef HRESULT(WINAPI* SWTF)(HWND, LPCWSTR, LPCWSTR);
             auto swt = reinterpret_cast<SWTF>(GetProcAddress(hUx, "SetWindowTheme"));
-            if (swt) swt(list_, L"DarkMode_Explorer", nullptr);
+            if (swt) swt(list_, Theme::lightTheme ? L"Explorer" : L"DarkMode_Explorer", nullptr);
+            FreeLibrary(hUx);
         }
     }
 
@@ -1515,14 +1622,17 @@ private:
     {
         CancelPendingRebuild();
         SetWindowTextW(edit_, L"");
-        LoadFilePins();
-        LoadBrickFavs();
         EnsureClassCache();
+        EnsureOSLCategories();
         if (IsSceneOnly()) RefreshSceneCache();
         Rebuild(true);
         RebuildBrickUI();
         POINT p{}; GetCursorPos(&p);
-        RECT wa{}; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+        RECT wa{};
+        MONITORINFO mi{ sizeof(mi) };
+        HMONITOR monitor = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST);
+        if (monitor && GetMonitorInfoW(monitor, &mi)) wa = mi.rcWork;
+        else SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
         int x = std::clamp(static_cast<long>(p.x - kWindowWidth / 2),
                            wa.left, wa.right - static_cast<long>(kWindowWidth));
         int y = std::clamp(static_cast<long>(p.y + 20),
@@ -1590,32 +1700,23 @@ private:
             y = std::clamp(static_cast<long>(y), wa.top, wa.bottom - static_cast<long>(kWindowHeight));
         }
 
-        int startY = y + 15;
+        // Position while fully transparent, then reveal at the final location.
+        // This preserves the no-flicker spawn order without pumping a nested
+        // message loop from inside the mouse hook.
         SetLayeredWindowAttributes(wnd_, 0, 0, LWA_ALPHA);
+        SetWindowPos(wnd_, HWND_TOPMOST, x, y, kWindowWidth, kWindowHeight,
+            SWP_NOACTIVATE);
         ShowWindow(wnd_, SW_SHOW);
-        SetWindowPos(wnd_, HWND_TOPMOST, x, startY, kWindowWidth, kWindowHeight, 0);
-        // Fade & slide in — cubic ease-out, 80ms
-        DWORD t0 = GetTickCount();
-        for (;;) {
-            float t = (float)(GetTickCount() - t0) / 80.0f;
-            if (t >= 1.0f) { 
-                SetLayeredWindowAttributes(wnd_, 0, 255, LWA_ALPHA); 
-                SetWindowPos(wnd_, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                break; 
-            }
-            float ease = 1.0f - (1.0f-t)*(1.0f-t)*(1.0f-t);
-            BYTE a = (BYTE)(255.0f * ease);
-            int curY = startY - (int)(15.0f * ease);
-            SetLayeredWindowAttributes(wnd_, 0, a, LWA_ALPHA);
-            SetWindowPos(wnd_, nullptr, x, curY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            MSG msg; while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
-        }
+        SetLayeredWindowAttributes(wnd_, 0, 255, LWA_ALPHA);
         SetActiveWindow(wnd_);
         SetForegroundWindow(wnd_);
         SetFocus(edit_);
         SendMessageW(edit_, EM_SETSEL, 0, -1);
         // Stop Max from stealing keyboard input (M, S, P etc. are Max shortcuts)
-        DisableAccelerators();
+        if (!acceleratorsDisabled_) {
+            DisableAccelerators();
+            acceleratorsDisabled_ = true;
+        }
     }
 
     void Hide()
@@ -1623,28 +1724,19 @@ private:
         CancelPendingRebuild();
         FinishRename(true);
         HidePreview();
-        // Fade & slide out — cubic ease-in, 50ms
-        if (IsWindowVisible(wnd_)) {
-            RECT r; GetWindowRect(wnd_, &r);
-            int x = r.left, y = r.top;
-            DWORD t0 = GetTickCount();
-            for (;;) {
-                float t = (float)(GetTickCount() - t0) / 50.0f;
-                if (t >= 1.0f) break;
-                float ease = t * t * t;
-                BYTE a = (BYTE)(255.0f * (1.0f - ease));
-                int curY = y + (int)(10.0f * ease);
-                SetLayeredWindowAttributes(wnd_, 0, a, LWA_ALPHA);
-                SetWindowPos(wnd_, nullptr, x, curY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                MSG msg; while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
-            }
-        }
         ShowWindow(wnd_, SW_HIDE);
         SetLayeredWindowAttributes(wnd_, 0, 255, LWA_ALPHA);
         dragging_ = false;
         dragIndex_ = -1;
         // Restore Max keyboard shortcuts
+        RestoreAccelerators();
+    }
+
+    void RestoreAccelerators()
+    {
+        if (!acceleratorsDisabled_) return;
         EnableAccelerators();
+        acceleratorsDisabled_ = false;
     }
 
     // ─── Commands ───────────────────────────────────────────────
@@ -1761,8 +1853,13 @@ private:
                 std::wstring filename(fd.cFileName);
                 size_t dot = filename.rfind(L'.');
                 std::wstring name = (dot != std::wstring::npos) ? filename.substr(0, dot) : filename;
-                std::wstring norm = Normalize(name, true);
-                if (!norm.empty()) nameToCategory[norm] = category;
+                std::wstring norm = Normalize(name, false);
+                if (!norm.empty()) {
+                    nameToCategory[norm] = category;
+                    std::wstring versionless = StripOSLVersionSuffix(norm);
+                    if (versionless != norm && nameToCategory.find(versionless) == nameToCategory.end())
+                        nameToCategory.emplace(std::move(versionless), category);
+                }
             } while (FindNextFileW(hFind, &fd));
             FindClose(hFind);
         }
@@ -1793,12 +1890,6 @@ private:
         classCacheReady_ = true;
         oslCategoryReady_ = false;
         classCacheBuilding_ = false;
-    }
-
-    void WarmClassCache()
-    {
-        if (!classCacheReady_) EnsureClassCache();
-        EnsureOSLCategories();
     }
 
     void EnsureOSLCategories()
@@ -1844,7 +1935,9 @@ private:
 
         if (!oslCategories.empty()) {
             for (auto& item : classItems_) {
-                auto it = oslCategories.find(item.normLabel);
+                auto it = oslCategories.find(item.key);
+                if (it == oslCategories.end())
+                    it = oslCategories.find(StripOSLVersionSuffix(item.key));
                 if (it == oslCategories.end()) continue;
                 item.category = it->second;
                 item.search = Normalize(item.label + L" " + it->second + L" OSL", true);
@@ -2002,7 +2095,7 @@ private:
 
         // Sort by score descending when searching, alphabetical otherwise
         if (!tokens.empty())
-            std::sort(scored.begin(), scored.end(),
+            std::stable_sort(scored.begin(), scored.end(),
                 [](const Scored& a, const Scored& b) { return a.score > b.score; });
 
         filtered_.clear();
@@ -2013,7 +2106,7 @@ private:
             std::set<int> pinIndices;
             for (const auto& pin : filePins_) {
                 for (size_t i = 0; i < source.size(); i++) {
-                    if (source[i].key == pin) {
+                    if (source[i].key == pin && passesTab(source[i])) {
                         filtered_.push_back(static_cast<int>(i));
                         pinIndices.insert(static_cast<int>(i));
                         break;
@@ -2033,6 +2126,8 @@ private:
         if (!filtered_.empty()) SendMessageW(list_, LB_SETCURSEL, 0, 0);
         SendMessageW(list_, WM_SETREDRAW, TRUE, 0);
         RedrawWindow(list_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+        if (wnd_ && IsWindowVisible(wnd_)) UpdatePreviewForSelection();
+        else HidePreview();
 
         lastQuery_ = normQ;
         lastTab_ = tab_;
@@ -2099,7 +2194,6 @@ private:
         if (!mb) { SetStatus(L"Create failed."); return; }
         const bool isNew = (item.live == nullptr);
         const bool isMat = (mb->SuperClassID() == MATERIAL_CLASS_ID);
-        const bool isMap = (mb->SuperClassID() == TEXMAP_CLASS_ID);
 
         // Name new instances
         if (isNew)
@@ -2160,11 +2254,12 @@ private:
                 for (int i = 0; i < ip->GetSelNodeCount(); ++i)
                     if (INode* n = ip->GetSelNode(i)) n->SetMtl(mtl);
                 ip->PutMtlToMtlEditor(mb, slot);
-            } else if (GetMtlEditInterface()) {
-                // Material palette exists — put in medit slot
+            } else {
+                // Always retain the created item in a material-editor slot.
+                // GetMtlEditInterface() can be unavailable transiently even
+                // though the core interface still accepts the slot update.
                 ip->PutMtlToMtlEditor(mb, slot);
             }
-            // else: nothing selected, nothing open — do nothing
             Hide();
         }
 
@@ -2214,11 +2309,12 @@ private:
         std::wstring alias = GetItemAlias(filteredIdx);
         if (alias.empty()) return;
         auto it = std::find(filePins_.begin(), filePins_.end(), alias);
-        if (it != filePins_.end()) filePins_.erase(it);
+        const bool wasPinned = it != filePins_.end();
+        if (wasPinned) filePins_.erase(it);
         else filePins_.insert(filePins_.begin(), alias);
         SaveFilePins();
         Rebuild(true);
-        SetStatus(it != filePins_.end() ? L"Unpinned." : L"Pinned to file.");
+        SetStatus(wasPinned ? L"Unpinned." : L"Pinned.");
     }
 
     void SaveFilePins()
@@ -2226,15 +2322,17 @@ private:
         FlowState_SaveSettings(); // unified save
     }
 
-    void LoadFilePins()
-    {
-        // Data is already loaded by LoadSettings() at startup.
-        // No-op — kept so call sites don't need to change.
-    }
-
-    // ─── Persistent brick favorites (saved in PowerShader.cfg) ──
+    // ─── Persistent brick favorites (saved in FlowState.cfg) ────
     void ToggleBrickFav(int filteredIdx)
     {
+        if (!activeItems_ || filteredIdx < 0 ||
+            filteredIdx >= static_cast<int>(filtered_.size())) return;
+        const int sourceIdx = filtered_[filteredIdx];
+        if (sourceIdx < 0 || sourceIdx >= static_cast<int>(activeItems_->size())) return;
+        if ((*activeItems_)[sourceIdx].live) {
+            SetStatus(L"Scene items cannot be saved as persistent favorites.");
+            return;
+        }
         std::wstring alias = GetItemAlias(filteredIdx);
         if (alias.empty()) return;
         // Check if already a brick fav
@@ -2274,15 +2372,9 @@ private:
         FlowState_SaveSettings(); // unified save
     }
 
-    void LoadBrickFavs()
+    void RebuildBrickUI(bool commitRename = true)
     {
-        // Data is already loaded by LoadSettings() at startup.
-        // No-op — kept so call sites don't need to change.
-    }
-
-    void RebuildBrickUI()
-    {
-        FinishRename(true);
+        FinishRename(commitRename);
         // Destroy existing brick buttons
         for (HWND bh : brickBtns_)
             if (bh) DestroyWindow(bh);
@@ -2382,7 +2474,7 @@ private:
     }
 
     // ─── State ──────────────────────────────────────────────────
-    HWND hotkeyWnd_ = nullptr;
+    bool inited_     = false;
     HWND wnd_       = nullptr;
     HWND edit_      = nullptr;
     HWND list_      = nullptr;
@@ -2414,6 +2506,7 @@ private:
     bool  trackingMouse_ = false;
     bool  sceneOnly_  = false;
     bool  applyToSel_ = false;  // Apply material to selection (off by default — just creates in SME)
+    bool  acceleratorsDisabled_ = false;
     int   listBaseY_  = 0;
     // Dual favorites
     std::vector<HWND> brickBtns_;            // brick button HWNDs
@@ -2441,14 +2534,23 @@ static void WriteBricksSectionImpl(FILE* f) {
 }
 
 static void ReadPinsLineImpl(const std::wstring& line) {
-    if (!line.empty())
-        Palette::Get().filePins_.push_back(line);
+    if (line.empty()) return;
+    auto& pins = Palette::Get().filePins_;
+    if (std::find(pins.begin(), pins.end(), line) == pins.end())
+        pins.push_back(line);
 }
 
 static void ReadBricksLineImpl(const std::wstring& line) {
     size_t sep = line.find(L'|');
-    if (sep != std::wstring::npos)
-        Palette::Get().brickFavs_.push_back({line.substr(0, sep), line.substr(sep + 1)});
+    if (sep == std::wstring::npos || sep == 0) return;
+    std::wstring alias = line.substr(0, sep);
+    std::wstring label = line.substr(sep + 1, 4);
+    if (label.empty()) return;
+    auto& bricks = Palette::Get().brickFavs_;
+    auto existing = std::find_if(bricks.begin(), bricks.end(),
+        [&](const BrickFav& item) { return item.alias == alias; });
+    if (existing == bricks.end() && static_cast<int>(bricks.size()) < kBrickMax)
+        bricks.push_back({std::move(alias), std::move(label)});
 }
 
 static void ClearPersistentImpl() {
@@ -2459,11 +2561,11 @@ static void ClearPersistentImpl() {
 } // anonymous namespace
 
 // ── Exported API ────────────────────────────────────────────────
-void Init(HINSTANCE, bool lightTheme) { Palette::Get().Init(lightTheme); }
+bool Init(HINSTANCE, bool lightTheme) { return Palette::Get().Init(lightTheme); }
 void Shutdown()      { Palette::Get().Shutdown(); }
 void Toggle()        { Palette::Get().Toggle(); }
-bool IsOpen()        { return false; } // TODO: add accessor to Palette
-void ReloadTheme(bool lightTheme) { Theme::Update(lightTheme); }
+bool IsOpen()        { return Palette::Get().IsOpen(); }
+void ReloadTheme(bool lightTheme) { Palette::Get().ReloadTheme(lightTheme); }
 
 void WritePinsSection(FILE* f)                  { WritePinsSectionImpl(f); }
 void WriteBricksSection(FILE* f)                { WriteBricksSectionImpl(f); }

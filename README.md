@@ -1,114 +1,78 @@
 # flowstate
 
-3ds Max C++ GUP plugin suite for fast parameter editing, shader lookup,
-modifier-stack navigation, and viewport/modeling hotkeys.
+![flowstate](images/flowstate_logo.png)
 
-FlowState logo
+flowstate 1.3 is a collection of 3ds Max tools for faster parameter editing, shader creation, modifier access, modeling, and mouse-driven viewport workflows.
 
-## Features
+## Tools
 
-### Modifier Stack under mouse.
+- **PowerParams** — Opens a floating editor for object, modifier, multi-selection, and Editable Poly command parameters with typing, scrubbing, favorites, and V/H slider slots.
+- **Timeline Slider** - Timeline scrubbing anywhere just by dragging. 
+- **Automatic Orbit** - Switch between orbit modes DYNAMICALLY. Also registers them to hotkey editor.
+- **Opacity Slider** - Change object opacity smoothly by dragging on viewport
+- **PowerShader** — Searches materials, texmaps, scene shaders, and OSL categories with pins, bricks, previews, drag/drop, assignment, and SHLL preview generation.
+- **ModStack** — Searches macros and modifiers, noticably faster than standard 3dsMax search
+- **Normalize Poly** — Shiva Tools's vertex cleaner C++ rewrite and works as a modifier. Up to 100x faster than the maxscript one.
+- **Smooth Bridge** — Bridge with proper continuity
+- **F2 Extend** — Blender style extend
+- **Config UI** — Controls modules, sub-object buttons, Slate Tab search, theme, and the XButton1 action map through `flowstate_config.ms`.
+- **FlowState.cfg** — Stores all module flags, key mappings, collapsed/hidden parameters, favorites, shader pins, and brick layouts in `<plugcfg>`.
+- **Loop Subdivision** - Subdivision surface modifier for triangular meshes
 
-Floating parameter panel for the selected object or modifier stack. It opens at
-the cursor, exposes editable parameters, supports favorite pins, and can take over
-Editable Poly caddy-style command parameters such as chamfer, bridge, extrude,
-bevel, inset, and outline.
+## Shortcuts
 
-Main trigger: `Mouse4`.
+| Input | Action |
+| --- | --- |
+| `XButton2` | Toggle PowerParams |
+| `Shift+XButton2` | Toggle PowerShader |
+| `Tab` in Slate Material Editor | Toggle PowerShader when enabled |
+| `Ctrl+XButton2` | Cycle auto-orbit mode |
+| `Alt+Shift+XButton2` | Swap V/H slider assignments |
+| `XButton1` combinations | Run the configurable action map |
+| Mouse wheel over a value | Scrub the value |
+| `Shift` while dragging | Use 10x coarse speed |
+| `Alt` while dragging | Use 0.1x fine speed |
+| `Enter` or `Tab` while typing | Apply the value |
+| `Esc` | Cancel the current operation and close |
 
-Highlights:
+## XButton1 defaults
 
-- Object, modifier, and selected modifier parameters in one floating panel.
-- Multi-object writes where supported.
-- Favorite pin strip with reorder and V/H slider slot assignment.
-- Wheel, typed-value, and click-drag editing.
-- Collapsible and hideable parameter groups.
-- Editable Poly command-mode support through cached EPoly operation param blocks.
+| Modifiers | Action |
+| --- | --- |
+| None | Screen Grab |
+| `Shift` | Time Slider |
+| `Ctrl` | Param Slider |
+| `Ctrl+Shift` | Opacity Slider |
+| `Ctrl+Alt+Shift` | Clear Sliders |
+| `Alt` | UV Grab |
 
-### Search
+Every XButton1 action can be reassigned, mapped to `Alt+Shift` or `Ctrl+Alt`, or turned off in the Config UI.
 
-Material and texmap search palette for the scene and available shader classes.
-It includes OSL category patching, pinned shader bricks, and texture preview.
+## Install
 
-Main triggers:
+1. Copy the matching `FlowState.gup` build to `3ds Max <version>\plugins`.
+2. Run `flowstate_config.ms` once to install the user macro and startup loader.
+3. Restart 3ds Max after first installation or after replacing the GUP.
 
-- `Shift+Mouse4`
-- `Tab` when Material Editor is in focus.
+Release packages require both `FlowState.gup` and `flowstate_config.ms`.
 
-### Config UI
+## Build
 
-Dark .NET WinForms macroscript dialog in
-`macros/flowstate_config.ms`.
+Requires Visual Studio 2022, CMake 3.20+, and the SDK matching the target 3ds Max version.
 
-It controls:
+```powershell
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DMAX_VERSION=2026
+cmake --build build --config Release
+```
 
-- PowerParams and PowerShader module toggles.
-- Sub-object toggles.
-- SME `Tab` shader search.
-- Theme mode.
-- XButton1 action keymap.
+Set `MAX_VERSION=2027` or override `MAXSDK_PATH` for another supported SDK; the Release output places the GUP and config script together.
 
-The macroscript self-installs a startup loader so the macros survive Max
-restarts.
+## Uninstall
 
-### Modeling Tools
-
-- `Precision Cut` (WIP) Cut meshes with splines (MODIFIER)
-- `Normalize Poly` C++ accelerated version of ShivaTools vertex cleaner script. (MODIFIER)
-- `Smooth Bridge` Supports twist and flip with tangency controls. (TOOL)
-
-## Controls
-
-
-| Input                              | Action                              |
-| ---------------------------------- | ----------------------------------- |
-| `XButton2`                         | Toggle PowerParams                  |
-| `Shift+XButton2`                   | Toggle PowerShader                  |
-| `Tab` in Slate Material Editor     | Toggle PowerShader when enabled     |
-| `Ctrl+XButton2`                    | Cycle auto-orbit mode               |
-| `Alt+Shift+XButton2`               | Swap V/H slider assignments         |
-| `XButton1` combos                  | Run configurable drag/action keymap |
-| Mouse wheel over PowerParams value | Scrub value                         |
-| `Shift` while dragging/scrubbing   | Coarse speed                        |
-| `Alt` while dragging/scrubbing     | Fine speed                          |
-| Type then `Tab`/`Enter`            | Apply typed value                   |
-| `Esc`                              | Cancel panel operation and close    |
-| Click outside panel                | Accept and close                    |
-
-
-## Mouse5 Keymap
-
-Mouse5 actions are mapped by combo index, not hardcoded modifier checks.
-
-
-| Combo index | Modifiers        | Default action |
-| ----------- | ---------------- | -------------- |
-| `0`         | none             | Screen Grab    |
-| `1`         | `Shift`          | Time Slider    |
-| `2`         | `Ctrl`           | Param Slider   |
-| `3`         | `Ctrl+Shift`     | Opacity Slider |
-| `4`         | `Ctrl+Alt+Shift` | Clear Sliders  |
-
-
-The globals are:
-
-- `g_kmGrab`
-- `g_kmTime`
-- `g_kmSlider`
-- `g_kmOpacity`
-- `g_kmClear`
-
-They persist as `Key:<action>=<comboIdx>` entries in `FlowState.cfg`. Drag-time
-speed modifiers are separate and remain hardcoded: `Shift` is coarse/faster,
-`Alt` is fine/slower.
+Remove `FlowState.gup`, the installed `flowstate_config.ms` copies/startup loader, and optionally `<plugcfg>\FlowState.cfg`.
 
 ## License
 
-FlowState is licensed under the **GNU General Public License v3.0** with an
-additional permission (a linking exception) that allows it to be linked,
-combined, and distributed together with the proprietary Autodesk 3ds Max SDK.
+GPL-3.0 with an Autodesk 3ds Max SDK linking exception; see [LICENSE](LICENSE) and [LICENSE-EXCEPTION](LICENSE-EXCEPTION).
 
-See [LICENSE](LICENSE) for the GPLv3 text and
-[LICENSE-EXCEPTION](LICENSE-EXCEPTION) for the exception.
-
-Copyright (C) 2026 cl0nazepamm
+Copyright (C) 2026 clone

@@ -3,6 +3,7 @@ build_*/
 *.user
 *.suo
 .vs/
+build_log.txt
 
 # Local build/dev scripts — only build.bat is tracked
 *.bat

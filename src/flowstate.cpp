@@ -48,6 +48,7 @@ static const int             kSetOrbitId        = 8;
 static const int             kSetSelectedId     = 9;
 static const int             kSetSubObjectId    = 10;
 static const int             kSetPOIId          = 11;
+static const int             kReloadSettingsId  = 12;
 
 // ── Config ──────────────────────────────────────────────────────
 static const TCHAR* kWndClass = _T("PowerParamsPanel");
@@ -249,6 +250,7 @@ static bool EnsureScreenGrabHoldStarted() {
     Interface* ip = GetCOREInterface();
     if (!ip) return false;
     if (g_screenGrabHoldStarted) return true;
+    if (theHold.Holding()) return false;
 
     if (g_screenGrabTarget == SCREEN_GRAB_TARGET_SUBOBJECT) {
         if (!g_screenGrabEditObj) return false;
@@ -413,11 +415,23 @@ static bool IsSafeOrbitSwapMode(int cid) {
 static bool SetOrbitFlyoffImpl(int idx, bool force) {
     Interface* ip = GetCOREInterface();
     if (!ip) return false;
-    HWND tb = nullptr;
-    EnumChildWindows(ip->GetMAXHWnd(), FindViewControlToolbarProc, (LPARAM)&tb);
-    if (!tb) return false;
-    HWND btnHwnd = GetDlgItem(tb, kOrbitFlyoffCtrlId);
-    if (!btnHwnd) return false;
+
+    // Cache the view-control toolbar HWND: EvaluateAutoOrbit calls this ~4x/sec.
+    // Revalidate both ancestry and the flyoff control because Max may rebuild
+    // the toolbar while leaving a still-valid (or recycled) HWND behind.
+    static HWND s_tb = nullptr;
+    HWND maxWnd = ip->GetMAXHWnd();
+    HWND btnHwnd = nullptr;
+    if (s_tb && IsWindow(s_tb) && IsChild(maxWnd, s_tb))
+        btnHwnd = GetDlgItem(s_tb, kOrbitFlyoffCtrlId);
+
+    if (!btnHwnd) {
+        s_tb = nullptr;
+        EnumChildWindows(maxWnd, FindViewControlToolbarProc, (LPARAM)&s_tb);
+        if (!s_tb) return false;
+        btnHwnd = GetDlgItem(s_tb, kOrbitFlyoffCtrlId);
+        if (!btnHwnd) return false;
+    }
     ICustButton* btn = GetICustButton(btnHwnd);
     if (!btn) return false;
 
@@ -491,13 +505,13 @@ static bool HasSubSelection() {
         _T("    local cls=classOf o;local sc=superClassOf o;")
         _T("    if cls==Editable_Poly then (")
         _T("      if lvl==1 do (if (polyOp.getVertSelection o).numberSet>0 do r=true);")
-        _T("      if lvl==2 do (if (polyOp.getEdgeSelection o).numberSet>0 do r=true);")
+        _T("      if lvl==2 or lvl==3 do (if (polyOp.getEdgeSelection o).numberSet>0 do r=true);")  // Edge(2)/Border(3)
         _T("      if lvl>=4 do (if (polyOp.getFaceSelection o).numberSet>0 do r=true)")
         _T("    )")
         _T("    else if cls==Editable_Mesh and node!=undefined then (")
         _T("      if lvl==1 do (if (getVertSelection node).numberSet>0 do r=true);")
         _T("      if lvl==2 do (if (getEdgeSelection node).numberSet>0 do r=true);")
-        _T("      if lvl==3 do (if (getFaceSelection node).numberSet>0 do r=true)")
+        _T("      if lvl>=3 do (if (getFaceSelection node).numberSet>0 do r=true)")  // Face(3)/Polygon(4)/Element(5)
         _T("    )")
         _T("    else if sc==shape and node!=undefined then try(")
         _T("      local ns=numSplines node;")
@@ -513,7 +527,7 @@ static bool HasSubSelection() {
         _T("      if not handled and node!=undefined and cls==Edit_Mesh then (handled=true;")
         _T("        if lvl==1 do (if (getVertSelection node).numberSet>0 do r=true);")
         _T("        if lvl==2 do (if (getEdgeSelection node).numberSet>0 do r=true);")
-        _T("        if lvl==3 do (if (getFaceSelection node).numberSet>0 do r=true));")
+        _T("        if lvl>=3 do (if (getFaceSelection node).numberSet>0 do r=true));")
         _T("      if not handled and node!=undefined and cls==Edit_Spline then (handled=true;")
         _T("        try(local ns=numSplines node;")
         _T("          if lvl==1 do (for i=1 to ns where not r do (local s=getKnotSelection node i;if s!=undefined and s.count>0 do r=true));")
@@ -580,7 +594,6 @@ static VOID CALLBACK AutoOrbitTimerProc(HWND, UINT, UINT_PTR, DWORD) {
 
 static void SetAutoOrbitMode(AutoOrbitMode mode) {
     if (mode == g_autoOrbitMode) return;
-    bool wasOn = g_autoOrbitMode != AUTO_ORBIT_OFF;
     bool nowOn = mode != AUTO_ORBIT_OFF;
     g_autoOrbitMode = mode;
 
@@ -611,7 +624,6 @@ static void SetAutoOrbitMode(AutoOrbitMode mode) {
         case AUTO_ORBIT_POI:      ShowOSD(L"Auto orbit: POI");         break;
         case AUTO_ORBIT_DYNAMIC:  ShowOSD(L"Auto orbit: DYNAMIC POI"); break;
     }
-    (void)wasOn;
 }
 
 static void CycleAutoOrbitMode() {
@@ -627,7 +639,6 @@ static void CycleAutoOrbitMode() {
 }
 
 static void DisableAutoSilent() {
-    if (g_autoOrbitMode == AUTO_ORBIT_OFF) return;
     g_autoOrbitMode = AUTO_ORBIT_OFF;
     if (g_autoOrbitNotifyRegistered) {
         UnRegisterNotification(AutoOrbitNotifyCB, nullptr, NOTIFY_SELECTIONSET_CHANGED);
@@ -1022,6 +1033,7 @@ static int   g_lmbDragAccum  = 0;  // accumulated sub-threshold movement for int
 static bool  g_lmbDragMoved  = false; // true once mouse moves enough to be a drag (not a click)
 static bool  g_lmbDragChanged = false;
 static bool  g_lmbBoolToggled = false;
+static bool  g_lmbDragOwnHold = false;
 
 // Module enable flags (read from FlowState.ini)
 static bool g_enablePowerParams = true;
@@ -1035,29 +1047,37 @@ struct QuickMod {
 static std::vector<QuickMod> g_quickMods;
 
 static void PositionBtnStrips();
+static void SaveSettings();
+
+static void AddPowerParamsQuickModifier(const std::wstring& internalName,
+                                        const std::wstring& label) {
+    if (internalName.empty() || label.empty()) return;
+    for (const auto& item : g_quickMods)
+        if (item.internalName == internalName) return;
+
+    std::wstring shortLabel;
+    for (wchar_t c : label) if (iswupper(c)) shortLabel += c;
+    if (shortLabel.empty() || shortLabel.length() == 1) {
+        shortLabel = label.substr(0, std::min(size_t(3), label.size()));
+        for (auto& c : shortLabel) c = towupper(c);
+    }
+    if (shortLabel.length() > 4) shortLabel.resize(4);
+    g_quickMods.push_back({internalName, label, shortLabel});
+}
 
 void TogglePowerParamsQuickModifier(const wchar_t* internalName, const wchar_t* label) {
     if (!internalName || !label) return;
     std::wstring iname(internalName);
+    bool removed = false;
     for (auto it = g_quickMods.begin(); it != g_quickMods.end(); ++it) {
         if (it->internalName == iname) {
             g_quickMods.erase(it);
-            if (g_open && g_btnRight) InvalidateRect(g_btnRight, nullptr, TRUE);
-            PositionBtnStrips();
-            return;
+            removed = true;
+            break;
         }
     }
-    
-    std::wstring sl;
-    std::wstring lbl(label);
-    for (wchar_t c : lbl) if (iswupper(c)) sl += c;
-    if (sl.empty() || sl.length() == 1) {
-        sl = lbl.substr(0, std::min(size_t(3), lbl.size()));
-        for (auto& c : sl) c = towupper(c);
-    }
-    if (sl.length() > 4) sl = sl.substr(0, 4);
-
-    g_quickMods.push_back({iname, lbl, sl});
+    if (!removed) AddPowerParamsQuickModifier(iname, label);
+    SaveSettings();
     if (g_open && g_btnRight) InvalidateRect(g_btnRight, nullptr, TRUE);
     PositionBtnStrips();
 }
@@ -1091,8 +1111,9 @@ static XB1Slot g_xb1V; // active vertical slot (resolved for current selection)
 static XB1Slot g_xb1H; // active horizontal slot
 static std::wstring g_xb1Class; // current base class context
 static HWND         g_osdWnd = nullptr;
-static UINT_PTR     g_osdTimer = 0;
+static bool         g_osdClassRegistered = false;
 static HWND         g_dragTip = nullptr; // cursor-following value tooltip
+static bool         g_dragTipClassRegistered = false;
 
 // XButton1 keymap — configurable modifier combos
 // Combo indices: 0=bare, 1=Shift, 2=Ctrl, 3=Ctrl+Shift, 4=Ctrl+Alt+Shift,
@@ -1154,9 +1175,12 @@ public:
     std::vector<UVVert> afterUVs;
 
     void Apply(const std::vector<UVVert>& uvs) {
+        if (uvs.size() != uvVerts.size()) return;
         if (isPoly && mn) {
             MNMap* mp = mn->M(channel);
             if (!mp) return;
+            for (int index : uvVerts)
+                if (index < 0 || index >= mp->numv) return;
             for (size_t i = 0; i < uvVerts.size(); i++)
                 mp->v[uvVerts[i]] = uvs[i];
             // Mirror the live-drag invalidation chain exactly: without
@@ -1173,6 +1197,10 @@ public:
         } else if (mesh) {
             if (!mesh->mapSupport(channel)) return;
             UVVert* mv = mesh->mapVerts(channel);
+            int count = mesh->getNumMapVerts(channel);
+            if (!mv) return;
+            for (int index : uvVerts)
+                if (index < 0 || index >= count) return;
             for (size_t i = 0; i < uvVerts.size(); i++)
                 mv[uvVerts[i]] = uvs[i];
             mesh->InvalidateGeomCache();
@@ -1525,8 +1553,6 @@ static bool BeginUVGrab(INode* node, HWND viewHwnd, const POINT& screenPt) {
     }
     return true;
 
-    ResetUVDrag();
-    return false;
 }
 
 // Apply a transform from the cached originals based on screen delta + modifiers.
@@ -1621,12 +1647,6 @@ static void ApplyUVDrag(int dxPix, int dyPix, bool ctrl, bool shift) {
     if (ip) ip->RedrawViews(ip->GetTime(), REDRAW_NORMAL);
 }
 
-// LoadModuleFlags is now handled by LoadSettings() — reads [config] section from FlowState.cfg
-static void LoadModuleFlags() {
-    // No-op: LoadSettings() handles everything now.
-    // Kept as stub so call sites don't need to change yet.
-}
-
 static std::wstring GetSelBaseClass() {
     Interface* ip = GetCOREInterface();
     if (!ip || ip->GetSelNodeCount() == 0) return {};
@@ -1679,7 +1699,6 @@ static void SyncXB1ToSelection() {
     }
 }
 
-static void SaveSettings(); // forward declaration
 static void SaveXB1Assignment() {
     StashXB1();
     SaveSettings(); // XB1 data is now in [config] section of FlowState.cfg
@@ -1803,6 +1822,7 @@ static int  ClampDragDelta(int delta);
 static bool IsWritableParam(IParamBlock2* pb, ParamID pid);
 static bool SetPB2FloatSafe(IParamBlock2* pb, ParamID pid, ParamType2 type, TimeValue t, float value);
 static bool SetPB2IntSafe(IParamBlock2* pb, ParamID pid, ParamType2 type, TimeValue t, int value);
+static bool SetPB2BoolSafe(IParamBlock2* pb, ParamID pid, TimeValue t, int value);
 static bool TogglePB2BoolSafe(IParamBlock2* pb, ParamID pid, TimeValue t);
 static std::wstring PropFromKey(const EditField& ef);
 static bool FindParam(INode* node, const std::wstring& key,
@@ -1816,8 +1836,7 @@ static void ShowOSD(const std::wstring& text) {
     int cy = (wr.top + wr.bottom) / 2;
 
     if (!g_osdWnd) {
-        static bool regOsd = false;
-        if (!regOsd) {
+        if (!g_osdClassRegistered) {
             WNDCLASSEX wc = { sizeof(wc) };
             wc.lpfnWndProc = [](HWND h, UINT m, WPARAM w, LPARAM l) -> LRESULT {
                 if (m == WM_PAINT) {
@@ -1842,13 +1861,16 @@ static void ShowOSD(const std::wstring& text) {
             };
             wc.hInstance = hInstance;
             wc.lpszClassName = _T("FlowStateOSD");
-            RegisterClassEx(&wc);
-            regOsd = true;
+            g_osdClassRegistered = RegisterClassEx(&wc) != 0 ||
+                GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
         }
-        g_osdWnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-            _T("FlowStateOSD"), _T(""), WS_POPUP,
-            0, 0, 280, 36, nullptr, nullptr, hInstance, nullptr);
+        if (g_osdClassRegistered) {
+            g_osdWnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                _T("FlowStateOSD"), _T(""), WS_POPUP,
+                0, 0, 280, 36, nullptr, nullptr, hInstance, nullptr);
+        }
     }
+    if (!g_osdWnd) return;
     SetWindowTextW(g_osdWnd, text.c_str());
     SetWindowPos(g_osdWnd, HWND_TOPMOST, cx - 140, cy - 18, 280, 36, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(g_osdWnd, nullptr, TRUE);
@@ -1886,7 +1908,6 @@ static std::wstring ReadSlotValue(const XB1Slot& slot) {
     if (slot.spIdx >= 0) return FmtFloat(g_splineVals[slot.spIdx]);
     // PB1 — use tracked displayVal (set at drag start, updated per frame)
     return FmtFloat(slot.displayVal);
-    return L"--";
 }
 
 static HFONT g_tipFont = nullptr;
@@ -1898,8 +1919,7 @@ static void ShowDragTip(const POINT& pt, const std::wstring& text) {
     if (!g_tipBg) g_tipBg = CreateSolidBrush(RGB(30, 30, 30));
 
     if (!g_dragTip) {
-        static bool regTip = false;
-        if (!regTip) {
+        if (!g_dragTipClassRegistered) {
             WNDCLASSEX wc = { sizeof(wc) };
             wc.lpfnWndProc = [](HWND h, UINT m, WPARAM w, LPARAM l) -> LRESULT {
                 if (m == WM_PAINT) {
@@ -1920,13 +1940,16 @@ static void ShowDragTip(const POINT& pt, const std::wstring& text) {
             };
             wc.hInstance = hInstance;
             wc.lpszClassName = _T("FlowStateDragTip");
-            RegisterClassEx(&wc);
-            regTip = true;
+            g_dragTipClassRegistered = RegisterClassEx(&wc) != 0 ||
+                GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
         }
-        g_dragTip = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-            _T("FlowStateDragTip"), _T(""), WS_POPUP,
-            0, 0, 1, 1, nullptr, nullptr, hInstance, nullptr);
+        if (g_dragTipClassRegistered) {
+            g_dragTip = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                _T("FlowStateDragTip"), _T(""), WS_POPUP,
+                0, 0, 1, 1, nullptr, nullptr, hInstance, nullptr);
+        }
     }
+    if (!g_dragTip) return;
     // Measure and position — no font alloc
     HDC hdc = GetDC(g_dragTip);
     HFONT old = (HFONT)SelectObject(hdc, g_tipFont);
@@ -1980,7 +2003,11 @@ static std::wstring GetCfgPath() {
 static void SaveSettings() {
     std::wstring path = GetCfgPath();
     if (path.empty()) return;
-    FILE* f = _wfopen(path.c_str(), L"w");
+    // Per-process/thread staging avoids one Max instance truncating another
+    // instance's in-progress config write.
+    std::wstring tmpPath = path + L".tmp." + std::to_wstring(GetCurrentProcessId()) +
+        L"." + std::to_wstring(GetCurrentThreadId());
+    FILE* f = _wfopen(tmpPath.c_str(), L"w");
     if (!f) return;
 
     // [config] — module flags & XB1 assignments
@@ -2014,14 +2041,40 @@ static void SaveSettings() {
     PowerShader::WritePinsSection(f);
     PowerShader::WriteBricksSection(f);
 
-    fclose(f);
+    bool writeOK = fflush(f) == 0 && ferror(f) == 0;
+    if (fclose(f) != 0) writeOK = false;
+    if (!writeOK || !MoveFileExW(tmpPath.c_str(), path.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        DeleteFileW(tmpPath.c_str());
 }
 
 // Non-static wrapper so powershader.cpp can trigger a full save
 void FlowState_SaveSettings() { SaveSettings(); }
 
+static void NormalizeKeymap() {
+    bool used[8] = {};
+    int* assignments[] = {
+        &g_kmGrab, &g_kmTime, &g_kmSlider,
+        &g_kmOpacity, &g_kmClear, &g_kmUVGrab
+    };
+    for (int* value : assignments) {
+        if (*value < -1 || *value > 7) *value = -1;
+        if (*value >= 0) {
+            if (used[*value]) *value = -1;
+            else used[*value] = true;
+        }
+    }
+}
+
 static void LoadSettings() {
+    g_enablePowerParams = true;
+    g_enablePowerShader = true;
+    g_showSubObj = false;
+    g_tabShader = true;
+    g_lightTheme = false;
     g_collapsed.clear(); g_hidden.clear(); g_favorites.clear(); g_quickMods.clear();
+    g_xb1Map.clear();
+    g_xb1V.Clear(); g_xb1H.Clear(); g_xb1Class.clear();
     PowerShader::ClearPersistent();
     g_kmGrab = 0; g_kmTime = 1; g_kmSlider = 2; g_kmOpacity = 3; g_kmClear = 4; g_kmUVGrab = 5;
 
@@ -2044,7 +2097,7 @@ static void LoadSettings() {
                 case L'C': g_collapsed.insert(val); break;
                 case L'F': if (!val.empty() && val[0] != L':') g_favorites.insert(val); break;
                 case L'H': g_hidden.insert(val); break;
-                case L'Q': { size_t p = val.find(L'|'); if (p != std::wstring::npos) TogglePowerParamsQuickModifier(val.substr(0,p).c_str(), val.substr(p+1).c_str()); break; }
+                case L'Q': { size_t p = val.find(L'|'); if (p != std::wstring::npos) AddPowerParamsQuickModifier(val.substr(0,p), val.substr(p+1)); break; }
                 }
             }
             fclose(f);
@@ -2069,6 +2122,10 @@ static void LoadSettings() {
         if (wcscmp(line, L"[params]") == 0)  { sec = SEC_PARAMS; continue; }
         if (wcscmp(line, L"[pins]") == 0)    { sec = SEC_PINS;   continue; }
         if (wcscmp(line, L"[bricks]") == 0)  { sec = SEC_BRICKS; continue; }
+        if (len >= 2 && line[0] == L'[' && line[len - 1] == L']') {
+            sec = SEC_NONE;
+            continue;
+        }
 
         std::wstring l(line);
 
@@ -2111,7 +2168,7 @@ static void LoadSettings() {
             case L'C': g_collapsed.insert(val); break;
             case L'F': if (!val.empty() && val[0] != L':') g_favorites.insert(val); break;
             case L'H': g_hidden.insert(val); break;
-            case L'Q': { size_t p = val.find(L'|'); if (p != std::wstring::npos) TogglePowerParamsQuickModifier(val.substr(0,p).c_str(), val.substr(p+1).c_str()); break; }
+            case L'Q': { size_t p = val.find(L'|'); if (p != std::wstring::npos) AddPowerParamsQuickModifier(val.substr(0,p), val.substr(p+1)); break; }
             }
         }
         else if (sec == SEC_PINS) {
@@ -2122,6 +2179,7 @@ static void LoadSettings() {
         }
     }
     fclose(f);
+    NormalizeKeymap();
     UpdateTheme(g_lightTheme);
     PowerShader::ReloadTheme(g_lightTheme);
     ModStack::ReloadTheme(g_lightTheme);
@@ -2163,6 +2221,20 @@ static void BuildLayout();
 // ── Mouse hook — XButton2=panel, XButton1=pin ───────────────────
 // Uses WH_MOUSE (thread-level) instead of WH_MOUSE_LL (system-wide)
 // to avoid blocking the system input pipeline when Max is busy.
+enum DragMode { DRAG_NONE, DRAG_TIME, DRAG_OPACITY, DRAG_UVGRAB };
+static DragMode s_dragMode = DRAG_NONE;
+static int   s_lastMouseX  = 0;
+static int   s_lastMouseY  = 0;
+static float s_dragFloat   = 0;
+static bool  s_xb1Dragging = false;
+static bool  s_xb1Changed  = false;
+static bool  s_xb1BoolToggledV = false;
+static bool  s_xb1BoolToggledH = false;
+static bool  s_xb1OwnHold = false;
+static bool  s_opacityChanged = false;
+static bool  s_opacityOwnHold = false;
+static bool  s_uvOwnHold = false;
+
 static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     if (nCode < 0) return CallNextHookEx(g_mouseHook, nCode, wp, lp);
 
@@ -2179,28 +2251,94 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     }
 
     // ── XButton1 hold-drag tools ──────────────────────────────
-    enum DragMode { DRAG_NONE, DRAG_TIME, DRAG_OPACITY, DRAG_UVGRAB };
-    static DragMode s_dragMode = DRAG_NONE;
-    static int   s_lastMouseX  = 0;
-    static int   s_lastMouseY  = 0;
-    static float s_dragFloat   = 0;
-    static bool  s_xb1Dragging = false;
-    static bool  s_xb1Changed  = false;
-    static bool  s_xb1BoolToggledV = false;
-    static bool  s_xb1BoolToggledH = false;
-
     auto finishXB1Drag = [&]() {
         s_xb1Dragging = false;
-        if (s_xb1Changed) theHold.Accept(_T("XB1 Drag"));
-        else theHold.Cancel();
+        if (s_xb1OwnHold && theHold.Holding()) {
+            if (s_xb1Changed) theHold.Accept(_T("XB1 Drag"));
+            else theHold.Cancel();
+        }
+        s_xb1OwnHold = false;
         s_xb1Changed = false;
         s_xb1BoolToggledV = false;
         s_xb1BoolToggledH = false;
         HideDragTip();
     };
 
+    auto finishUVGrab = [&]() {
+        if (s_dragMode != DRAG_UVGRAB) return;
+        s_dragMode = DRAG_NONE;
+        // Record before/after UVs so Undo rolls back the whole drag.
+        bool changed = false;
+        if (!s_uv.uvVerts.empty() && (s_uv.polyObj || s_uv.triObj)) {
+            UVIslandRestore* r = new UVIslandRestore;
+            r->obj     = s_uv.isPoly ? (Object*)s_uv.polyObj : (Object*)s_uv.triObj;
+            r->node    = s_uv.node;
+            r->isPoly  = s_uv.isPoly;
+            r->mn      = s_uv.isPoly ? &s_uv.polyObj->GetMesh() : nullptr;
+            r->mesh    = s_uv.isPoly ? nullptr : &s_uv.triObj->GetMesh();
+            r->channel = s_uv.mapChannel;
+            r->uvVerts = s_uv.uvVerts;
+            r->beforeUVs = s_uv.origUVs;
+            r->afterUVs.reserve(s_uv.uvVerts.size());
+            if (s_uv.isPoly) {
+                MNMap* mp = s_uv.polyObj->GetMesh().M(s_uv.mapChannel);
+                if (mp) for (int vi : s_uv.uvVerts) {
+                    if (vi < 0 || vi >= mp->numv) break;
+                    r->afterUVs.push_back(mp->v[vi]);
+                }
+            } else {
+                Mesh& mesh = s_uv.triObj->GetMesh();
+                UVVert* mv = mesh.mapVerts(s_uv.mapChannel);
+                int count = mesh.getNumMapVerts(s_uv.mapChannel);
+                if (mv) for (int vi : s_uv.uvVerts) {
+                    if (vi < 0 || vi >= count) break;
+                    r->afterUVs.push_back(mv[vi]);
+                }
+            }
+            if (r->afterUVs.size() == r->beforeUVs.size()) {
+                for (size_t i = 0; i < r->afterUVs.size(); ++i) {
+                    const UVVert& a = r->afterUVs[i];
+                    const UVVert& b = r->beforeUVs[i];
+                    if (a.x != b.x || a.y != b.y || a.z != b.z) {
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            if (changed && theHold.Holding()) {
+                theHold.Put(r);
+            } else {
+                delete r;
+            }
+        }
+        if (s_uvOwnHold && theHold.Holding()) {
+            if (changed) theHold.Accept(_T("UV Grab"));
+            else theHold.Cancel();
+        }
+        s_uvOwnHold = false;
+        ResetUVDrag();
+    };
+
+    auto finishSimpleDrag = [&]() {
+        if (s_dragMode == DRAG_OPACITY && s_opacityOwnHold && theHold.Holding()) {
+            if (s_opacityChanged) theHold.Accept(_T("Opacity Slider"));
+            else theHold.Cancel();
+        }
+        s_opacityChanged = false;
+        s_opacityOwnHold = false;
+        s_dragMode = DRAG_NONE;
+    };
+
     if (s_xb1Dragging && wp == WM_MOUSEMOVE && !(GetAsyncKeyState(VK_XBUTTON1) & 0x8000)) {
         finishXB1Drag();
+        return 1;
+    }
+
+    if ((s_dragMode != DRAG_NONE || g_screenGrabState != SCREEN_GRAB_NONE) &&
+        wp == WM_MOUSEMOVE && !(GetAsyncKeyState(VK_XBUTTON1) & 0x8000)) {
+        if (g_screenGrabState != SCREEN_GRAB_NONE) EndScreenGrab(true);
+        else if (s_dragMode == DRAG_UVGRAB) finishUVGrab();
+        else finishSimpleDrag();
         return 1;
     }
 
@@ -2263,7 +2401,6 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                 float sc = a > 0.001f ? a * 0.01f : 0.001f;
                 if (shift) sc *= 10.0f; if (alt) sc *= 0.1f;
                 float inc = step * sc;
-                slot.displayVal += inc;
                 size_t sep = slot.key.find(L':');
                 if (sep != std::wstring::npos) {
                     std::wstring prop = slot.key.substr(sep + 1);
@@ -2272,8 +2409,10 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                     std::wstring sc2 = L"for obj in selection do try(local o=obj" + objPath +
                         L";local v=getProperty o #" + prop +
                         L";setProperty o #" + prop + L" (v+" + std::to_wstring(inc) + L"))catch()";
-                    ExecuteMAXScriptScript(sc2.c_str(), MAXScript::ScriptSource::Dynamic);
-                    changed = true;
+                    if (ExecuteMAXScriptScript(sc2.c_str(), MAXScript::ScriptSource::Dynamic)) {
+                        slot.displayVal += inc;
+                        changed = true;
+                    }
                 }
             }
         };
@@ -2340,6 +2479,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                 INode* nd = ip->GetSelNode(i);
                 if (nd) nd->SetVisibility(ip->GetTime(), s_dragFloat);
             }
+            s_opacityChanged = true;
             ip->RedrawViews(ip->GetTime());
         }
         else if (s_dragMode == DRAG_UVGRAB) {
@@ -2401,6 +2541,9 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                     s_lastMouseX = ((MOUSEHOOKSTRUCT*)lp)->pt.x;
                     s_dragFloat = ip->GetSelNode(0)->GetVisibility(ip->GetTime());
                     if (s_dragFloat < 0) s_dragFloat = 1.0f;
+                    s_opacityChanged = false;
+                    s_opacityOwnHold = !theHold.Holding();
+                    if (s_opacityOwnHold) theHold.Begin();
                     return 1;
                 }
 
@@ -2512,7 +2655,8 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                             s_xb1Changed = false;
                             s_xb1BoolToggledV = false;
                             s_xb1BoolToggledH = false;
-                            theHold.Begin();
+                            s_xb1OwnHold = !theHold.Holding();
+                            if (s_xb1OwnHold) theHold.Begin();
                             return 1;
                         }
                     }
@@ -2537,6 +2681,12 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
 
                 // UV island grab
                 if (combo == g_kmUVGrab && ip && ip->GetSelNodeCount() > 0) {
+                    // UV undo uses a plugin RestoreObj. Never attach it to an
+                    // unrelated transaction that could outlive this plugin.
+                    if (theHold.Holding()) {
+                        ShowOSD(L"UV grab: finish the current operation first");
+                        return 1;
+                    }
                     POINT screenPt = ((MOUSEHOOKSTRUCT*)lp)->pt;
                     HWND viewHwnd = nullptr;
                     if (!TryGetViewportFromScreenPoint(screenPt, viewHwnd, nullptr))
@@ -2550,7 +2700,8 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                     s_dragMode = DRAG_UVGRAB;
                     s_lastMouseX = screenPt.x;
                     s_lastMouseY = screenPt.y;
-                    theHold.Begin();
+                    s_uvOwnHold = !theHold.Holding();
+                    if (s_uvOwnHold) theHold.Begin();
                     ShowOSD(L"UV grab");
                     return 1;
                 }
@@ -2559,39 +2710,15 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             }
             if (wp == WM_XBUTTONUP) {
                 if (g_screenGrabState == SCREEN_GRAB_PENDING || g_screenGrabState == SCREEN_GRAB_ACTIVE) {
-                    PostMessage(g_panel, WM_PP_GRAB_END, 0, 0);
+                    EndScreenGrab(true);
                     return 1;
                 }
                 if (s_dragMode == DRAG_UVGRAB) {
-                    s_dragMode = DRAG_NONE;
-                    // Record the before/after UVs so Undo can roll back
-                    // the whole drag as a single atomic step.
-                    if (!s_uv.uvVerts.empty() && (s_uv.polyObj || s_uv.triObj)) {
-                        UVIslandRestore* r = new UVIslandRestore;
-                        r->obj     = s_uv.isPoly ? (Object*)s_uv.polyObj : (Object*)s_uv.triObj;
-                        r->node    = s_uv.node;
-                        r->isPoly  = s_uv.isPoly;
-                        r->mn      = s_uv.isPoly ? &s_uv.polyObj->GetMesh() : nullptr;
-                        r->mesh    = s_uv.isPoly ? nullptr : &s_uv.triObj->GetMesh();
-                        r->channel = s_uv.mapChannel;
-                        r->uvVerts = s_uv.uvVerts;
-                        r->beforeUVs = s_uv.origUVs;
-                        r->afterUVs.reserve(s_uv.uvVerts.size());
-                        if (s_uv.isPoly) {
-                            MNMap* mp = s_uv.polyObj->GetMesh().M(s_uv.mapChannel);
-                            if (mp) for (int vi : s_uv.uvVerts) r->afterUVs.push_back(mp->v[vi]);
-                        } else {
-                            UVVert* mv = s_uv.triObj->GetMesh().mapVerts(s_uv.mapChannel);
-                            if (mv) for (int vi : s_uv.uvVerts) r->afterUVs.push_back(mv[vi]);
-                        }
-                        theHold.Put(r);
-                    }
-                    theHold.Accept(_T("UV Grab"));
-                    ResetUVDrag();
+                    finishUVGrab();
                     return 1;
                 }
                 if (s_dragMode != DRAG_NONE) {
-                    s_dragMode = DRAG_NONE;
+                    finishSimpleDrag();
                     return 1;
                 }
             }
@@ -2615,30 +2742,81 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                             L"  \u2194 " + (g_xb1H.Active() ? g_xb1H.label : L"OFF"));
                 }
                 return 1;
-            } else if ((shift || matEd) && g_enablePowerShader) {
-                PostMessage(g_panel, WM_PP_SHADER, 0, 0);
+            } else if (shift || matEd) {
+                if (g_enablePowerShader) {
+                    PostMessage(g_panel, WM_PP_SHADER, 0, 0);
+                    return 1;
+                }
             } else if (g_enablePowerParams) {
                 PostMessage(g_panel, WM_PP_TOGGLE, 0, 0);
+                return 1;
             }
-            return 1;
         }
     }
 
     return CallNextHookEx(g_mouseHook, nCode, wp, lp);
 }
 
+static void RestoreActiveUVDrag() {
+    if (s_uv.uvVerts.empty() || s_uv.origUVs.size() != s_uv.uvVerts.size()) return;
+    UVIslandRestore restore;
+    restore.obj = s_uv.isPoly ? static_cast<Object*>(s_uv.polyObj)
+                              : static_cast<Object*>(s_uv.triObj);
+    restore.node = s_uv.node;
+    restore.isPoly = s_uv.isPoly;
+    restore.mn = s_uv.isPoly && s_uv.polyObj ? &s_uv.polyObj->GetMesh() : nullptr;
+    restore.mesh = !s_uv.isPoly && s_uv.triObj ? &s_uv.triObj->GetMesh() : nullptr;
+    restore.channel = s_uv.mapChannel;
+    restore.uvVerts = s_uv.uvVerts;
+    restore.Apply(s_uv.origUVs);
+}
+
+static void CancelHookDrags() {
+    if (g_screenGrabState != SCREEN_GRAB_NONE)
+        EndScreenGrab(false);
+
+    if (s_xb1Dragging) {
+        s_xb1Dragging = false;
+        if (s_xb1OwnHold && theHold.Holding()) theHold.Cancel();
+    }
+    s_xb1OwnHold = false;
+    s_xb1Changed = false;
+    s_xb1BoolToggledV = false;
+    s_xb1BoolToggledH = false;
+
+    if (s_dragMode == DRAG_UVGRAB) {
+        RestoreActiveUVDrag();
+        if (s_uvOwnHold && theHold.Holding()) theHold.Cancel();
+        ResetUVDrag();
+    } else if (s_dragMode == DRAG_OPACITY) {
+        if (s_opacityOwnHold && theHold.Holding()) theHold.Cancel();
+    }
+    s_uvOwnHold = false;
+    s_opacityOwnHold = false;
+    s_opacityChanged = false;
+    s_dragMode = DRAG_NONE;
+    HideDragTip();
+}
+
 // ── Keyboard hook — Tab opens PowerShader when SME focused ──────
 static LRESULT CALLBACK KbHookProc(int nCode, WPARAM wp, LPARAM lp) {
-    if (nCode >= 0 && g_tabShader && wp == VK_TAB && !(lp & (1 << 31))) {
+    if (nCode >= 0 && g_enablePowerShader && g_tabShader && g_panel &&
+        wp == VK_TAB && !(lp & (1u << 31))) {
         // Key-down only (bit 31 = 0), ignore repeats (bit 30)
-        if (!(lp & (1 << 30)) && IsMaterialEditorFocused()) {
+        if (!(lp & (1u << 30)) && IsMaterialEditorFocused()) {
             PostMessage(g_panel, WM_PP_SHADER, 0, 0);
             return 1; // eat the Tab
         }
     }
-    if (nCode >= 0 && g_autoOrbitMode != AUTO_ORBIT_OFF && (lp & (1 << 31)) && g_panel) {
-        // Key-up: defer eval so hotkey-driven panel switch can complete first.
-        PostMessage(g_panel, WM_FS_ORBIT_EVAL, 0, 0);
+    if (nCode >= 0 && g_autoOrbitMode != AUTO_ORBIT_OFF && (lp & (1u << 31)) && g_panel) {
+        // Key-up: defer eval so a hotkey-driven panel/level switch can complete
+        // first. Skip while typing into our own value/favorite edit fields —
+        // those keystrokes can't change orbit state, and the timer + selection
+        // notifications already cover real scene changes.
+        HWND focus = GetFocus();
+        HWND root  = focus ? GetAncestor(focus, GA_ROOT) : nullptr;
+        if (root != g_panel && root != g_favWnd)
+            PostMessage(g_panel, WM_FS_ORBIT_EVAL, 0, 0);
     }
     return CallNextHookEx(g_kbHook, nCode, wp, lp);
 }
@@ -2697,6 +2875,12 @@ static bool SetPB2FloatSafe(IParamBlock2* pb, ParamID pid, ParamType2 type, Time
 static bool SetPB2IntSafe(IParamBlock2* pb, ParamID pid, ParamType2 type, TimeValue t, int value) {
     if (!IsWritableParam(pb, pid)) return false;
     pb->SetValue(pid, t, ClampPB2Int(pb, pid, type, value));
+    return true;
+}
+
+static bool SetPB2BoolSafe(IParamBlock2* pb, ParamID pid, TimeValue t, int value) {
+    if (!IsWritableParam(pb, pid)) return false;
+    pb->SetValue(pid, t, value ? 1 : 0);
     return true;
 }
 
@@ -3394,30 +3578,46 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     g_splineVals[idx] != 0.0f) {
                     TimeValue t = ip->GetTime();
                     SplineShape* ss = g_splineForButtons;
-                    theHold.Begin();
+                    const bool ownHold = !theHold.Holding();
+                    if (ownHold) theHold.Begin();
                     ss->SetFCLimit();
                     int spId = idx + kSpSentinel;
                     if (spId == kSpFillet)       { ss->BeginFilletMove(t); ss->FilletMove(t, g_splineVals[idx]); ss->EndFilletMove(t, TRUE); }
                     else if (spId == kSpChamfer) { ss->BeginChamferMove(t); ss->ChamferMove(t, g_splineVals[idx]); ss->EndChamferMove(t, TRUE); }
                     else if (spId == kSpOutline) { ss->BeginOutlineMove(t); ss->OutlineMove(t, g_splineVals[idx]); ss->EndOutlineMove(t, TRUE); }
                     else if (spId == kSpWeld)    { ss->SetEndPointAutoWeldThreshold(g_splineVals[idx]); ss->DoVertWeld(); }
-                    theHold.Accept(_T("Spline Op"));
+                    if (ownHold) theHold.Accept(_T("Spline Op"));
                     ip->RedrawViews(t);
                 }
             } else if (ef->pb) {
                 Interface* ip = GetCOREInterface();
                 TimeValue t = ip ? ip->GetTime() : 0;
-                theHold.Suspend();
-                if (IsFloat(ef->type))      ef->pb->SetValue(ef->id, t, (float)_wtof(txt));
-                else if (ef->type==TYPE_BOOL) ef->pb->SetValue(ef->id, t, (_wcsicmp(txt,_T("On"))==0||_wcsicmp(txt,_T("1"))==0)?1:0);
-                else                        ef->pb->SetValue(ef->id, t, _wtoi(txt));
-                theHold.Resume();
+                const bool ownHold = !theHold.Holding();
+                if (ownHold) theHold.Begin();
+                bool changed = false;
+                if (IsFloat(ef->type))
+                    changed = SetPB2FloatSafe(ef->pb, ef->id, ef->type, t, (float)_wtof(txt));
+                else if (ef->type == TYPE_BOOL)
+                    changed = SetPB2BoolSafe(ef->pb, ef->id, t,
+                        (_wcsicmp(txt,_T("On"))==0||_wcsicmp(txt,_T("1"))==0));
+                else
+                    changed = SetPB2IntSafe(ef->pb, ef->id, ef->type, t, _wtoi(txt));
+                if (ownHold) {
+                    if (changed) theHold.Accept(_T("Set Pinned Parameter"));
+                    else theHold.Cancel();
+                }
             } else {
                 std::wstring prop = PropFromKey(*ef);
                 std::wstring val(txt);
                 if (ef->type == (ParamType2)TYPE_BOOL) val = (_wcsicmp(txt,L"On")==0||_wcsicmp(txt,L"1")==0) ? L"true" : L"false";
                 std::wstring s = L"try(setProperty " + MsObjPath(*ef) + L" #" + prop + L" " + val + L")catch()";
-                ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
+                const bool ownHold = !theHold.Holding();
+                if (ownHold) theHold.Begin();
+                BOOL ok = ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
+                if (ownHold) {
+                    if (ok) theHold.Accept(_T("Set Pinned Parameter"));
+                    else theHold.Cancel();
+                }
             }
             NotifyParamChanged();
             InvalidateRect(g_panel, nullptr, FALSE);
@@ -3436,23 +3636,28 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         Interface* ip = GetCOREInterface();
         TimeValue t = ip ? ip->GetTime() : 0;
         if (ef->pb) {
-            theHold.Suspend();
+            const bool ownHold = !theHold.Holding();
+            if (ownHold) theHold.Begin();
+            bool changed = false;
             if (IsFloat(ef->type)) {
                 float cur = ef->pb->GetFloat(ef->id, t);
                 float a = cur<0?-cur:cur;
                 float sc = a>100.f?10.f:a>10.f?1.f:a>1.f?0.1f:0.01f;
                 if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
-                ef->pb->SetValue(ef->id, t, cur + step * sc);
+                changed = SetPB2FloatSafe(ef->pb, ef->id, ef->type, t, cur + step * sc);
             } else if (ef->type == TYPE_BOOL) {
-                ef->pb->SetValue(ef->id, t, ef->pb->GetInt(ef->id, t) ? 0 : 1);
+                changed = TogglePB2BoolSafe(ef->pb, ef->id, t);
             } else {
                 int cur = ef->pb->GetInt(ef->id, t);
                 int s = (int)step;
                 if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
                 if (s == 0) s = step>0?1:-1;
-                ef->pb->SetValue(ef->id, t, cur + s);
+                changed = SetPB2IntSafe(ef->pb, ef->id, ef->type, t, cur + s);
             }
-            theHold.Resume();
+            if (ownHold) {
+                if (changed) theHold.Accept(_T("Adjust Pinned Parameter"));
+                else theHold.Cancel();
+            }
         } else if (!ef->pb && (int)ef->id >= kSpSentinel && (int)ef->id < kSpSentinel + kSpCount) {
             // Spline op favorite — wheel adjust
             int idx = (int)ef->id - kSpSentinel;
@@ -3463,23 +3668,28 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else {
             // PB1 MaxScript path
             std::wstring prop = PropFromKey(*ef);
+            std::wstring script;
             if (ef->type == (ParamType2)TYPE_BOOL) {
-                std::wstring s = L"try(setProperty " + MsObjPath(*ef) + L" #" + prop +
+                script = L"try(setProperty " + MsObjPath(*ef) + L" #" + prop +
                     L" (not(getProperty " + MsObjPath(*ef) + L" #" + prop + L")))catch()";
-                ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
             } else if (IsFloat(ef->type)) {
-                std::wstring s = L"try(local v=getProperty " + MsObjPath(*ef) + L" #" + prop +
+                script = L"try(local v=getProperty " + MsObjPath(*ef) + L" #" + prop +
                     L";setProperty " + MsObjPath(*ef) + L" #" + prop + L" (v+" +
                     std::to_wstring(step) + L"*(if(abs v)>100 then 10 else if(abs v)>10 then 1 else if(abs v)>1 then 0.1 else 0.01)" +
                     (shift?L"*10":L"") + (ctrl?L"*0.1":L"") + L"))catch()";
-                ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
             } else {
                 int s = (int)step;
                 if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
                 if (s == 0) s = step>0?1:-1;
-                std::wstring sc = L"try(local v=getProperty " + MsObjPath(*ef) + L" #" + prop +
+                script = L"try(local v=getProperty " + MsObjPath(*ef) + L" #" + prop +
                     L";setProperty " + MsObjPath(*ef) + L" #" + prop + L" (v+" + std::to_wstring(s) + L"))catch()";
-                ExecuteMAXScriptScript(sc.c_str(), MAXScript::ScriptSource::Dynamic);
+            }
+            const bool ownHold = !theHold.Holding();
+            if (ownHold) theHold.Begin();
+            BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
+            if (ownHold) {
+                if (ok) theHold.Accept(_T("Adjust Pinned Parameter"));
+                else theHold.Cancel();
             }
         }
         NotifyParamChanged();
@@ -3498,6 +3708,7 @@ static int   g_favDragStartX = 0;
 static int   g_favDragAccum = 0;
 static bool  g_favDragChanged = false;
 static bool  g_favBoolToggled = false;
+static bool  g_favDragOwnHold = false;
 
 // ── Tool name overlay near cursor ────────────────────────────────
 static const TCHAR* GetCommandModeName(int mode) {
@@ -3525,13 +3736,18 @@ static LRESULT CALLBACK ToolTipProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT rc; GetClientRect(hwnd, &rc);
         HBRUSH bg = CreateSolidBrush(kBg); FillRect(hdc, &rc, bg); DeleteObject(bg);
         HPEN bp = CreatePen(PS_SOLID, 1, kAccent);
-        SelectObject(hdc, bp); SelectObject(hdc, (HBRUSH)GetStockObject(NULL_BRUSH));
-        Rectangle(hdc, 0, 0, rc.right, rc.bottom); DeleteObject(bp);
+        HPEN oldP = (HPEN)SelectObject(hdc, bp);
+        HBRUSH oldB = (HBRUSH)SelectObject(hdc, (HBRUSH)GetStockObject(NULL_BRUSH));
+        Rectangle(hdc, 0, 0, rc.right, rc.bottom);
         SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, kAccent);
-        SelectObject(hdc, g_fontBold);
+        HFONT oldF = (HFONT)SelectObject(hdc, g_fontBold);
         TCHAR txt[64]; GetWindowText(hwnd, txt, 64);
         RECT tr = { 6, 3, rc.right - 6, rc.bottom };
         DrawText(hdc, txt, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(hdc, oldF);
+        SelectObject(hdc, oldB);
+        SelectObject(hdc, oldP);
+        DeleteObject(bp);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -3727,9 +3943,10 @@ static bool RunSplineHeaderAction(const ActionBtn& action) {
     int id = (int)action.fnId;
     if (id >= kSplineButtonOpBase) {
         splineButtonOp op = (splineButtonOp)(id - kSplineButtonOpBase);
-        theHold.Begin();
+        const bool ownHold = !theHold.Holding();
+        if (ownHold) theHold.Begin();
         ops->ButtonOp(op);
-        theHold.Accept(_T("Spline Op"));
+        if (ownHold) theHold.Accept(_T("Spline Op"));
         if (ip) ip->RedrawViews(ip->GetTime());
     } else {
         ops->StartCommandMode((splineCommandMode)id);
@@ -3966,10 +4183,18 @@ paint_done:
 // ── Build / Rebuild layout ──────────────────────────────────────
 // ── Single active edit control ───────────────────────────────────
 static void KillActiveEdit(bool apply) {
-    if (!g_editHwnd) return;
-    if (apply && g_editParam >= 0 && g_editParam < (int)g_edits.size()) {
-        TCHAR txt[256]; GetWindowText(g_editHwnd, txt, 256);
-        auto& ef = g_edits[g_editParam];
+    HWND editHwnd = g_editHwnd;
+    int editParam = g_editParam;
+    if (!editHwnd) return;
+
+    // Destroying a focused edit can synchronously emit EN_KILLFOCUS. Detach
+    // global state first so that notification cannot re-enter and apply twice.
+    g_editHwnd = nullptr;
+    g_editParam = -1;
+
+    if (apply && editParam >= 0 && editParam < (int)g_edits.size()) {
+        TCHAR txt[256]; GetWindowText(editHwnd, txt, 256);
+        auto& ef = g_edits[editParam];
         // Spline op values (sentinel-marked IDs)
         if (!ef.pb && (int)ef.id >= kSpSentinel && (int)ef.id < kSpSentinel + kSpCount) {
             int idx = (int)ef.id - kSpSentinel;
@@ -3983,12 +4208,13 @@ static void KillActiveEdit(bool apply) {
                         TimeValue t = ip->GetTime();
                         int spId = idx + kSpSentinel;
                         if (spId == kSpFillet || spId == kSpChamfer) ss->SetFCLimit();
-                        theHold.Begin();
+                        const bool ownHold = !theHold.Holding();
+                        if (ownHold) theHold.Begin();
                         if (spId == kSpFillet)       { ss->BeginFilletMove(t); ss->FilletMove(t, g_splineVals[idx]); ss->EndFilletMove(t, TRUE); }
                         else if (spId == kSpChamfer) { ss->BeginChamferMove(t); ss->ChamferMove(t, g_splineVals[idx]); ss->EndChamferMove(t, TRUE); }
                         else if (spId == kSpOutline) { ss->BeginOutlineMove(t); ss->OutlineMove(t, g_splineVals[idx]); ss->EndOutlineMove(t, TRUE); }
                         else if (spId == kSpWeld)    { ss->SetEndPointAutoWeldThreshold(g_splineVals[idx]); ss->DoVertWeld(); }
-                        theHold.Accept(_T("Spline Op"));
+                        if (ownHold) theHold.Accept(_T("Spline Op"));
                         ss->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
                         ip->RedrawViews(t);
                     }
@@ -3997,12 +4223,18 @@ static void KillActiveEdit(bool apply) {
         } else if (ef.pb) {
             Interface* ip = GetCOREInterface();
             TimeValue t = ip ? ip->GetTime() : 0;
-            theHold.Suspend();
+            const bool ownHold = !theHold.Holding();
+            if (ownHold) theHold.Begin();
+            bool changed = false;
             if (g_epolyOp >= 0) {
                 // EPoly takeover — use cached PB directly (FindParam can't resolve op params)
-                if (IsFloat(ef.type))       ef.pb->SetValue(ef.id, t, (float)_wtof(txt));
-                else if (ef.type==TYPE_BOOL) ef.pb->SetValue(ef.id, t, (_wcsicmp(txt,_T("On"))==0||_wcsicmp(txt,_T("1"))==0||_wcsicmp(txt,_T("true"))==0)?1:0);
-                else                        ef.pb->SetValue(ef.id, t, _wtoi(txt));
+                if (IsFloat(ef.type))
+                    changed = SetPB2FloatSafe(ef.pb, ef.id, ef.type, t, (float)_wtof(txt));
+                else if (ef.type == TYPE_BOOL)
+                    changed = SetPB2BoolSafe(ef.pb, ef.id, t,
+                        (_wcsicmp(txt,_T("On"))==0||_wcsicmp(txt,_T("1"))==0||_wcsicmp(txt,_T("true"))==0));
+                else
+                    changed = SetPB2IntSafe(ef.pb, ef.id, ef.type, t, _wtoi(txt));
             } else {
                 // Normal params — apply to all selected nodes
                 for (int ni = 0; ni < (ip ? ip->GetSelNodeCount() : 0); ni++) {
@@ -4010,12 +4242,19 @@ static void KillActiveEdit(bool apply) {
                     if (!nd) continue;
                     IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
                     if (!FindParam(nd, ef.key, pb, pid, pt2)) continue;
-                    if (IsFloat(pt2))        pb->SetValue(pid, t, (float)_wtof(txt));
-                    else if (pt2==TYPE_BOOL) pb->SetValue(pid, t, (_wcsicmp(txt,_T("On"))==0||_wcsicmp(txt,_T("1"))==0||_wcsicmp(txt,_T("true"))==0)?1:0);
-                    else                     pb->SetValue(pid, t, _wtoi(txt));
+                    if (IsFloat(pt2))
+                        changed |= SetPB2FloatSafe(pb, pid, pt2, t, (float)_wtof(txt));
+                    else if (pt2 == TYPE_BOOL)
+                        changed |= SetPB2BoolSafe(pb, pid, t,
+                            (_wcsicmp(txt,_T("On"))==0||_wcsicmp(txt,_T("1"))==0||_wcsicmp(txt,_T("true"))==0));
+                    else
+                        changed |= SetPB2IntSafe(pb, pid, pt2, t, _wtoi(txt));
                 }
             }
-            theHold.Resume();
+            if (ownHold) {
+                if (changed) theHold.Accept(_T("Set Parameter"));
+                else theHold.Cancel();
+            }
             if (g_epolyPreview) EPolyRefresh();
             else                NotifyParamChanged();
         } else {
@@ -4026,13 +4265,17 @@ static void KillActiveEdit(bool apply) {
             std::wstring objPath = MsObjPath(ef);
             if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
             std::wstring script = L"for obj in selection do try(setProperty (obj" + objPath + L") #" + prop + L" " + val + L")catch()";
-            ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
+            const bool ownHold = !theHold.Holding();
+            if (ownHold) theHold.Begin();
+            BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
+            if (ownHold) {
+                if (ok) theHold.Accept(_T("Set Parameter"));
+                else theHold.Cancel();
+            }
             NotifyParamChanged();
         }
     }
-    DestroyWindow(g_editHwnd);
-    g_editHwnd = nullptr;
-    g_editParam = -1;
+    DestroyWindow(editHwnd);
     EnableAccelerators();
 }
 
@@ -4165,7 +4408,6 @@ static void BuildLayout() {
         RECT cur; GetWindowRect(g_panel, &cur);
         if (cur.right - cur.left > 1) { g_panelPos.x = cur.left; g_panelPos.y = cur.top; }
     }
-    g_freshOpen = false;
 
     UINT swpFlags = SWP_NOACTIVATE;
     if (!isVisible) swpFlags |= SWP_NOREDRAW;  // don't paint yet — fade handles it
@@ -4471,32 +4713,40 @@ static void RefreshFavoritesStrip() {
     }
 
     SetTimer(g_favWnd, 1, kRefreshMs, nullptr);
-    ShowWindow(g_favWnd, SW_SHOWNOACTIVATE);
-    InvalidateRect(g_favWnd, nullptr, TRUE);
-    UpdateWindow(g_favWnd);
+    if (!g_freshOpen) {
+        ShowWindow(g_favWnd, SW_SHOWNOACTIVATE);
+        InvalidateRect(g_favWnd, nullptr, TRUE);
+        UpdateWindow(g_favWnd);
+    }
 }
 
 static void CancelFavDrag() {
     if (!g_favDragging) return;
+    HWND capture = GetCapture();
     g_favDragging = false;
     g_favDragIdx = -1;
     g_favDragAccum = 0;
     g_favDragChanged = false;
     g_favBoolToggled = false;
-    theHold.Cancel();
+    if (capture == g_favWnd) ReleaseCapture();
+    if (g_favDragOwnHold && theHold.Holding()) theHold.Cancel();
+    g_favDragOwnHold = false;
     HideDragTip();
     SetCursor(LoadCursor(nullptr, IDC_ARROW));
 }
 
 static void CancelPanelValueDrag() {
     if (!g_lmbDragging) return;
+    HWND capture = GetCapture();
     g_lmbDragging = false;
     g_lmbDragIdx = -1;
     g_lmbDragAccum = 0;
     g_lmbDragMoved = false;
     g_lmbDragChanged = false;
     g_lmbBoolToggled = false;
-    theHold.Cancel();
+    if (capture == g_panel) ReleaseCapture();
+    if (g_lmbDragOwnHold && theHold.Holding()) theHold.Cancel();
+    g_lmbDragOwnHold = false;
     HideDragTip();
 }
 
@@ -4582,7 +4832,8 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 g_favDragChanged = false;
                 g_favBoolToggled = false;
                 SetCapture(hwnd);
-                theHold.Begin();
+                g_favDragOwnHold = !theHold.Holding();
+                if (g_favDragOwnHold) theHold.Begin();
                 SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
                 return 0;
             }
@@ -4637,8 +4888,11 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         g_favDragging = false;
         g_favDragIdx  = -1;
         ReleaseCapture();
-        if (g_favDragChanged) theHold.Accept(_T("Pin Drag"));
-        else theHold.Cancel();
+        if (g_favDragOwnHold && theHold.Holding()) {
+            if (g_favDragChanged) theHold.Accept(_T("Pin Drag"));
+            else theHold.Cancel();
+        }
+        g_favDragOwnHold = false;
         g_favDragChanged = false;
         g_favBoolToggled = false;
         HideDragTip();
@@ -4757,7 +5011,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_lmbDragChanged = false;
                     g_lmbBoolToggled = false;
                     SetCapture(hwnd);
-                    theHold.Begin();
+                    g_lmbDragOwnHold = !theHold.Holding();
+                    if (g_lmbDragOwnHold) theHold.Begin();
                 }
                 return 0;
             }
@@ -4977,16 +5232,18 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_lmbDragIdx  = -1;
             ReleaseCapture();
             if (moved && g_lmbDragChanged) {
-                theHold.Accept(_T("Param Drag"));
+                if (g_lmbDragOwnHold && theHold.Holding())
+                    theHold.Accept(_T("Param Drag"));
                 HideDragTip();
                 GatherParams(); BuildLayout();
                 RefreshFavoritesStrip();
             } else {
                 // No drag — treat as click, spawn edit box
-                theHold.Cancel();
+                if (g_lmbDragOwnHold && theHold.Holding()) theHold.Cancel();
                 if (!moved && idx >= 0 && idx < (int)g_edits.size())
                     SpawnEditAt(idx);
             }
+            g_lmbDragOwnHold = false;
             g_lmbDragChanged = false;
             g_lmbBoolToggled = false;
         }
@@ -5018,6 +5275,15 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
                 if (ef.pb) {
                     // PB2 — adjust on all selected nodes
+                    int intStep = 0;
+                    if (IsInt(ef.type)) {
+                        g_lmbDragAccum += dx;
+                        intStep = g_lmbDragAccum / 3;
+                        if (intStep != 0) {
+                            g_lmbDragAccum -= intStep * 3;
+                            if (shift) intStep *= 10;
+                        }
+                    }
                     for (int ni = 0; ni < selCount; ni++) {
                         INode* nd = ip->GetSelNode(ni);
                         if (!nd) continue;
@@ -5032,14 +5298,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             g_lmbDragChanged |= SetPB2FloatSafe(pb, pid, pt2, t, cur + (float)dx * sc);
                         } else if (pt2 == TYPE_BOOL && !g_lmbBoolToggled) {
                             g_lmbDragChanged |= TogglePB2BoolSafe(pb, pid, t);
-                        } else if (IsInt(pt2)) {
-                            g_lmbDragAccum += dx;
-                            int s = g_lmbDragAccum / 3;
-                            if (s != 0) {
-                                g_lmbDragAccum -= s * 3;
-                                if (shift) s *= 10;
-                                g_lmbDragChanged |= SetPB2IntSafe(pb, pid, pt2, t, pb->GetInt(pid, t) + s);
-                            }
+                        } else if (IsInt(pt2) && intStep != 0) {
+                            g_lmbDragChanged |= SetPB2IntSafe(
+                                pb, pid, pt2, t, pb->GetInt(pid, t) + intStep);
                         }
                     }
                     if (ef.type == TYPE_BOOL) g_lmbBoolToggled = true;
@@ -5200,7 +5461,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_splineVals[idx] += step * sc;
                 }
             } else if (ef.pb && ip) {
-                theHold.Suspend();
+                const bool ownHold = !theHold.Holding();
+                if (ownHold) theHold.Begin();
+                bool changed = false;
                 if (g_epolyOp >= 0) {
                     // EPoly takeover — use cached PB directly
                     if (IsFloat(ef.type)) {
@@ -5208,15 +5471,15 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         float a = cur<0?-cur:cur;
                         float sc = a>100.f?10.f:a>10.f?1.f:a>1.f?0.1f:0.01f;
                         if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
-                        ef.pb->SetValue(ef.id, t, cur + step * sc);
+                        changed = SetPB2FloatSafe(ef.pb, ef.id, ef.type, t, cur + step * sc);
                     } else if (ef.type == TYPE_BOOL) {
-                        ef.pb->SetValue(ef.id, t, ef.pb->GetInt(ef.id, t) ? 0 : 1);
+                        changed = TogglePB2BoolSafe(ef.pb, ef.id, t);
                     } else {
                         int cur = ef.pb->GetInt(ef.id, t);
                         int s = (int)step;
                         if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
                         if (s == 0) s = step>0?1:-1;
-                        ef.pb->SetValue(ef.id, t, cur + s);
+                        changed = SetPB2IntSafe(ef.pb, ef.id, ef.type, t, cur + s);
                     }
                 } else {
                     // Normal params — apply to all selected nodes
@@ -5230,19 +5493,22 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             float a = cur<0?-cur:cur;
                             float sc = a>100.f?10.f:a>10.f?1.f:a>1.f?0.1f:0.01f;
                             if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
-                            pb->SetValue(pid, t, cur + step * sc);
+                            changed |= SetPB2FloatSafe(pb, pid, pt2, t, cur + step * sc);
                         } else if (pt2 == TYPE_BOOL) {
-                            pb->SetValue(pid, t, pb->GetInt(pid, t) ? 0 : 1);
+                            changed |= TogglePB2BoolSafe(pb, pid, t);
                         } else {
                             int cur = pb->GetInt(pid, t);
                             int s = (int)step;
                             if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
                             if (s == 0) s = step>0?1:-1;
-                            pb->SetValue(pid, t, cur + s);
+                            changed |= SetPB2IntSafe(pb, pid, pt2, t, cur + s);
                         }
                     }
                 }
-                theHold.Resume();
+                if (ownHold) {
+                    if (changed) theHold.Accept(_T("Adjust Parameter"));
+                    else theHold.Cancel();
+                }
                 if (g_epolyPreview) EPolyRefresh();
                 else                NotifyParamChanged();
             } else if (!ef.pb) {
@@ -5250,10 +5516,13 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 std::wstring prop = PropFromKey(ef);
                 std::wstring objPath = MsObjPath(ef);
                 if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
+                const bool ownHold = !theHold.Holding();
+                if (ownHold) theHold.Begin();
+                BOOL ok = FALSE;
                 if (ef.type == (ParamType2)TYPE_BOOL) {
                     std::wstring script = L"for obj in selection do try(local o=obj" + objPath +
                         L";setProperty o #" + prop + L" (not (getProperty o #" + prop + L")))catch()";
-                    ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
+                    ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
                 } else if (IsFloat(ef.type)) {
                     std::wstring script = L"for obj in selection do try(local o=obj" + objPath +
                         L";local v=getProperty o #" + prop +
@@ -5262,7 +5531,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         L"(if (abs v)>100 then 10 else if (abs v)>10 then 1 else if (abs v)>1 then 0.1 else 0.01)" +
                         (shift ? L"*10" : L"") + (ctrl ? L"*0.1" : L"") +
                         L"))catch()";
-                    ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
+                    ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
                 } else {
                     int s = (int)step;
                     if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
@@ -5271,7 +5540,11 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         L";local v=getProperty o #" + prop +
                         L";setProperty o #" + prop + L" (v+" +
                         std::to_wstring(s) + L"))catch()";
-                    ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
+                    ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
+                }
+                if (ownHold) {
+                    if (ok) theHold.Accept(_T("Adjust Parameter"));
+                    else theHold.Cancel();
                 }
                 NotifyParamChanged();
             }
@@ -5377,9 +5650,18 @@ static void OpenPanel() {
     PositionBtnStrips();
     RefreshFavoritesStrip();
 
-    // Fade in panel with companions (button strips, fav strip)
-    HWND fadeComps[] = { g_btnLeft, g_favWnd, g_btnRight };
-    FadeIn(g_panel, fadeComps, 3);
+    // Fade in only populated/active companions. Empty 1x1 helper windows must
+    // remain hidden, and every shown companion is layered before first paint.
+    HWND fadeComps[3] = {};
+    int fadeCompCount = 0;
+    if (g_btnLeft && g_ctx != CTX_NONE && g_showSubObj && IsModifyMode())
+        fadeComps[fadeCompCount++] = g_btnLeft;
+    if (g_favWnd && !g_favEdits.empty())
+        fadeComps[fadeCompCount++] = g_favWnd;
+    if (g_btnRight && !g_quickMods.empty())
+        fadeComps[fadeCompCount++] = g_btnRight;
+    FadeIn(g_panel, fadeComps, fadeCompCount);
+    g_freshOpen = false;
     SetTimer(g_panel, 1, kRefreshMs, nullptr);
     if (g_favWnd && !g_favEdits.empty())
         SetTimer(g_favWnd, 1, kRefreshMs, nullptr);
@@ -5432,7 +5714,12 @@ static void ClosePanel() {
 
     KillTimer(g_panel, 1);
     KillActiveEdit(false);
-    if (g_lmbDragging) { g_lmbDragging = false; g_lmbDragIdx = -1; g_lmbDragChanged = false; g_lmbBoolToggled = false; ReleaseCapture(); theHold.Cancel(); HideDragTip(); }
+    CancelPanelValueDrag();
+    CancelFavDrag();
+    if (g_mmDragging) {
+        g_mmDragging = false;
+        if (GetCapture() == g_panel) ReleaseCapture();
+    }
     g_visEditMode = false;
     g_hoverParam = -1;
     g_edits.clear();
@@ -5457,6 +5744,38 @@ static void TogglePanel() {
 }
 
 // ── Action system ───────────────────────────────────────────────
+static void ReloadSettingsLive() {
+    LoadSettings();
+
+    // Theme colors are plain COLORREF values; recreate the two brushes that
+    // are retained for edit-control paint messages.
+    if (g_panel) {
+        if (g_brEdit) DeleteObject(g_brEdit);
+        if (g_brEditFoc) DeleteObject(g_brEditFoc);
+        g_brEdit = CreateSolidBrush(kEditBg);
+        g_brEditFoc = CreateSolidBrush(kEditFocus);
+    }
+
+    if (!g_enablePowerShader && PowerShader::IsOpen())
+        PowerShader::Toggle();
+
+    if (!g_open) return;
+    if (!g_enablePowerParams) {
+        ClosePanel();
+        return;
+    }
+
+    KillActiveEdit(false);
+    GatherParams();
+    BuildLayout();
+    RefreshFavoritesStrip();
+    PositionBtnStrips();
+    InvalidateRect(g_panel, nullptr, TRUE);
+    if (g_btnLeft) InvalidateRect(g_btnLeft, nullptr, TRUE);
+    if (g_btnRight) InvalidateRect(g_btnRight, nullptr, TRUE);
+    if (g_favWnd) InvalidateRect(g_favWnd, nullptr, TRUE);
+}
+
 class PPAction : public ActionItem {
 public:
     int   GetId() override { return kToggleId; }
@@ -5470,10 +5789,26 @@ public:
     BOOL  IsEnabled() override { return TRUE; }
     void  DeleteThis() override {}
 };
+
+class ReloadSettingsAction : public ActionItem {
+public:
+    int   GetId() override { return kReloadSettingsId; }
+    BOOL  ExecuteAction() override { ReloadSettingsLive(); return TRUE; }
+    void  GetButtonText(MSTR& t) override { t = _T("FlowState: Reload Settings"); }
+    void  GetMenuText(MSTR& t) override { t = _T("FlowState: Reload Settings"); }
+    void  GetDescriptionText(MSTR& t) override { t = _T("Reload FlowState settings from disk"); }
+    void  GetCategoryText(MSTR& t) override { t = PPARAM_NAME; }
+    BOOL  IsChecked() override { return FALSE; }
+    BOOL  IsItemVisible() override { return FALSE; }
+    BOOL  IsEnabled() override { return TRUE; }
+    void  DeleteThis() override {}
+};
+
 class PPActionCB : public ActionCallback {
 public:
     BOOL ExecuteAction(int id) override {
         if (id == kToggleId) { TogglePanel(); return TRUE; }
+        if (id == kReloadSettingsId) { ReloadSettingsLive(); return TRUE; }
         return DispatchOrbitAction(id);
     }
 };
@@ -5496,15 +5831,16 @@ public:
 };
 
 static PPAction   g_action;
+static ReloadSettingsAction g_reloadSettingsAction;
 static PPActionCB g_actionCB;
 
 static OrbitAction g_orbitActions[] = {
     { kOrbitCycleId,   _T("FlowState: Cycle Auto Orbit") },
     { kAutoOffId,      _T("FlowState: Auto Orbit Off") },
     { kAutoStandardId, _T("FlowState: Auto Orbit") },
-    { kAutoSelectedId, _T("FlowState: Auto Selected") },
-    { kAutoPOIId,      _T("FlowState: Auto POI") },
-    { kAutoDynamicId,  _T("FlowState: Auto Dynamic POI") },
+    { kAutoSelectedId, _T("FlowState: Auto Orbit Selected") },
+    { kAutoPOIId,      _T("FlowState: Auto Orbit POI") },
+    { kAutoDynamicId,  _T("FlowState: Auto Orbit Dynamic POI") },
     { kSetOrbitId,     _T("FlowState: Set Orbit") },
     { kSetSelectedId,  _T("FlowState: Set Orbit Selected") },
     { kSetSubObjectId, _T("FlowState: Set Orbit SubObject") },
@@ -5512,10 +5848,18 @@ static OrbitAction g_orbitActions[] = {
 };
 
 static ActionTable* MakeActionTable() {
+    static bool contextRegistered = false;
+    if (!contextRegistered) {
+        if (Interface* ip = GetCOREInterface()) {
+            if (IActionManager* am = ip->GetActionManager())
+                contextRegistered = am->RegisterActionContext(kContextId, PPARAM_NAME) != FALSE;
+        }
+    }
     static ActionTable table(kTableId, kContextId, TSTR(PPARAM_NAME));
     static bool init = false;
     if (!init) {
         table.AppendOperation(&g_action);
+        table.AppendOperation(&g_reloadSettingsAction);
         for (OrbitAction& a : g_orbitActions) table.AppendOperation(&a);
         init = true;
     }
@@ -5527,7 +5871,6 @@ class PowerParamsGUP : public GUP {
 public:
     DWORD Start() override {
         LoadSettings();
-        LoadModuleFlags();
 
         WNDCLASSEX wc = {};
         wc.cbSize = sizeof(wc);
@@ -5557,8 +5900,9 @@ public:
         g_btnLeft  = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED,
             kBtnStripClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
         SetLayeredWindowAttributes(g_btnLeft, 0, 255, LWA_ALPHA);
-        g_btnRight = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
+        g_btnRight = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED,
             kBtnStripClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
+        SetLayeredWindowAttributes(g_btnRight, 0, 255, LWA_ALPHA);
 
         // Favorites strip window
         WNDCLASSEX wcF = {};
@@ -5583,40 +5927,78 @@ public:
         g_toolTip = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
             kToolTipClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
 
-        IActionManager* am = GetCOREInterface()->GetActionManager();
+        if (!g_panel || !g_btnLeft || !g_btnRight || !g_favWnd || !g_toolTip ||
+            !g_font || !g_fontBold || !g_brEdit || !g_brEditFoc) {
+            Stop();
+            return GUPRESULT_NOKEEP;
+        }
+
+        // Constructing the table registers its context; ClassDesc exposes it
+        // to Max and Start only binds the callback.
+        Interface* core = GetCOREInterface();
+        IActionManager* am = core ? core->GetActionManager() : nullptr;
         if (am) {
-            am->RegisterActionContext(kContextId, PPARAM_NAME);
-            am->RegisterActionTable(MakeActionTable());
+            MakeActionTable();
             am->ActivateActionTable(&g_actionCB, kTableId);
         }
         g_mouseHook = SetWindowsHookEx(WH_MOUSE, MouseHookProc, nullptr, GetCurrentThreadId());
         g_kbHook    = SetWindowsHookEx(WH_KEYBOARD, KbHookProc, nullptr, GetCurrentThreadId());
+        if (!g_mouseHook || !g_kbHook) {
+            Stop();
+            return GUPRESULT_NOKEEP;
+        }
 
-        PowerShader::Init(hInstance, g_lightTheme);
-        ModStack::Init(hInstance, g_lightTheme);
+        if (!PowerShader::Init(hInstance, g_lightTheme) ||
+            !ModStack::Init(hInstance, g_lightTheme)) {
+            Stop();
+            return GUPRESULT_NOKEEP;
+        }
 
         return GUPRESULT_KEEP;
     }
 
     void Stop() override {
-        SetAutoOrbitMode(AUTO_ORBIT_OFF);
-        ModStack::Shutdown();
-        PowerShader::Shutdown();
-        if (g_screenGrabState != SCREEN_GRAB_NONE)
-            EndScreenGrab(false);
+        DisableAutoSilent();
+        CancelHookDrags();
+        if (Interface* ip = GetCOREInterface()) {
+            if (IActionManager* am = ip->GetActionManager())
+                am->DeactivateActionTable(&g_actionCB, kTableId);
+        }
         if (g_kbHook)    { UnhookWindowsHookEx(g_kbHook);    g_kbHook = nullptr; }
         if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+        ModStack::Shutdown();
+        PowerShader::Shutdown();
         ClosePanel();
         if (g_btnLeft)  { DestroyWindow(g_btnLeft);  g_btnLeft = nullptr; }
         if (g_btnRight) { DestroyWindow(g_btnRight); g_btnRight = nullptr; }
         if (g_favWnd)   { DestroyFavEdits(); DestroyWindow(g_favWnd); g_favWnd = nullptr; }
         if (g_toolTip)  { DestroyWindow(g_toolTip); g_toolTip = nullptr; }
         if (g_panel)    { DestroyWindow(g_panel);  g_panel = nullptr; }
+        if (g_osdWnd) {
+            KillTimer(g_osdWnd, 1);
+            DestroyWindow(g_osdWnd);
+            g_osdWnd = nullptr;
+        }
+        if (g_dragTip) { DestroyWindow(g_dragTip); g_dragTip = nullptr; }
         if (g_font)     { DeleteObject(g_font);     g_font = nullptr; }
         if (g_fontBold) { DeleteObject(g_fontBold); g_fontBold = nullptr; }
+        if (g_fontTiny) { DeleteObject(g_fontTiny); g_fontTiny = nullptr; }
+        if (g_tipFont)  { DeleteObject(g_tipFont);  g_tipFont = nullptr; }
+        if (g_tipBg)    { DeleteObject(g_tipBg);    g_tipBg = nullptr; }
         if (g_brEdit)   { DeleteObject(g_brEdit);   g_brEdit = nullptr; }
         if (g_brEditFoc){ DeleteObject(g_brEditFoc); g_brEditFoc = nullptr; }
         UnregisterClass(kWndClass, hInstance);
+        UnregisterClass(kBtnStripClass, hInstance);
+        UnregisterClass(kFavClass, hInstance);
+        UnregisterClass(kToolTipClass, hInstance);
+        if (g_osdClassRegistered) {
+            UnregisterClass(_T("FlowStateOSD"), hInstance);
+            g_osdClassRegistered = false;
+        }
+        if (g_dragTipClassRegistered) {
+            UnregisterClass(_T("FlowStateDragTip"), hInstance);
+            g_dragTipClassRegistered = false;
+        }
     }
 
     void      DeleteThis() override { delete this; }
@@ -5641,7 +6023,8 @@ public:
 
 static PPClassDesc ppDesc;
 
-ClassDesc* GetPrecisionCutClassDesc();
+// PrecisionCut is intentionally excluded from release builds until its crash
+// paths are fixed. To re-enable it, restore its CMake sources and class export.
 ClassDesc* GetNormalizePolyDesc();
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
@@ -5654,12 +6037,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return PPARAM_NAME; }
-__declspec(dllexport) int          LibNumberClasses()  { return 3; }
+__declspec(dllexport) int          LibNumberClasses()  { return 2; }
 __declspec(dllexport) ClassDesc*   LibClassDesc(int i) {
     switch (i) {
     case 0: return &ppDesc;
-    case 1: return GetPrecisionCutClassDesc();
-    case 2: return GetNormalizePolyDesc();
+    case 1: return GetNormalizePolyDesc();
     default: return nullptr;
     }
 }

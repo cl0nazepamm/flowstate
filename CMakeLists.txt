@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(FlowStateSuite VERSION 1.0.0 LANGUAGES CXX RC)
+project(FlowStateSuite VERSION 1.3.0 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -71,17 +71,6 @@ add_library(FlowState SHARED
     src/modstack.cpp
     src/modstack.h
     src/FlowState.def
-    src/precisioncut/dllmain.cpp
-    src/precisioncut/MeshCutter.cpp
-    src/precisioncut/MeshCutter.h
-    src/precisioncut/PrecisionCut.rc
-    src/precisioncut/PrecisionCutDesc.h
-    src/precisioncut/PrecisionCutMod.cpp
-    src/precisioncut/PrecisionCutMod.h
-    src/precisioncut/SplineProjector.cpp
-    src/precisioncut/SplineProjector.h
-    src/precisioncut/DebugLog.h
-    src/precisioncut/resource.h
     src/normalize_edges/f2_extend_tool.cpp
     src/normalize_edges/normalize_poly.cpp
     src/normalize_edges/normalize_poly.rc
@@ -93,7 +82,6 @@ configure_max_plugin(FlowState FlowState gup)
 target_include_directories(FlowState PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/precisioncut"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/normalize_edges"
 )
 target_link_libraries(FlowState PRIVATE
@@ -113,3 +101,12 @@ target_link_libraries(FlowState PRIVATE
 if(MSVC)
     target_compile_options(FlowState PRIVATE /EHa /O2 /fp:fast /openmp)
 endif()
+
+# Keep the two release deliverables together in the selected configuration
+# directory (for example build/Release/).
+add_custom_command(TARGET FlowState POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/macros/flowstate_config.ms"
+        "$<TARGET_FILE_DIR:FlowState>/flowstate_config.ms"
+    VERBATIM
+)
