@@ -335,7 +335,7 @@ private:
             SetBkMode(hdc, TRANSPARENT);
             HFONT oldF = (HFONT)SelectObject(hdc, Theme::fontBold);
             SetTextColor(hdc, Theme::accent);
-            constexpr wchar_t title[] = L"Modifier Stack";
+            constexpr wchar_t title[] = L"Macro Search";
             TextOutW(hdc, 10, 10, title, static_cast<int>(_countof(title) - 1));
 
             if (self->hoverClose_) {
@@ -509,7 +509,7 @@ private:
             hInstance, nullptr);
         SendMessageW(edit_, WM_SETFONT, reinterpret_cast<WPARAM>(Theme::fontBold), TRUE);
         SendMessageW(edit_, EM_SETCUEBANNER, TRUE,
-            reinterpret_cast<LPARAM>(L"Search modifiers...  (DEL = remove top)"));
+            reinterpret_cast<LPARAM>(L"Search macros..."));
         SetWindowSubclass(edit_, EditProc, 1, reinterpret_cast<DWORD_PTR>(this));
         y += 28;
 
@@ -820,7 +820,7 @@ private:
         SendMessageW(list_, WM_SETREDRAW, TRUE, 0);
         RedrawWindow(list_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
 
-        SetStatus(std::to_wstring(filtered_.size()) + L" modifiers" +
+        SetStatus(std::to_wstring(filtered_.size()) + L" macros" +
             (q.empty() ? L"" : (L"  |  " + q)));
     }
 
