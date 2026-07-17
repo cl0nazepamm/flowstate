@@ -22,6 +22,8 @@
 #include <windowsx.h>
 #include "powershader.h"
 #include "modstack.h"
+#include "normalize_edges/normalize_poly.h"
+#include "modifiers/loop_subdivision/loop_subdivision.h"
 #include <cmath>
 #include <string>
 #include <vector>
@@ -744,7 +746,7 @@ struct EditField {
     HWND         hwnd = nullptr;   // only used by favorites strip
     std::wstring label;
     std::wstring key;
-    std::wstring msPath;  // MaxScript object path for PB1 params (e.g. "$.modifiers[2]")
+    std::wstring msPath;  // MaxScript path suffix for PB1 params (e.g. ".modifiers[2]")
     int          keyOrdinal = 0;
     IParamBlock2* pb  = nullptr;
     ParamID      id   = 0;
@@ -1035,9 +1037,10 @@ static bool  g_lmbDragChanged = false;
 static bool  g_lmbBoolToggled = false;
 static bool  g_lmbDragOwnHold = false;
 
-// Module enable flags (read from FlowState.ini)
+// Module and input enable flags (read from FlowState.cfg)
 static bool g_enablePowerParams = true;
 static bool g_enablePowerShader = true;
+static bool g_enableSideKeys    = true;
 
 struct QuickMod {
     std::wstring internalName;
@@ -1828,6 +1831,37 @@ static std::wstring PropFromKey(const EditField& ef);
 static bool FindParam(INode* node, const std::wstring& key,
                       IParamBlock2*& outPB, ParamID& outID, ParamType2& outType);
 
+// PB1 objects (including Rectangle and the other SimpleShape primitives) are
+// reflected through MAXScript.  `$` is a node for one selected object but an
+// ObjectSet for multiple objects, so never use it as the read/schema anchor.
+// Store only the path suffix and explicitly choose either selection[1] for
+// display/schema reads or the current loop variable for per-object writes.
+static std::wstring MsPathSuffix(const std::wstring& path) {
+    if (path.empty()) return L".baseObject";
+    if (path[0] == L'$') return path.substr(1);
+    static const std::wstring firstPrefix = L"selection[1]";
+    if (path.compare(0, firstPrefix.size(), firstPrefix) == 0)
+        return path.substr(firstPrefix.size());
+    return path[0] == L'.' ? path : L"." + path;
+}
+
+static std::wstring MsFirstSelectedPath(const std::wstring& path) {
+    return L"selection[1]" + MsPathSuffix(path);
+}
+
+static std::wstring MsPerSelectedPath(const std::wstring& path) {
+    return L"obj" + MsPathSuffix(path);
+}
+
+// Match FindParam's PB2 behavior: the first selected object defines the
+// schema, and only selected targets with the same object/modifier class are
+// edited.  This prevents a Rectangle width edit from leaking into an
+// unrelated selected class that happens to expose a property with that name.
+static std::wstring MsSameClassFilter(const std::wstring& path) {
+    return L" where (try((classof " + MsPerSelectedPath(path) +
+        L") == (classof " + MsFirstSelectedPath(path) + L"))catch(false))";
+}
+
 static void ShowOSD(const std::wstring& text) {
     HWND maxWnd = GetCOREInterface() ? GetCOREInterface()->GetMAXHWnd() : nullptr;
     if (!maxWnd) return;
@@ -2010,10 +2044,11 @@ static void SaveSettings() {
     FILE* f = _wfopen(tmpPath.c_str(), L"w");
     if (!f) return;
 
-    // [config] — module flags & XB1 assignments
+    // [config] — module/input flags & XB1 assignments
     fwprintf(f, L"[config]\n");
     if (!g_enablePowerParams) fwprintf(f, L"PowerParams=0\n");
     if (!g_enablePowerShader) fwprintf(f, L"PowerShader=0\n");
+    if (!g_enableSideKeys)    fwprintf(f, L"SideKeys=0\n");
     if (g_showSubObj)         fwprintf(f, L"SubObjToggles=1\n");
     if (!g_tabShader)         fwprintf(f, L"TabShader=0\n");
     if (g_lightTheme)         fwprintf(f, L"LightTheme=1\n");
@@ -2069,6 +2104,7 @@ static void NormalizeKeymap() {
 static void LoadSettings() {
     g_enablePowerParams = true;
     g_enablePowerShader = true;
+    g_enableSideKeys = true;
     g_showSubObj = false;
     g_tabShader = true;
     g_lightTheme = false;
@@ -2132,6 +2168,7 @@ static void LoadSettings() {
         if (sec == SEC_CONFIG) {
             if (l == L"PowerParams=0")   g_enablePowerParams = false;
             if (l == L"PowerShader=0")   g_enablePowerShader = false;
+            if (l == L"SideKeys=0")      g_enableSideKeys = false;
             if (l == L"SubObjToggles=1") g_showSubObj = true;
             if (l == L"TabShader=0")     g_tabShader = false;
             if (l == L"LightTheme=1")    g_lightTheme = true;
@@ -2237,6 +2274,11 @@ static bool  s_uvOwnHold = false;
 
 static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     if (nCode < 0) return CallNextHookEx(g_mouseHook, nCode, wp, lp);
+
+    // Master opt-out: never consume or act on either mouse side button.
+    // The mouse hook remains installed for panel outside-click handling.
+    if (!g_enableSideKeys && (wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP))
+        return CallNextHookEx(g_mouseHook, nCode, wp, lp);
 
     MOUSEHOOKSTRUCT* ms = (MOUSEHOOKSTRUCT*)lp;
 
@@ -2404,9 +2446,9 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                 size_t sep = slot.key.find(L':');
                 if (sep != std::wstring::npos) {
                     std::wstring prop = slot.key.substr(sep + 1);
-                    std::wstring objPath = slot.msPath;
-                    if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
-                    std::wstring sc2 = L"for obj in selection do try(local o=obj" + objPath +
+                    std::wstring objPath = MsPerSelectedPath(slot.msPath);
+                    std::wstring sc2 = L"for obj in selection" + MsSameClassFilter(slot.msPath) +
+                        L" do try(local o=" + objPath +
                         L";local v=getProperty o #" + prop +
                         L";setProperty o #" + prop + L" (v+" + std::to_wstring(inc) + L"))catch()";
                     if (ExecuteMAXScriptScript(sc2.c_str(), MAXScript::ScriptSource::Dynamic)) {
@@ -2615,13 +2657,13 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                                         if (!mod) continue;
                                         MSTR mcn; mod->GetClassName(mcn, false);
                                         if (mcn.data() && _wcsicmp(mcn.data(), cls.c_str()) == 0) {
-                                            slot.msPath = L"$.modifiers[" + std::to_wstring(mi+1) + L"]";
+                                            slot.msPath = L".modifiers[" + std::to_wstring(mi+1) + L"]";
                                             return;
                                         }
                                     }
                                     walk = dv->GetObjRef();
                                 }
-                                slot.msPath = L"$.baseObject";
+                                slot.msPath = L".baseObject";
                             }
                         };
                         resolveSlot(g_xb1V);
@@ -2638,7 +2680,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                                 size_t sep = slot.key.find(L':');
                                 if (sep != std::wstring::npos) {
                                     std::wstring prop = slot.key.substr(sep + 1);
-                                    std::wstring path = slot.msPath.empty() ? L"$.baseObject" : slot.msPath;
+                                    std::wstring path = MsFirstSelectedPath(slot.msPath);
                                     std::wstring s = L"try((getProperty " + path + L" #" + prop + L") as string)catch(\"0\")";
                                     FPValue r; ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &r);
                                     if (r.type == TYPE_STRING && r.s) slot.displayVal = (float)_wtof(r.s);
@@ -2929,7 +2971,7 @@ static void AddSplineShapeExtraParams(ReferenceTarget* obj,
                                       const std::wstring& groupTitle,
                                       int& total) {
     if (!obj || obj->ClassID() != splineShapeClassID) return;
-    AddScriptedIntParam(groupTitle, L"steps", L"Interpolation", L"$.baseObject", total);
+    AddScriptedIntParam(groupTitle, L"steps", L"Interpolation", L".baseObject", total);
 }
 
 // Find a param on the current node by its persistent key (ClassName:ParamName)
@@ -3179,7 +3221,7 @@ static void CollectAllParams(ReferenceTarget* obj, const std::wstring& groupTitl
     }
     // Fallback 2: legacy objects (PB1) — use MaxScript property enumeration
     if (found == 0 && tot < kMaxParams) {
-        // Determine MaxScript path: modifier → $.modifiers[N], base → $.baseObject
+        // Determine node-relative MaxScript path: modifier → .modifiers[N], base → .baseObject
         std::wstring msPath;
         if (obj->SuperClassID() == OSM_CLASS_ID || obj->SuperClassID() == WSM_CLASS_ID) {
             Interface* ipM = GetCOREInterface();
@@ -3190,7 +3232,7 @@ static void CollectAllParams(ReferenceTarget* obj, const std::wstring& groupTitl
                     IDerivedObject* d = static_cast<IDerivedObject*>(walk);
                     for (int mi = 0; mi < d->NumModifiers(); mi++)
                         if (d->GetModifier(mi) == (Modifier*)obj) {
-                            msPath = L"$.modifiers[" + std::to_wstring(mi + 1) + L"]";
+                            msPath = L".modifiers[" + std::to_wstring(mi + 1) + L"]";
                             break;
                         }
                     if (!msPath.empty()) break;
@@ -3199,12 +3241,12 @@ static void CollectAllParams(ReferenceTarget* obj, const std::wstring& groupTitl
             }
             if (msPath.empty()) return;
         } else {
-            msPath = L"$.baseObject";
+            msPath = L".baseObject";
         }
 
         // Build a MaxScript that returns "propName|type|value\n" for each numeric property
         std::wstring script =
-            L"try(local s=\"\"; local o=" + msPath + L"; "
+            L"try(local s=\"\"; local o=" + MsFirstSelectedPath(msPath) + L"; "
             L"for p in (getPropNames o) do ("
             L"try(local v=getProperty o p; local c=classof v; "
             L"if c==Float or c==Integer or c==BooleanClass do ("
@@ -3561,7 +3603,7 @@ static void GatherParams() {
 
 // MaxScript object path for PB1 params
 static std::wstring MsObjPath(const EditField& ef) {
-    return ef.msPath.empty() ? L"$.baseObject" : ef.msPath;
+    return MsPathSuffix(ef.msPath);
 }
 
 // Extract property name from key "ClassName:propName"
@@ -3579,7 +3621,7 @@ static void FormatValue(const EditField& ef, TimeValue t, TCHAR* buf, int len) {
     // MaxScript-based params (legacy PB1 objects)
     if (!ef.pb) {
         std::wstring prop = PropFromKey(ef);
-        std::wstring path = ef.msPath.empty() ? L"$.baseObject" : ef.msPath;
+        std::wstring path = MsFirstSelectedPath(ef.msPath);
         std::wstring script = L"try((getProperty " + path + L" #" + prop + L") as string)catch(\"--\")";
         FPValue result;
         BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic,
@@ -3602,8 +3644,8 @@ static void FormatValue(const EditField& ef, TimeValue t, TCHAR* buf, int len) {
 static void NotifyParamChanged() {
     Interface* ip = GetCOREInterface();
     if (!ip) return;
-    if (ip->GetSelNodeCount() > 0) {
-        INode* node = ip->GetSelNode(0);
+    for (int ni = 0; ni < ip->GetSelNodeCount(); ++ni) {
+        INode* node = ip->GetSelNode(ni);
         if (node) { node->InvalidateWS(); node->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE); }
     }
     ip->RedrawViews(ip->GetTime());
@@ -3711,9 +3753,9 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 std::wstring val(txt);
                 if (ef->type == (ParamType2)TYPE_BOOL)
                     val = (_wcsicmp(txt,L"On")==0||_wcsicmp(txt,L"1")==0||_wcsicmp(txt,L"true")==0) ? L"true" : L"false";
-                std::wstring objPath = MsObjPath(*ef);
-                if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
-                std::wstring s = L"for obj in selection do try(setProperty (obj" + objPath +
+                std::wstring objPath = MsPerSelectedPath(ef->msPath);
+                std::wstring s = L"for obj in selection" + MsSameClassFilter(ef->msPath) +
+                    L" do try(setProperty (" + objPath +
                     L") #" + prop + L" " + val + L")catch()";
                 const bool ownHold = !theHold.Holding();
                 if (ownHold) theHold.Begin();
@@ -3757,14 +3799,15 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else {
             // PB1 MaxScript path
             std::wstring prop = PropFromKey(*ef);
-            std::wstring objPath = MsObjPath(*ef);
-            if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
+            std::wstring objPath = MsPerSelectedPath(ef->msPath);
             std::wstring script;
             if (ef->type == (ParamType2)TYPE_BOOL) {
-                script = L"for obj in selection do try(local o=obj" + objPath +
+                script = L"for obj in selection" + MsSameClassFilter(ef->msPath) +
+                    L" do try(local o=" + objPath +
                     L";setProperty o #" + prop + L" (not (getProperty o #" + prop + L")))catch()";
             } else if (IsFloat(ef->type)) {
-                script = L"for obj in selection do try(local o=obj" + objPath +
+                script = L"for obj in selection" + MsSameClassFilter(ef->msPath) +
+                    L" do try(local o=" + objPath +
                     L";local v=getProperty o #" + prop +
                     L";setProperty o #" + prop + L" (v+" +
                     std::to_wstring(step) + L"*(if(abs v)>100 then 10 else if(abs v)>10 then 1 else if(abs v)>1 then 0.1 else 0.01)" +
@@ -3773,7 +3816,8 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 int s = (int)step;
                 if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
                 if (s == 0) s = step>0?1:-1;
-                script = L"for obj in selection do try(local o=obj" + objPath +
+                script = L"for obj in selection" + MsSameClassFilter(ef->msPath) +
+                    L" do try(local o=" + objPath +
                     L";local v=getProperty o #" + prop +
                     L";setProperty o #" + prop + L" (v+" + std::to_wstring(s) + L"))catch()";
             }
@@ -4355,9 +4399,9 @@ static void KillActiveEdit(bool apply) {
             std::wstring prop = PropFromKey(ef);
             std::wstring val(txt);
             if (ef.type == (ParamType2)TYPE_BOOL) val = (_wcsicmp(txt,L"On")==0||_wcsicmp(txt,L"1")==0||_wcsicmp(txt,L"true")==0) ? L"true" : L"false";
-            std::wstring objPath = MsObjPath(ef);
-            if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
-            std::wstring script = L"for obj in selection do try(setProperty (obj" + objPath + L") #" + prop + L" " + val + L")catch()";
+            std::wstring objPath = MsPerSelectedPath(ef.msPath);
+            std::wstring script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                L" do try(setProperty (" + objPath + L") #" + prop + L" " + val + L")catch()";
             const bool ownHold = !theHold.Holding();
             if (ownHold) theHold.Begin();
             BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
@@ -4706,7 +4750,7 @@ static void BuildFavorites() {
                         ef.label = ge.label;
                         ef.key = key; ef.pb = nullptr; ef.id = ge.id;
                         ef.type = ge.type; ef.hwnd = nullptr;
-                        ef.msPath = ge.msPath.empty() ? L"$.baseObject" : ge.msPath;
+                        ef.msPath = MsPathSuffix(ge.msPath);
                         g_favEdits.push_back(std::move(ef));
                         found = true; break;
                     }
@@ -4950,17 +4994,17 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         } else if ((int)ef.id < kSpSentinel || (int)ef.id >= kSpSentinel + kSpCount) {
             // PB1 fallback — mirror the main parameter panel's multi-object scrub.
             std::wstring prop = PropFromKey(ef);
-            std::wstring objPath = MsObjPath(ef);
-            if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
+            std::wstring objPath = MsPerSelectedPath(ef.msPath);
             std::wstring script;
             if (ef.type == (ParamType2)TYPE_BOOL) {
                 if (!g_favBoolToggled) {
-                    script = L"for obj in selection do try(local o=obj" + objPath +
+                    script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                        L" do try(local o=" + objPath +
                         L";setProperty o #" + prop + L" (not (getProperty o #" + prop + L")))catch()";
                     g_favBoolToggled = true;
                 }
             } else if (IsFloat(ef.type)) {
-                std::wstring readScript = L"try((getProperty " + MsObjPath(ef) +
+                std::wstring readScript = L"try((getProperty " + MsFirstSelectedPath(ef.msPath) +
                     L" #" + prop + L") as float)catch(0.0)";
                 FPValue value;
                 ExecuteMAXScriptScript(readScript.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &value);
@@ -4970,7 +5014,8 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 if (shift) scale *= 10.0f;
                 if (ctrl) scale *= 0.1f;
                 float inc = (float)dx * scale;
-                script = L"for obj in selection do try(local o=obj" + objPath +
+                script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                    L" do try(local o=" + objPath +
                     L";local v=getProperty o #" + prop +
                     L";setProperty o #" + prop + L" (v+" + std::to_wstring(inc) + L"))catch()";
             } else if (IsInt(ef.type)) {
@@ -4979,7 +5024,8 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 if (intStep != 0) {
                     g_favDragAccum -= intStep * 3;
                     if (shift) intStep *= 10;
-                    script = L"for obj in selection do try(local o=obj" + objPath +
+                    script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                        L" do try(local o=" + objPath +
                         L";local v=getProperty o #" + prop +
                         L";setProperty o #" + prop + L" (v+" + std::to_wstring(intStep) + L"))catch()";
                 }
@@ -5430,7 +5476,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (sep != std::wstring::npos) {
                         std::wstring prop = ef.key.substr(sep + 1);
                         // Read current value to compute proportional step
-                        std::wstring readS = L"try((getProperty " + ef.msPath + L" #" + prop + L") as float)catch(0.0)";
+                        std::wstring readS = L"try((getProperty " + MsFirstSelectedPath(ef.msPath) + L" #" + prop + L") as float)catch(0.0)";
                         FPValue rv; ExecuteMAXScriptScript(readS.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &rv);
                         float cur = (rv.type == TYPE_FLOAT) ? rv.f : 0.0f;
                         float a = cur < 0 ? -cur : cur;
@@ -5438,9 +5484,9 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
                         float inc = (float)dx * sc;
                         if (inc == 0.0f) return 0;
-                        std::wstring objPath = ef.msPath;
-                        if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
-                        std::wstring s = L"for obj in selection do try(local o=obj" + objPath +
+                        std::wstring objPath = MsPerSelectedPath(ef.msPath);
+                        std::wstring s = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                            L" do try(local o=" + objPath +
                             L";local v=getProperty o #" + prop +
                             L";setProperty o #" + prop + L" (v+" + std::to_wstring(inc) + L"))catch()";
                         ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
@@ -5476,7 +5522,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     size_t sep = ef.key.find(L':');
                     if (sep != std::wstring::npos) {
                         std::wstring prop = ef.key.substr(sep + 1);
-                        std::wstring readS = L"try((getProperty " + ef.msPath + L" #" + prop + L") as string)catch(\"\")";
+                        std::wstring readS = L"try((getProperty " + MsFirstSelectedPath(ef.msPath) + L" #" + prop + L") as string)catch(\"\")";
                         FPValue rv; ExecuteMAXScriptScript(readS.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &rv);
                         if (rv.type == TYPE_STRING && rv.s) tip += rv.s;
                     }
@@ -5634,17 +5680,18 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (!ef.pb) {
                 // MaxScript-based params (legacy PB1 objects) — apply to all selected
                 std::wstring prop = PropFromKey(ef);
-                std::wstring objPath = MsObjPath(ef);
-                if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
+                std::wstring objPath = MsPerSelectedPath(ef.msPath);
                 const bool ownHold = !theHold.Holding();
                 if (ownHold) theHold.Begin();
                 BOOL ok = FALSE;
                 if (ef.type == (ParamType2)TYPE_BOOL) {
-                    std::wstring script = L"for obj in selection do try(local o=obj" + objPath +
+                    std::wstring script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                        L" do try(local o=" + objPath +
                         L";setProperty o #" + prop + L" (not (getProperty o #" + prop + L")))catch()";
                     ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
                 } else if (IsFloat(ef.type)) {
-                    std::wstring script = L"for obj in selection do try(local o=obj" + objPath +
+                    std::wstring script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                        L" do try(local o=" + objPath +
                         L";local v=getProperty o #" + prop +
                         L";setProperty o #" + prop + L" (v+" +
                         std::to_wstring(step) + L"*" +
@@ -5656,7 +5703,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     int s = (int)step;
                     if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
                     if (s == 0) s = step>0?1:-1;
-                    std::wstring script = L"for obj in selection do try(local o=obj" + objPath +
+                    std::wstring script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                        L" do try(local o=" + objPath +
                         L";local v=getProperty o #" + prop +
                         L";setProperty o #" + prop + L" (v+" +
                         std::to_wstring(s) + L"))catch()";
@@ -5865,7 +5913,15 @@ static void TogglePanel() {
 
 // ── Action system ───────────────────────────────────────────────
 static void ReloadSettingsLive() {
+    const bool sideKeysWereEnabled = g_enableSideKeys;
     LoadSettings();
+
+    if (sideKeysWereEnabled && !g_enableSideKeys) {
+        // A live opt-out must not leave an in-progress drag or the currently
+        // side-cycled orbit mode active. Max orbit actions remain available.
+        CancelHookDrags();
+        DisableAutoSilent();
+    }
 
     // Theme colors are plain COLORREF values; recreate the two brushes that
     // are retained for edit-control paint messages.
@@ -6143,8 +6199,6 @@ public:
 
 static PPClassDesc ppDesc;
 
-ClassDesc* GetNormalizePolyDesc();
-
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
         MaxSDK::Util::UseLanguagePackLocale();
@@ -6155,11 +6209,12 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return PPARAM_NAME; }
-__declspec(dllexport) int          LibNumberClasses()  { return 2; }
+__declspec(dllexport) int          LibNumberClasses()  { return 3; }
 __declspec(dllexport) ClassDesc*   LibClassDesc(int i) {
     switch (i) {
     case 0: return &ppDesc;
     case 1: return GetNormalizePolyDesc();
+    case 2: return GetLoopSubdivisionDesc();
     default: return nullptr;
     }
 }

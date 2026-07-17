@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 
+if(POLICY CMP0177)
+    cmake_policy(SET CMP0177 NEW)
+endif()
+
 project(FlowStateSuite VERSION 1.3.0 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -63,26 +67,58 @@ function(configure_max_plugin target_name output_name plugin_type)
     )
 endfunction()
 
-# FlowState.gup
-add_library(FlowState SHARED
+# One native collection, one binary: every class below ships in FlowState.gup.
+set(FLOWSTATE_CORE_SOURCES
     src/flowstate.cpp
+    src/FlowState.def
+)
+
+set(FLOWSTATE_UI_SOURCES
     src/powershader.cpp
     src/powershader.h
     src/modstack.cpp
     src/modstack.h
-    src/FlowState.def
+)
+
+set(FLOWSTATE_MODELING_SOURCES
     src/normalize_edges/f2_extend_tool.cpp
-    src/normalize_edges/normalize_poly.cpp
-    src/normalize_edges/normalize_poly.rc
-    src/normalize_edges/resource.h
     src/normalize_edges/smooth_bridge_tool.cpp
 )
+
+set(FLOWSTATE_NORMALIZE_POLY_SOURCES
+    src/normalize_edges/normalize_poly.cpp
+    src/normalize_edges/normalize_poly.h
+    src/normalize_edges/normalize_poly.rc
+    src/normalize_edges/resource.h
+)
+
+set(FLOWSTATE_LOOP_SUBDIVISION_SOURCES
+    src/modifiers/loop_subdivision/loop_subdivision.cpp
+    src/modifiers/loop_subdivision/loop_subdivision.h
+    src/modifiers/loop_subdivision/loop_subdivision.rc
+    src/modifiers/loop_subdivision/loop_subdivision_resource.h
+)
+
+add_library(FlowState SHARED
+    ${FLOWSTATE_CORE_SOURCES}
+    ${FLOWSTATE_UI_SOURCES}
+    ${FLOWSTATE_MODELING_SOURCES}
+    ${FLOWSTATE_NORMALIZE_POLY_SOURCES}
+    ${FLOWSTATE_LOOP_SUBDIVISION_SOURCES}
+)
+
+source_group("Core" FILES ${FLOWSTATE_CORE_SOURCES})
+source_group("UI" FILES ${FLOWSTATE_UI_SOURCES})
+source_group("Modeling" FILES ${FLOWSTATE_MODELING_SOURCES})
+source_group("Modifiers\\Normalize Poly" FILES ${FLOWSTATE_NORMALIZE_POLY_SOURCES})
+source_group("Modifiers\\Loop Subdivision" FILES ${FLOWSTATE_LOOP_SUBDIVISION_SOURCES})
 
 configure_max_plugin(FlowState FlowState gup)
 target_include_directories(FlowState PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/normalize_edges"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/modifiers/loop_subdivision"
 )
 target_link_libraries(FlowState PRIVATE
     core.lib

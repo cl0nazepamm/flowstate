@@ -6,18 +6,19 @@ flowstate 1.3 is a collection of 3ds Max tools for faster parameter editing, sha
 
 ## Tools
 
-- **PowerParams** — Opens a floating editor for object, modifier, multi-selection, and Editable Poly command parameters with typing, scrubbing, favorites, and V/H slider slots.
+- **Stack** — Opens a floating editor for object, modifier, multi-selection, and Editable Poly command parameters with typing, scrubbing, favorites, and V/H slider slots.
 - **Timeline Slider** - Timeline scrubbing anywhere just by dragging. 
-- **Automatic Orbit** - Switch between orbit modes DYNAMICALLY. Also registers them to hotkey editor.
+- **Automatic Orbit** - Switch between orbit modes. Also registers them to hotkey editor.
 - **Opacity Slider** - Change object opacity smoothly by dragging on viewport
-- **PowerShader** — Searches materials, texmaps, scene shaders, and OSL categories with pins, bricks, previews, drag/drop, assignment, and SHLL preview generation.
-- **ModStack** — Searches macros and modifiers, noticably faster than standard 3dsMax search
-- **Normalize Poly** — Shiva Tools's vertex cleaner C++ rewrite and works as a modifier. Up to 100x faster than the maxscript one.
+- **Shader Search** — Searches materials, texmaps, scene shaders, and OSL categories with pins, bricks, previews, drag/drop, assignment, and SHLL preview generation.
+- **Macro Search** — Searches macros and modifiers, noticably faster than standard 3dsMax search
+- **Normalize Poly** — Shiva Tools's vertex cleaner but works in modifier level.
 - **Smooth Bridge** — Bridge with proper continuity
-- **F2 Extend** — Blender style extend
-- **Config UI** — Controls modules, sub-object buttons, Slate Tab search, theme, and the XButton1 action map through `flowstate_config.ms`.
-- **FlowState.cfg** — Stores all module flags, key mappings, collapsed/hidden parameters, favorites, shader pins, and brick layouts in `<plugcfg>`.
+- **F2 Extend** — Blender style sideways bridge/extend or monorail.
 - **Loop Subdivision** - Subdivision surface modifier for triangular meshes
+- **Config UI** — Controls modules, sub-object buttons, Slate Tab search, theme, the XButton1 action map, and a master opt-out that releases both mouse side buttons.
+- **FlowState.cfg** — Stores all module flags, key mappings, collapsed/hidden parameters, favorites, shader pins, and brick layouts in `<plugcfg>`.
+
 
 ## Shortcuts
 
@@ -56,6 +57,8 @@ Every XButton1 action can be reassigned, mapped to `Alt+Shift` or `Ctrl+Alt`, or
 
 Release packages require both `FlowState.gup` and `flowstate_config.ms`.
 
+All native tools and modifiers are exported from `FlowState.gup`. The build does not produce companion `.dlm`, `.dlo`, or secondary `.gup` files. Remove legacy `normalize_poly.dlm` and `clone_loop.dlm` copies when upgrading so Max does not load duplicate classes.
+
 ## Build
 
 Requires Visual Studio 2022, CMake 3.20+, and the SDK matching the target 3ds Max version.
@@ -67,9 +70,22 @@ cmake --build build --config Release
 
 Set `MAX_VERSION=2027` or override `MAXSDK_PATH` for another supported SDK; the Release output places the GUP and config script together.
 
+### Native source layout
+
+| Area | Sources |
+| --- | --- |
+| Core module and exports | `src/flowstate.cpp`, `src/FlowState.def` |
+| Floating editors | `src/powershader.*`, `src/modstack.*` |
+| Modeling commands | `src/normalize_edges/f2_extend_tool.cpp`, `smooth_bridge_tool.cpp` |
+| Normalize Poly modifier | `src/normalize_edges/normalize_poly.*` |
+| Loop Subdivision modifier | `src/modifiers/loop_subdivision/` |
+| Native smoke tests | `tests/` |
+
+The CMake project groups those areas explicitly while linking them into the single `FlowState` target.
+
 ## Uninstall
 
-Remove `FlowState.gup`, the installed `flowstate_config.ms` copies/startup loader, and optionally `<plugcfg>\FlowState.cfg`.
+Remove `FlowState.gup`, the installed `flowstate_config.ms` copies/startup loader, and optionally `<plugcfg>\FlowState.cfg`. Legacy standalone `normalize_poly.dlm` and `clone_loop.dlm` files are not part of the collection and can also be removed.
 
 ## License
 

@@ -5,6 +5,7 @@
 #include <maxapi.h>
 #include <polyobj.h>
 #include <mnmesh.h>
+#include "normalize_poly.h"
 #include "resource.h"
 #include <vector>
 

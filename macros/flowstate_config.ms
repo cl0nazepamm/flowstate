@@ -391,15 +391,18 @@ macroscript flowstate_Config
     frm.controls.add (mkSep pad Y iW); Y += 12
     frm.controls.add (mkLabel "MODULES" pad Y iW 18 fObj:fBold cObj:cHead); Y += 24
 
-    global flowstate_chkPP = mkCheck "Parameters (XButton2)" (pad+4) Y (iW-8) chk:true
+    global flowstate_chkPP = mkCheck "Parameters / Stack" (pad+4) Y (iW-8) chk:true
     frm.controls.add flowstate_chkPP; Y += 26
-    global flowstate_chkPS = mkCheck "Shader Search Utility (Shift+XButton2)" (pad+4) Y (iW-8) chk:true
+    global flowstate_chkPS = mkCheck "Shader Search Utility" (pad+4) Y (iW-8) chk:true
     frm.controls.add flowstate_chkPS; Y += 34
 
     -- ── Options ──
     frm.controls.add (mkSep pad Y iW); Y += 12
     frm.controls.add (mkLabel "OPTIONS" pad Y iW 18 fObj:fBold cObj:cHead); Y += 24
 
+    global flowstate_chkSideKeys = mkCheck "FlowState Mouse Side Buttons (XButton1 / XButton2)" (pad+4) Y (iW-8) chk:true
+    frm.controls.add flowstate_chkSideKeys; Y += 26
+    frm.controls.add (mkLabel "Off releases both buttons; Tab search and Max hotkeys still work." (pad+20) Y (iW-24) 18 fObj:fSmall cObj:cDim); Y += 22
     global flowstate_chkSubObj = mkCheck "Sub-Object Toggles (V/E/B/F/El)" (pad+4) Y (iW-8) chk:false
     frm.controls.add flowstate_chkSubObj; Y += 26
     global flowstate_chkTab = mkCheck "TAB key override for search." (pad+4) Y (iW-8) chk:false
@@ -552,6 +555,7 @@ macroscript flowstate_Config
     global flowstate_kmSel = #()
     global flowstate_kmBtns = #()
     global flowstate_kmMenus = #()
+    global flowstate_kmLabels = #()
     local lblW = 110
     local cbW = 140
     local cbX = pad + lblW + 4
@@ -559,7 +563,9 @@ macroscript flowstate_Config
         local slot = i
         local curVal = readKeymap iniPath actKeys[slot] default:defaults[slot]
         append flowstate_kmSel curVal
-        frm.controls.add (mkLabel flowstate_kmActionNames[slot] (pad+4) (Y+2) lblW 20 fObj:fSmall cObj:cDim)
+        local actionLbl = mkLabel flowstate_kmActionNames[slot] (pad+4) (Y+2) lblW 20 fObj:fSmall cObj:cDim
+        frm.controls.add actionLbl
+        append flowstate_kmLabels actionLbl
         local pickTxt = if curVal == -1 then "Off" else if curVal >= 0 and curVal < flowstate_kmChoiceLabels.count then flowstate_kmChoiceLabels[curVal + 1] else flowstate_kmChoiceLabels[1]
         local btn = mkKeyPickBtn cbX Y cbW pickTxt
         local m = attachKeyMenu btn slot
@@ -579,6 +585,14 @@ macroscript flowstate_Config
             else
                 flowstate_kmBtns[i].Text = "  " + flowstate_kmChoiceLabels[jj + 1] + "   " + "▼"
         ) catch ()
+    )
+
+    fn flowstate_onSideKeysChanged s e = (
+        global flowstate_kmBtns
+        global flowstate_kmLabels
+        local isEnabled = s.Checked
+        for ctrl in flowstate_kmBtns do try(ctrl.Enabled = isEnabled)catch()
+        for ctrl in flowstate_kmLabels do try(ctrl.Enabled = isEnabled)catch()
     )
     Y += 6
 
@@ -667,13 +681,17 @@ macroscript flowstate_Config
     ---------------------------------------------------------------------------
     flowstate_chkPP.Checked     = readFlag iniPath "PowerParams"
     flowstate_chkPS.Checked     = readFlag iniPath "PowerShader"
+    flowstate_chkSideKeys.Checked = readFlag iniPath "SideKeys" default:true
     flowstate_chkSubObj.Checked = readFlag iniPath "SubObjToggles" default:false
     flowstate_chkTab.Checked    = readFlag iniPath "TabShader" default:true
     flowstate_chkLight.Checked  = readFlag iniPath "LightTheme" default:false
+    flowstate_onSideKeysChanged flowstate_chkSideKeys undefined
 
     ---------------------------------------------------------------------------
     -- Events
     ---------------------------------------------------------------------------
+
+    dotNet.addEventHandler flowstate_chkSideKeys "CheckedChanged" flowstate_onSideKeysChanged
 
     -- Close
     fn onClose s e = (try(flowstate_ConfigForm.Close())catch())
@@ -756,6 +774,7 @@ macroscript flowstate_Config
                         local managed =
                             findString ln "PowerParams=" == 1 or
                             findString ln "PowerShader=" == 1 or
+                            findString ln "SideKeys=" == 1 or
                             findString ln "SubObjToggles=" == 1 or
                             findString ln "TabShader=" == 1 or
                             findString ln "LightTheme=" == 1 or
@@ -783,6 +802,7 @@ macroscript flowstate_Config
                 for ln in configKeep do format "%\n" ln to:f
                 if not flowstate_chkPP.Checked  do format "PowerParams=0\n" to:f
                 if not flowstate_chkPS.Checked  do format "PowerShader=0\n" to:f
+                if not flowstate_chkSideKeys.Checked do format "SideKeys=0\n" to:f
                 if flowstate_chkSubObj.Checked  do format "SubObjToggles=1\n" to:f
                 if not flowstate_chkTab.Checked do format "TabShader=0\n" to:f
                 if flowstate_chkLight.Checked   do format "LightTheme=1\n" to:f
@@ -840,7 +860,7 @@ macroscript flowstate_Config
 
     -- Reset
     fn onReset s e = (
-        if queryBox "Clear all flowstate settings?\n\nThis will reset collapsed groups, hidden params,\nfavorites, and XB1 assignments." title:"flowstate" then (
+        if queryBox "Clear all flowstate settings?\n\nThis restores all defaults, including mouse side buttons,\nand clears parameter layouts, favorites, quick modifiers,\nshader pins/bricks, and XB1 assignments." title:"flowstate" then (
             local cfgDir = getDir #plugcfg
             local resetFiles = #(
                 cfgDir + "\\FlowState.cfg",
@@ -889,7 +909,7 @@ macroscript flowstate_Config
     dotNet.addEventHandler frm "FormClosed" onClosed
 
     -- Pin handler references so GC can't collect them while the form is alive
-    global flowstate_handlers = #(onPaint, onClose, onXEnter, onXLeave, onDragDown, onDragMove, onDragUp, onDeactivate, onSave, onReset, onKey, onClosed, flowstate_onKmMenuPick, flowstate_onKmBtnClick)
+    global flowstate_handlers = #(onPaint, onClose, onXEnter, onXLeave, onDragDown, onDragMove, onDragUp, onDeactivate, onSave, onReset, onKey, onClosed, flowstate_onKmMenuPick, flowstate_onKmBtnClick, flowstate_onSideKeysChanged)
 
     -- Show
     try (format "[flowstate] config UI v1.3 -- Save applies settings to the loaded plugin.\n" to:listener) catch ()

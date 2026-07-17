@@ -1,0 +1,18 @@
+#include "loop_subdivision_resource.h"
+#include <windows.h>
+
+STRINGTABLE
+BEGIN
+    IDS_LOOP_SUBDIVISION_PARAMS      "Parameters"
+    IDS_LOOP_SUBDIVISION_ITERATIONS  "Iterations"
+END
+
+IDD_LOOP_SUBDIVISION_PANEL DIALOGEX 0, 0, 101, 24
+STYLE WS_CHILD | WS_VISIBLE
+EXSTYLE 0
+FONT 8, "MS Shell Dlg"
+BEGIN
+    LTEXT       "Iterations", -1, 8, 9, 42, 8
+    CONTROL     "", IDC_LOOP_SUBDIVISION_ITERATIONS, "CustEdit", WS_TABSTOP, 54, 7, 26, 10
+    CONTROL     "", IDC_LOOP_SUBDIVISION_SPIN, "SpinnerControl", 0, 82, 7, 11, 10
+END
