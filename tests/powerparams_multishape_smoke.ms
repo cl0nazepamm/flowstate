@@ -38,11 +38,26 @@
         ) do (
             local o = obj.baseObject
             local v = getProperty o #length
-            local step = if (abs v) > 100 then 10.0 else if (abs v) > 10 then 1.0 else if (abs v) > 1 then 0.1 else 0.01
+            local step = if (abs v) > 0.001 then (abs v) * 0.01 else 0.001
             setProperty o #length (v + step)
         )
-        check (abs (a.length - 5.1) < 0.0001) "First Rectangle scrub used the wrong source value"
-        check (abs (b.length - 210.0) < 0.0001) "Second Rectangle scrub used the wrong source value"
+        check (abs (a.length - 5.05) < 0.0001) "First Rectangle scrub used the wrong source value"
+        check (abs (b.length - 202.0) < 0.0001) "Second Rectangle scrub used the wrong source value"
+
+        -- Integer and boolean legacy properties use the same class-gated fanout.
+        a.steps = 1
+        b.steps = 6
+        for obj in selection where (
+            try ((classof obj.baseObject) == (classof selection[1].baseObject)) catch false
+        ) do setProperty obj.baseObject #steps ((getProperty obj.baseObject #steps) + 1)
+        check (a.steps == 2 and b.steps == 7) "Integer multi-edit did not preserve per-shape values"
+
+        a.optimize = true
+        b.optimize = false
+        for obj in selection where (
+            try ((classof obj.baseObject) == (classof selection[1].baseObject)) catch false
+        ) do setProperty obj.baseObject #optimize (not (getProperty obj.baseObject #optimize))
+        check (not a.optimize and b.optimize) "Boolean multi-edit did not toggle both Rectangles"
 
         -- A property name shared by another class must not leak across a mixed
         -- selection; this mirrors FindParam's class gate on the PB2/poly path.

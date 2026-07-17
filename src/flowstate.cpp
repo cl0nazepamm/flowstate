@@ -994,6 +994,13 @@ enum { kSpWeld=kSpSentinel, kSpFillet=kSpSentinel+1, kSpChamfer=kSpSentinel+2, k
 constexpr int kSpCount = 4;
 static const TCHAR* kSpLabels[] = { _T("Weld"), _T("Fillet"), _T("Chamfer"), _T("Outline") };
 
+struct SplineFakeDragState {
+    int valueIdx = -1;
+    float startValue = 0.0f;
+    bool active = false;
+};
+static SplineFakeDragState g_splineFakeDrag;
+
 struct BtnDef { const TCHAR* label; int id; };
 static const int kSplineButtonOpBase = 10000;
 
@@ -1862,6 +1869,13 @@ static std::wstring MsSameClassFilter(const std::wstring& path) {
         L") == (classof " + MsFirstSelectedPath(path) + L"))catch(false))";
 }
 
+static std::wstring MsPB1DragScale(bool coarse, bool fine) {
+    std::wstring scale = L"(if (abs v)>0.001 then (abs v)*0.01 else 0.001)";
+    if (coarse) scale += L"*10.0";
+    if (fine)   scale += L"*0.1";
+    return scale;
+}
+
 static void ShowOSD(const std::wstring& text) {
     HWND maxWnd = GetCOREInterface() ? GetCOREInterface()->GetMAXHWnd() : nullptr;
     if (!maxWnd) return;
@@ -1941,6 +1955,8 @@ static std::wstring ReadSlotValue(const XB1Slot& slot) {
     }
     if (slot.spIdx >= 0) return FmtFloat(g_splineVals[slot.spIdx]);
     // PB1 — use tracked displayVal (set at drag start, updated per frame)
+    if (slot.type == (ParamType2)TYPE_BOOL)
+        return slot.displayVal != 0.0f ? L"On" : L"Off";
     return FmtFloat(slot.displayVal);
 }
 
@@ -2439,20 +2455,44 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                 changed = true;
             } else {
                 // PB1 — loop all selected objects via MaxScript
-                float a = slot.displayVal<0?-slot.displayVal:slot.displayVal;
-                float sc = a > 0.001f ? a * 0.01f : 0.001f;
-                if (shift) sc *= 10.0f; if (alt) sc *= 0.1f;
-                float inc = step * sc;
                 size_t sep = slot.key.find(L':');
                 if (sep != std::wstring::npos) {
                     std::wstring prop = slot.key.substr(sep + 1);
                     std::wstring objPath = MsPerSelectedPath(slot.msPath);
-                    std::wstring sc2 = L"for obj in selection" + MsSameClassFilter(slot.msPath) +
-                        L" do try(local o=" + objPath +
-                        L";local v=getProperty o #" + prop +
-                        L";setProperty o #" + prop + L" (v+" + std::to_wstring(inc) + L"))catch()";
-                    if (ExecuteMAXScriptScript(sc2.c_str(), MAXScript::ScriptSource::Dynamic)) {
-                        slot.displayVal += inc;
+                    std::wstring script;
+                    float displayDelta = 0.0f;
+                    if (slot.type == (ParamType2)TYPE_BOOL) {
+                        if (!boolToggled) {
+                            script = L"for obj in selection" + MsSameClassFilter(slot.msPath) +
+                                L" do try(local o=" + objPath +
+                                L";setProperty o #" + prop + L" (not (getProperty o #" + prop + L")))catch()";
+                            boolToggled = true;
+                            displayDelta = slot.displayVal != 0.0f ? -1.0f : 1.0f;
+                        }
+                    } else if (IsFloat(slot.type)) {
+                        script = L"for obj in selection" + MsSameClassFilter(slot.msPath) +
+                            L" do try(local o=" + objPath +
+                            L";local v=getProperty o #" + prop +
+                            L";setProperty o #" + prop + L" (v+" + std::to_wstring(step) +
+                            L"*" + MsPB1DragScale(shift, alt) + L"))catch()";
+                        float a = slot.displayVal < 0 ? -slot.displayVal : slot.displayVal;
+                        float scale = a > 0.001f ? a * 0.01f : 0.001f;
+                        if (shift) scale *= 10.0f;
+                        if (alt) scale *= 0.1f;
+                        displayDelta = step * scale;
+                    } else if (IsInt(slot.type)) {
+                        int intStep = delta / 3;
+                        if (intStep == 0) intStep = delta > 0 ? 1 : -1;
+                        if (shift) intStep *= 10;
+                        script = L"for obj in selection" + MsSameClassFilter(slot.msPath) +
+                            L" do try(local o=" + objPath +
+                            L";local v=getProperty o #" + prop +
+                            L";setProperty o #" + prop + L" (v+" + std::to_wstring(intStep) + L"))catch()";
+                        displayDelta = (float)intStep;
+                    }
+                    if (!script.empty() && ExecuteMAXScriptScript(
+                            script.c_str(), MAXScript::ScriptSource::Dynamic)) {
+                        slot.displayVal += displayDelta;
                         changed = true;
                     }
                 }
@@ -2683,7 +2723,13 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                                     std::wstring path = MsFirstSelectedPath(slot.msPath);
                                     std::wstring s = L"try((getProperty " + path + L" #" + prop + L") as string)catch(\"0\")";
                                     FPValue r; ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &r);
-                                    if (r.type == TYPE_STRING && r.s) slot.displayVal = (float)_wtof(r.s);
+                                    if (r.type == TYPE_STRING && r.s) {
+                                        if (slot.type == (ParamType2)TYPE_BOOL)
+                                            slot.displayVal = (_wcsicmp(r.s, L"true") == 0 ||
+                                                _wcsicmp(r.s, L"on") == 0 || wcscmp(r.s, L"1") == 0) ? 1.0f : 0.0f;
+                                        else
+                                            slot.displayVal = (float)_wtof(r.s);
+                                    }
                                 }
                             }
                         };
@@ -3337,6 +3383,95 @@ static bool IsSplineShapeActiveForOps(INode* node, SplineShape* spline) {
     return ok && result.type == TYPE_STRING && result.s && wcscmp(result.s, L"1") == 0;
 }
 
+static bool IsSplineValueField(const EditField& ef, int* valueIdx = nullptr) {
+    int idx = (int)ef.id - kSpSentinel;
+    bool isSplineValue = !ef.pb && idx >= 0 && idx < kSpCount;
+    if (isSplineValue && valueIdx) *valueIdx = idx;
+    return isSplineValue;
+}
+
+static float SplineValueDragScale(float value, bool coarse, bool fine) {
+    float amount = std::fabs(value);
+    float scale = amount > 100.0f ? 10.0f :
+                  amount > 10.0f  ? 1.0f  :
+                  amount > 1.0f   ? 0.1f  : 0.01f;
+    if (coarse) scale *= 10.0f;
+    if (fine)   scale *= 0.1f;
+    return scale;
+}
+
+static bool UpdateSplineFakeDrag(const EditField& ef, int dx,
+                                 bool coarse, bool fine) {
+    int idx = -1;
+    if (!IsSplineValueField(ef, &idx) || dx == 0) return false;
+
+    if (!g_splineFakeDrag.active) {
+        g_splineFakeDrag.valueIdx = idx;
+        g_splineFakeDrag.startValue = g_splineVals[idx];
+        g_splineFakeDrag.active = true;
+    } else if (g_splineFakeDrag.valueIdx != idx) {
+        return false;
+    }
+
+    g_splineVals[idx] += (float)dx * SplineValueDragScale(
+        g_splineVals[idx], coarse, fine);
+    return true;
+}
+
+static bool FinishSplineFakeDrag(bool accept) {
+    // Non-spline parameter drags use the caller's normal commit decision.
+    if (!g_splineFakeDrag.active) return accept;
+
+    int idx = g_splineFakeDrag.valueIdx;
+    float startValue = g_splineFakeDrag.startValue;
+    g_splineFakeDrag = {};
+    if (idx < 0 || idx >= kSpCount) return false;
+
+    if (!accept) {
+        g_splineVals[idx] = startValue;
+        return false;
+    }
+
+    Interface* ip = GetCOREInterface();
+    if (!ip || ip->GetSelNodeCount() == 0) {
+        g_splineVals[idx] = startValue;
+        return false;
+    }
+    INode* node = ip->GetSelNode(0);
+    SplineShape* spline = FindSplineShape(node);
+    if (!spline || !IsSplineShapeActiveForOps(node, spline)) {
+        g_splineVals[idx] = startValue;
+        return false;
+    }
+
+    // Deliberately one-shot: never leave a spline move transaction open while
+    // Windows is dispatching mouse messages. The drag above only edits the
+    // local value, and the geometry operation happens once on release.
+    TimeValue t = ip->GetTime();
+    int spId = kSpSentinel + idx;
+    if (spId == kSpFillet || spId == kSpChamfer) spline->SetFCLimit();
+    if (spId == kSpFillet) {
+        spline->BeginFilletMove(t);
+        spline->FilletMove(t, g_splineVals[idx]);
+        spline->EndFilletMove(t, TRUE);
+    } else if (spId == kSpChamfer) {
+        spline->BeginChamferMove(t);
+        spline->ChamferMove(t, g_splineVals[idx]);
+        spline->EndChamferMove(t, TRUE);
+    } else if (spId == kSpOutline) {
+        spline->BeginOutlineMove(t);
+        spline->OutlineMove(t, g_splineVals[idx]);
+        spline->EndOutlineMove(t, TRUE);
+    } else if (spId == kSpWeld) {
+        spline->SetEndPointAutoWeldThreshold(g_splineVals[idx]);
+        spline->DoVertWeld();
+    }
+
+    spline->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
+    ip->RedrawViews(t);
+    return true;
+}
+
 // Returns EPoly only if it's the currently active modifier (A_MOD_BEING_EDITED)
 // or the base object. Edit Poly modifiers that aren't selected in the stack
 // won't respond to tool operations.
@@ -3600,11 +3735,6 @@ static void GatherParams() {
 
 }
 
-
-// MaxScript object path for PB1 params
-static std::wstring MsObjPath(const EditField& ef) {
-    return MsPathSuffix(ef.msPath);
-}
 
 // Extract property name from key "ClassName:propName"
 static std::wstring PropFromKey(const EditField& ef) {
@@ -4860,6 +4990,7 @@ static void RefreshFavoritesStrip() {
 static void CancelFavDrag() {
     if (!g_favDragging) return;
     HWND capture = GetCapture();
+    FinishSplineFakeDrag(false);
     g_favDragging = false;
     g_favDragIdx = -1;
     g_favDragAccum = 0;
@@ -4875,6 +5006,7 @@ static void CancelFavDrag() {
 static void CancelPanelValueDrag() {
     if (!g_lmbDragging) return;
     HWND capture = GetCapture();
+    FinishSplineFakeDrag(false);
     g_lmbDragging = false;
     g_lmbDragIdx = -1;
     g_lmbDragAccum = 0;
@@ -4988,7 +5120,10 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         TimeValue t = ip ? ip->GetTime() : 0;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        if (ef.pb) {
+        bool splineFakeDrag = IsSplineValueField(ef);
+        if (splineFakeDrag) {
+            g_favDragChanged |= UpdateSplineFakeDrag(ef, dx, shift, ctrl);
+        } else if (ef.pb) {
             g_favDragChanged |= ScrubSelectedPB2(
                 ef, t, dx, g_favDragAccum, g_favBoolToggled, shift, ctrl);
         } else if ((int)ef.id < kSpSentinel || (int)ef.id >= kSpSentinel + kSpCount) {
@@ -5004,20 +5139,11 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                     g_favBoolToggled = true;
                 }
             } else if (IsFloat(ef.type)) {
-                std::wstring readScript = L"try((getProperty " + MsFirstSelectedPath(ef.msPath) +
-                    L" #" + prop + L") as float)catch(0.0)";
-                FPValue value;
-                ExecuteMAXScriptScript(readScript.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &value);
-                float cur = value.type == TYPE_FLOAT ? value.f : 0.0f;
-                float a = cur < 0 ? -cur : cur;
-                float scale = a > 0.001f ? a * 0.01f : 0.001f;
-                if (shift) scale *= 10.0f;
-                if (ctrl) scale *= 0.1f;
-                float inc = (float)dx * scale;
                 script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
                     L" do try(local o=" + objPath +
                     L";local v=getProperty o #" + prop +
-                    L";setProperty o #" + prop + L" (v+" + std::to_wstring(inc) + L"))catch()";
+                    L";setProperty o #" + prop + L" (v+" + std::to_wstring((float)dx) +
+                    L"*" + MsPB1DragScale(shift, ctrl) + L"))catch()";
             } else if (IsInt(ef.type)) {
                 g_favDragAccum += dx;
                 int intStep = g_favDragAccum / 3;
@@ -5034,7 +5160,7 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 g_favDragChanged |= ExecuteMAXScriptScript(
                     script.c_str(), MAXScript::ScriptSource::Dynamic) != FALSE;
         }
-        if (ip) {
+        if (ip && !splineFakeDrag) {
             for (int ni = 0; ni < ip->GetSelNodeCount(); ni++) {
                 INode* nd = ip->GetSelNode(ni);
                 if (nd) nd->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
@@ -5051,17 +5177,19 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     }
     case WM_LBUTTONUP: {
         if (!g_favDragging) break;
+        bool changed = g_favDragChanged;
         g_favDragging = false;
         g_favDragIdx  = -1;
         ReleaseCapture();
+        HideDragTip();
+        changed = FinishSplineFakeDrag(changed);
         if (g_favDragOwnHold && theHold.Holding()) {
-            if (g_favDragChanged) theHold.Accept(_T("Pin Drag"));
+            if (changed) theHold.Accept(_T("Pin Drag"));
             else theHold.Cancel();
         }
         g_favDragOwnHold = false;
         g_favDragChanged = false;
         g_favBoolToggled = false;
-        HideDragTip();
         SetCursor(LoadCursor(nullptr, IDC_ARROW));
         return 0;
     }
@@ -5394,13 +5522,15 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_lmbDragging) {
             int idx = g_lmbDragIdx;
             bool moved = g_lmbDragMoved;
+            bool changed = g_lmbDragChanged;
             g_lmbDragging = false;
             g_lmbDragIdx  = -1;
             ReleaseCapture();
-            if (moved && g_lmbDragChanged) {
+            HideDragTip();
+            bool commit = FinishSplineFakeDrag(moved && changed);
+            if (commit) {
                 if (g_lmbDragOwnHold && theHold.Holding())
                     theHold.Accept(_T("Param Drag"));
-                HideDragTip();
                 GatherParams(); BuildLayout();
                 RefreshFavoritesStrip();
             } else {
@@ -5438,8 +5568,12 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
                 EditField& ef = g_edits[g_lmbDragIdx];
                 int selCount = ip ? ip->GetSelNodeCount() : 0;
+                bool splineFakeDrag = IsSplineValueField(ef);
 
-                if (ef.pb) {
+                if (splineFakeDrag) {
+                    g_lmbDragChanged |= UpdateSplineFakeDrag(
+                        ef, dx, shift, ctrl);
+                } else if (ef.pb) {
                     // PB2 — adjust on all selected nodes
                     int intStep = 0;
                     if (IsInt(ef.type)) {
@@ -5475,26 +5609,40 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     size_t sep = ef.key.find(L':');
                     if (sep != std::wstring::npos) {
                         std::wstring prop = ef.key.substr(sep + 1);
-                        // Read current value to compute proportional step
-                        std::wstring readS = L"try((getProperty " + MsFirstSelectedPath(ef.msPath) + L" #" + prop + L") as float)catch(0.0)";
-                        FPValue rv; ExecuteMAXScriptScript(readS.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &rv);
-                        float cur = (rv.type == TYPE_FLOAT) ? rv.f : 0.0f;
-                        float a = cur < 0 ? -cur : cur;
-                        float sc = a > 0.001f ? a * 0.01f : 0.001f;
-                        if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
-                        float inc = (float)dx * sc;
-                        if (inc == 0.0f) return 0;
                         std::wstring objPath = MsPerSelectedPath(ef.msPath);
-                        std::wstring s = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
-                            L" do try(local o=" + objPath +
-                            L";local v=getProperty o #" + prop +
-                            L";setProperty o #" + prop + L" (v+" + std::to_wstring(inc) + L"))catch()";
-                        ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
-                        g_lmbDragChanged = true;
+                        std::wstring script;
+                        if (ef.type == (ParamType2)TYPE_BOOL) {
+                            if (!g_lmbBoolToggled) {
+                                script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                                    L" do try(local o=" + objPath +
+                                    L";setProperty o #" + prop + L" (not (getProperty o #" + prop + L")))catch()";
+                                g_lmbBoolToggled = true;
+                            }
+                        } else if (IsFloat(ef.type)) {
+                            script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                                L" do try(local o=" + objPath +
+                                L";local v=getProperty o #" + prop +
+                                L";setProperty o #" + prop + L" (v+" + std::to_wstring((float)dx) +
+                                L"*" + MsPB1DragScale(shift, ctrl) + L"))catch()";
+                        } else if (IsInt(ef.type)) {
+                            g_lmbDragAccum += dx;
+                            int intStep = g_lmbDragAccum / 3;
+                            if (intStep != 0) {
+                                g_lmbDragAccum -= intStep * 3;
+                                if (shift) intStep *= 10;
+                                script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                                    L" do try(local o=" + objPath +
+                                    L";local v=getProperty o #" + prop +
+                                    L";setProperty o #" + prop + L" (v+" + std::to_wstring(intStep) + L"))catch()";
+                            }
+                        }
+                        if (!script.empty())
+                            g_lmbDragChanged |= ExecuteMAXScriptScript(
+                                script.c_str(), MAXScript::ScriptSource::Dynamic) != FALSE;
                     }
                 }
 
-                if (ip) {
+                if (ip && !splineFakeDrag) {
                     for (int ni = 0; ni < selCount; ni++) {
                         INode* nd = ip->GetSelNode(ni);
                         if (nd) nd->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
@@ -5508,7 +5656,11 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 // Show drag tooltip with current value
                 POINT scr; GetCursorPos(&scr);
                 std::wstring tip = ef.label + L": ";
-                if (ef.pb) {
+                if (IsSplineValueField(ef)) {
+                    wchar_t buf[64];
+                    FormatValue(ef, t, buf, 64);
+                    tip += buf;
+                } else if (ef.pb) {
                     IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
                     if (selCount > 0 && FindParam(ip->GetSelNode(0), ef.key, pb, pid, pt2)) {
                         if (IsFloat(pt2)) {
