@@ -929,7 +929,7 @@ static void ShowPreview(const std::wstring& path, HWND paletteWnd) {
         if (g_previewClassRegistered) {
             g_previewWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 kPreviewClass, L"", WS_POPUP, 0, 0, kPreviewSize, kPreviewSize,
-                nullptr, nullptr, hInstance, nullptr);
+                paletteWnd, nullptr, hInstance, nullptr);
         }
     }
     if (!g_previewWnd) {
@@ -1087,8 +1087,13 @@ private:
             return 0;
 
         case WM_USER + 50:
-            self->UpdatePreviewForSelection();
+            if (IsWindowVisible(h)) self->UpdatePreviewForSelection();
+            else HidePreview();
             return 0;
+
+        case WM_SHOWWINDOW:
+            if (!w) HidePreview();
+            break;
 
         case WM_ACTIVATE:
             if (LOWORD(w) == WA_INACTIVE && !self->dragging_) self->Hide();
@@ -1116,7 +1121,10 @@ private:
             SetBkMode(hdc, TRANSPARENT);
             HFONT oldF = static_cast<HFONT>(SelectObject(hdc, Theme::fontBold));
             SetTextColor(hdc, Theme::accent);
-            TextOutW(hdc, 10, 10, L"flowstate.", 10);
+            const wchar_t* title = self->dragging_
+                ? L"release to create"
+                : L"flowstate.";
+            TextOutW(hdc, 10, 10, title, lstrlenW(title));
             // Close button
             if (self->hoverClose_) {
                 HBRUSH hov = CreateSolidBrush(RGB(200, 60, 60));
@@ -1328,8 +1336,14 @@ private:
             {
                 POINT p{}; GetCursorPos(&p);
                 if (std::abs(p.x - self->dragStart_.x) > 6 ||
-                    std::abs(p.y - self->dragStart_.y) > 6)
-                    self->dragging_ = true;
+                    std::abs(p.y - self->dragStart_.y) > 6) {
+                    if (!self->dragging_) {
+                        self->dragging_ = true;
+                        RECT header = { 0, 0, kWindowWidth, kHeaderH };
+                        RedrawWindow(self->wnd_, &header, nullptr,
+                            RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+                    }
+                }
             }
             break;
         case WM_LBUTTONUP:
@@ -1343,6 +1357,11 @@ private:
             }
             self->dragging_ = false;
             self->dragIndex_ = -1;
+            {
+                RECT header = { 0, 0, kWindowWidth, kHeaderH };
+                RedrawWindow(self->wnd_, &header, nullptr,
+                    RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+            }
             break;
         case WM_RBUTTONDOWN:
         {
@@ -1794,6 +1813,13 @@ private:
 
     void UpdatePreviewForSelection()
     {
+        // List clicks post a delayed refresh. Activation can hide the palette
+        // before that message is dispatched, so never let a stale refresh
+        // resurrect the independent topmost preview popup.
+        if (!wnd_ || !IsWindowVisible(wnd_)) {
+            HidePreview();
+            return;
+        }
         int sel = (int)SendMessage(list_, LB_GETCURSEL, 0, 0);
         if (sel >= 0 && sel < (int)filtered_.size() && activeItems_) {
             const Item& item = (*activeItems_)[filtered_[sel]];
