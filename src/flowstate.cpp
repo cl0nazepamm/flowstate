@@ -2980,6 +2980,113 @@ static bool FindParam(INode* node, const std::wstring& key,
     return false;
 }
 
+// Apply pinned PB2 edits through the same per-node lookup used by the main
+// parameter panel.  The EditField stores the first selected node's PB only for
+// display; writing through that cached pointer would otherwise skip the rest
+// of a multi-object selection.
+static bool SetSelectedPB2FromText(const EditField& ef, TimeValue t, const TCHAR* txt) {
+    Interface* ip = GetCOREInterface();
+    if (!ip) return false;
+
+    bool changed = false;
+    for (int ni = 0; ni < ip->GetSelNodeCount(); ++ni) {
+        INode* node = ip->GetSelNode(ni);
+        if (!node) continue;
+        IParamBlock2* pb = nullptr;
+        ParamID pid = 0;
+        ParamType2 type = (ParamType2)0;
+        if (!FindParam(node, ef.key, pb, pid, type)) continue;
+
+        if (IsFloat(type))
+            changed |= SetPB2FloatSafe(pb, pid, type, t, (float)_wtof(txt));
+        else if (type == TYPE_BOOL)
+            changed |= SetPB2BoolSafe(pb, pid, t,
+                (_wcsicmp(txt, _T("On")) == 0 ||
+                 _wcsicmp(txt, _T("1")) == 0 ||
+                 _wcsicmp(txt, _T("true")) == 0));
+        else
+            changed |= SetPB2IntSafe(pb, pid, type, t, _wtoi(txt));
+    }
+    return changed;
+}
+
+static bool AdjustSelectedPB2ByWheel(const EditField& ef, TimeValue t, float step,
+                                     bool shift, bool ctrl) {
+    Interface* ip = GetCOREInterface();
+    if (!ip) return false;
+
+    int intStep = (int)step;
+    if (shift) intStep *= 10;
+    if (ctrl && intStep != 0) intStep = intStep > 0 ? 1 : -1;
+    if (intStep == 0) intStep = step > 0 ? 1 : -1;
+
+    bool changed = false;
+    for (int ni = 0; ni < ip->GetSelNodeCount(); ++ni) {
+        INode* node = ip->GetSelNode(ni);
+        if (!node) continue;
+        IParamBlock2* pb = nullptr;
+        ParamID pid = 0;
+        ParamType2 type = (ParamType2)0;
+        if (!FindParam(node, ef.key, pb, pid, type)) continue;
+
+        if (IsFloat(type)) {
+            float cur = pb->GetFloat(pid, t);
+            float a = cur < 0 ? -cur : cur;
+            float scale = a > 100.f ? 10.f : a > 10.f ? 1.f : a > 1.f ? 0.1f : 0.01f;
+            if (shift) scale *= 10.0f;
+            if (ctrl) scale *= 0.1f;
+            changed |= SetPB2FloatSafe(pb, pid, type, t, cur + step * scale);
+        } else if (type == TYPE_BOOL) {
+            changed |= TogglePB2BoolSafe(pb, pid, t);
+        } else if (IsInt(type)) {
+            changed |= SetPB2IntSafe(pb, pid, type, t, pb->GetInt(pid, t) + intStep);
+        }
+    }
+    return changed;
+}
+
+static bool ScrubSelectedPB2(const EditField& ef, TimeValue t, int dx,
+                             int& intAccum, bool& boolToggled,
+                             bool shift, bool ctrl) {
+    Interface* ip = GetCOREInterface();
+    if (!ip) return false;
+
+    int intStep = 0;
+    if (IsInt(ef.type)) {
+        intAccum += dx;
+        intStep = intAccum / 3;
+        if (intStep != 0) {
+            intAccum -= intStep * 3;
+            if (shift) intStep *= 10;
+        }
+    }
+
+    bool changed = false;
+    for (int ni = 0; ni < ip->GetSelNodeCount(); ++ni) {
+        INode* node = ip->GetSelNode(ni);
+        if (!node) continue;
+        IParamBlock2* pb = nullptr;
+        ParamID pid = 0;
+        ParamType2 type = (ParamType2)0;
+        if (!FindParam(node, ef.key, pb, pid, type)) continue;
+
+        if (IsFloat(type)) {
+            float cur = pb->GetFloat(pid, t);
+            float a = cur < 0 ? -cur : cur;
+            float scale = a > 0.001f ? a * 0.01f : 0.001f;
+            if (shift) scale *= 10.0f;
+            if (ctrl) scale *= 0.1f;
+            changed |= SetPB2FloatSafe(pb, pid, type, t, cur + (float)dx * scale);
+        } else if (type == TYPE_BOOL && !boolToggled) {
+            changed |= TogglePB2BoolSafe(pb, pid, t);
+        } else if (IsInt(type) && intStep != 0) {
+            changed |= SetPB2IntSafe(pb, pid, type, t, pb->GetInt(pid, t) + intStep);
+        }
+    }
+    if (ef.type == TYPE_BOOL) boolToggled = true;
+    return changed;
+}
+
 // Clean up SDK internal names for display: "lightRadius" → "Radius", "edge_chamfer" → "Chamfer"
 static std::wstring PrettyLabel(const std::wstring& raw, const std::wstring& groupTitle) {
     std::wstring s = raw;
@@ -3594,14 +3701,7 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 TimeValue t = ip ? ip->GetTime() : 0;
                 const bool ownHold = !theHold.Holding();
                 if (ownHold) theHold.Begin();
-                bool changed = false;
-                if (IsFloat(ef->type))
-                    changed = SetPB2FloatSafe(ef->pb, ef->id, ef->type, t, (float)_wtof(txt));
-                else if (ef->type == TYPE_BOOL)
-                    changed = SetPB2BoolSafe(ef->pb, ef->id, t,
-                        (_wcsicmp(txt,_T("On"))==0||_wcsicmp(txt,_T("1"))==0));
-                else
-                    changed = SetPB2IntSafe(ef->pb, ef->id, ef->type, t, _wtoi(txt));
+                bool changed = SetSelectedPB2FromText(*ef, t, txt);
                 if (ownHold) {
                     if (changed) theHold.Accept(_T("Set Pinned Parameter"));
                     else theHold.Cancel();
@@ -3609,8 +3709,12 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             } else {
                 std::wstring prop = PropFromKey(*ef);
                 std::wstring val(txt);
-                if (ef->type == (ParamType2)TYPE_BOOL) val = (_wcsicmp(txt,L"On")==0||_wcsicmp(txt,L"1")==0) ? L"true" : L"false";
-                std::wstring s = L"try(setProperty " + MsObjPath(*ef) + L" #" + prop + L" " + val + L")catch()";
+                if (ef->type == (ParamType2)TYPE_BOOL)
+                    val = (_wcsicmp(txt,L"On")==0||_wcsicmp(txt,L"1")==0||_wcsicmp(txt,L"true")==0) ? L"true" : L"false";
+                std::wstring objPath = MsObjPath(*ef);
+                if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
+                std::wstring s = L"for obj in selection do try(setProperty (obj" + objPath +
+                    L") #" + prop + L" " + val + L")catch()";
                 const bool ownHold = !theHold.Holding();
                 if (ownHold) theHold.Begin();
                 BOOL ok = ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
@@ -3638,22 +3742,7 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (ef->pb) {
             const bool ownHold = !theHold.Holding();
             if (ownHold) theHold.Begin();
-            bool changed = false;
-            if (IsFloat(ef->type)) {
-                float cur = ef->pb->GetFloat(ef->id, t);
-                float a = cur<0?-cur:cur;
-                float sc = a>100.f?10.f:a>10.f?1.f:a>1.f?0.1f:0.01f;
-                if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
-                changed = SetPB2FloatSafe(ef->pb, ef->id, ef->type, t, cur + step * sc);
-            } else if (ef->type == TYPE_BOOL) {
-                changed = TogglePB2BoolSafe(ef->pb, ef->id, t);
-            } else {
-                int cur = ef->pb->GetInt(ef->id, t);
-                int s = (int)step;
-                if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
-                if (s == 0) s = step>0?1:-1;
-                changed = SetPB2IntSafe(ef->pb, ef->id, ef->type, t, cur + s);
-            }
+            bool changed = AdjustSelectedPB2ByWheel(*ef, t, step, shift, ctrl);
             if (ownHold) {
                 if (changed) theHold.Accept(_T("Adjust Pinned Parameter"));
                 else theHold.Cancel();
@@ -3668,21 +3757,25 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else {
             // PB1 MaxScript path
             std::wstring prop = PropFromKey(*ef);
+            std::wstring objPath = MsObjPath(*ef);
+            if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
             std::wstring script;
             if (ef->type == (ParamType2)TYPE_BOOL) {
-                script = L"try(setProperty " + MsObjPath(*ef) + L" #" + prop +
-                    L" (not(getProperty " + MsObjPath(*ef) + L" #" + prop + L")))catch()";
+                script = L"for obj in selection do try(local o=obj" + objPath +
+                    L";setProperty o #" + prop + L" (not (getProperty o #" + prop + L")))catch()";
             } else if (IsFloat(ef->type)) {
-                script = L"try(local v=getProperty " + MsObjPath(*ef) + L" #" + prop +
-                    L";setProperty " + MsObjPath(*ef) + L" #" + prop + L" (v+" +
+                script = L"for obj in selection do try(local o=obj" + objPath +
+                    L";local v=getProperty o #" + prop +
+                    L";setProperty o #" + prop + L" (v+" +
                     std::to_wstring(step) + L"*(if(abs v)>100 then 10 else if(abs v)>10 then 1 else if(abs v)>1 then 0.1 else 0.01)" +
                     (shift?L"*10":L"") + (ctrl?L"*0.1":L"") + L"))catch()";
             } else {
                 int s = (int)step;
                 if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
                 if (s == 0) s = step>0?1:-1;
-                script = L"try(local v=getProperty " + MsObjPath(*ef) + L" #" + prop +
-                    L";setProperty " + MsObjPath(*ef) + L" #" + prop + L" (v+" + std::to_wstring(s) + L"))catch()";
+                script = L"for obj in selection do try(local o=obj" + objPath +
+                    L";local v=getProperty o #" + prop +
+                    L";setProperty o #" + prop + L" (v+" + std::to_wstring(s) + L"))catch()";
             }
             const bool ownHold = !theHold.Holding();
             if (ownHold) theHold.Begin();
@@ -4851,22 +4944,49 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         TimeValue t = ip ? ip->GetTime() : 0;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        if (ef.pb && IsWritableParam(ef.pb, ef.id)) {
-            if (IsFloat(ef.type)) {
-                float cur = ef.pb->GetFloat(ef.id, t);
+        if (ef.pb) {
+            g_favDragChanged |= ScrubSelectedPB2(
+                ef, t, dx, g_favDragAccum, g_favBoolToggled, shift, ctrl);
+        } else if ((int)ef.id < kSpSentinel || (int)ef.id >= kSpSentinel + kSpCount) {
+            // PB1 fallback — mirror the main parameter panel's multi-object scrub.
+            std::wstring prop = PropFromKey(ef);
+            std::wstring objPath = MsObjPath(ef);
+            if (!objPath.empty() && objPath[0] == L'$') objPath = objPath.substr(1);
+            std::wstring script;
+            if (ef.type == (ParamType2)TYPE_BOOL) {
+                if (!g_favBoolToggled) {
+                    script = L"for obj in selection do try(local o=obj" + objPath +
+                        L";setProperty o #" + prop + L" (not (getProperty o #" + prop + L")))catch()";
+                    g_favBoolToggled = true;
+                }
+            } else if (IsFloat(ef.type)) {
+                std::wstring readScript = L"try((getProperty " + MsObjPath(ef) +
+                    L" #" + prop + L") as float)catch(0.0)";
+                FPValue value;
+                ExecuteMAXScriptScript(readScript.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &value);
+                float cur = value.type == TYPE_FLOAT ? value.f : 0.0f;
                 float a = cur < 0 ? -cur : cur;
-                float sc = a > 0.001f ? a * 0.01f : 0.001f;
-                if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
-                g_favDragChanged |= SetPB2FloatSafe(ef.pb, ef.id, ef.type, t, cur + (float)dx * sc);
-            } else if (ef.type == TYPE_BOOL && !g_favBoolToggled) {
-                g_favDragChanged |= TogglePB2BoolSafe(ef.pb, ef.id, t);
-                g_favBoolToggled = true;
+                float scale = a > 0.001f ? a * 0.01f : 0.001f;
+                if (shift) scale *= 10.0f;
+                if (ctrl) scale *= 0.1f;
+                float inc = (float)dx * scale;
+                script = L"for obj in selection do try(local o=obj" + objPath +
+                    L";local v=getProperty o #" + prop +
+                    L";setProperty o #" + prop + L" (v+" + std::to_wstring(inc) + L"))catch()";
             } else if (IsInt(ef.type)) {
                 g_favDragAccum += dx;
-                int s = g_favDragAccum / 3;
-                if (s != 0) { g_favDragAccum -= s * 3; if (shift) s *= 10;
-                    g_favDragChanged |= SetPB2IntSafe(ef.pb, ef.id, ef.type, t, ef.pb->GetInt(ef.id, t) + s); }
+                int intStep = g_favDragAccum / 3;
+                if (intStep != 0) {
+                    g_favDragAccum -= intStep * 3;
+                    if (shift) intStep *= 10;
+                    script = L"for obj in selection do try(local o=obj" + objPath +
+                        L";local v=getProperty o #" + prop +
+                        L";setProperty o #" + prop + L" (v+" + std::to_wstring(intStep) + L"))catch()";
+                }
             }
+            if (!script.empty())
+                g_favDragChanged |= ExecuteMAXScriptScript(
+                    script.c_str(), MAXScript::ScriptSource::Dynamic) != FALSE;
         }
         if (ip) {
             for (int ni = 0; ni < ip->GetSelNodeCount(); ni++) {
