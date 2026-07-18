@@ -118,9 +118,221 @@ bool AssignParameterDrop(MtlBase* owner, MtlBase* dropped, const std::wstring& p
     return false;
 }
 
-// Qt material panels expose each picker through UI Automation. The picker's
-// automation ID ends with the ParamBlock2 internal name (for example,
-// "base_color_map"), which lets us assign to the exact slot under the cursor.
+std::wstring NormalizeSlotName(std::wstring_view value)
+{
+    std::wstring normalized;
+    normalized.reserve(value.size());
+    for (wchar_t ch : value)
+    {
+        if (iswalnum(ch)) normalized.push_back(static_cast<wchar_t>(towlower(ch)));
+    }
+    return normalized;
+}
+
+void AddUniqueName(std::vector<std::wstring>& names, std::wstring name)
+{
+    if (name.empty()) return;
+    if (std::find(names.begin(), names.end(), name) == names.end())
+        names.push_back(std::move(name));
+}
+
+bool IsStandardMaterial(MtlBase* owner)
+{
+    if (!owner) return false;
+    const Class_ID id = owner->ClassID();
+    return id == Class_ID(DMTL_CLASS_ID, 0) || id == Class_ID(DMTL2_CLASS_ID, 0);
+}
+
+std::vector<std::wstring> BuildDropLabelKeys(const std::wstring& label, bool standardMaterial)
+{
+    std::vector<std::wstring> keys;
+    const std::wstring raw = NormalizeSlotName(label);
+    AddUniqueName(keys, raw);
+
+    struct Alias { const wchar_t* label; const wchar_t* slot; };
+    static constexpr Alias aliases[] = {
+        { L"baseweight", L"base" },
+        { L"metalness", L"metallic" },
+        { L"specularweight", L"specular" },
+        { L"specularroughness", L"roughness" },
+        { L"specularior", L"ior" },
+        { L"specularanisotropy", L"anisotropytexture" },
+        { L"specularrotation", L"rotation" },
+        { L"transmissionweight", L"transmission" },
+        { L"scatter", L"scattering" },
+        { L"extraroughness", L"roughnessextra" },
+        { L"subsurfaceweight", L"subsurface" },
+        { L"subsurfaceradius", L"radius" },
+        { L"overridemedium", L"medium" },
+        { L"coatingweight", L"coating" },
+        { L"sheenweight", L"sheen" },
+        { L"filmthickness", L"filmwidth" },
+        { L"filmthicknessnm", L"filmwidth" },
+    };
+    for (const Alias& alias : aliases)
+    {
+        if (raw == alias.label)
+        {
+            AddUniqueName(keys, alias.slot);
+            break;
+        }
+    }
+
+    if (standardMaterial)
+    {
+        if (raw == L"ambient") AddUniqueName(keys, L"ambientcolor");
+        if (raw == L"diffuse") AddUniqueName(keys, L"diffusecolor");
+        if (raw == L"specular") AddUniqueName(keys, L"specularcolor");
+    }
+    return keys;
+}
+
+int ResolveSubTexmapSlot(MtlBase* owner, const std::wstring& label)
+{
+    if (!owner || label.empty()) return -1;
+    const std::vector<std::wstring> labelKeys =
+        BuildDropLabelKeys(label, IsStandardMaterial(owner));
+    if (labelKeys.empty()) return -1;
+
+    int match = -1;
+    for (int slot = 0; slot < owner->NumSubTexmaps(); ++slot)
+    {
+        std::vector<std::wstring> slotKeys;
+        const MSTR internalName = owner->GetSubTexmapSlotName(slot, false);
+        const MSTR localizedName = owner->GetSubTexmapSlotName(slot, true);
+        if (internalName.data())
+            AddUniqueName(slotKeys, NormalizeSlotName(internalName.data()));
+        if (localizedName.data())
+            AddUniqueName(slotKeys, NormalizeSlotName(localizedName.data()));
+
+        bool matches = false;
+        for (const std::wstring& labelKey : labelKeys)
+        {
+            if (std::find(slotKeys.begin(), slotKeys.end(), labelKey) != slotKeys.end())
+            {
+                matches = true;
+                break;
+            }
+        }
+        if (!matches) continue;
+        if (match >= 0 && match != slot) return -1;
+        match = slot;
+    }
+    return match;
+}
+
+struct RowLabelSearch
+{
+    RECT target{};
+    DWORD processId = 0;
+    std::wstring label;
+    long long score = 0x7fffffffffffffffLL;
+};
+
+BOOL CALLBACK FindRowLabelWindow(HWND hwnd, LPARAM data)
+{
+    RowLabelSearch* search = reinterpret_cast<RowLabelSearch*>(data);
+    if (!search || !IsWindowVisible(hwnd)) return TRUE;
+
+    DWORD processId = 0;
+    GetWindowThreadProcessId(hwnd, &processId);
+    if (processId != search->processId) return TRUE;
+
+    wchar_t className[64] = {};
+    if (!GetClassNameW(hwnd, className, static_cast<int>(std::size(className))) ||
+        _wcsicmp(className, L"Static") != 0)
+        return TRUE;
+
+    const int textLength = GetWindowTextLengthW(hwnd);
+    if (textLength <= 0) return TRUE;
+    std::vector<wchar_t> text(static_cast<size_t>(textLength) + 1, L'\0');
+    GetWindowTextW(hwnd, text.data(), textLength + 1);
+    if (NormalizeSlotName(text.data()).empty()) return TRUE;
+
+    RECT rect{};
+    if (!GetWindowRect(hwnd, &rect)) return TRUE;
+    const int targetCenter = (search->target.top + search->target.bottom) / 2;
+    const int labelCenter = (rect.top + rect.bottom) / 2;
+    const int verticalDistance = std::abs(targetCenter - labelCenter);
+    const int targetHeight = search->target.bottom - search->target.top;
+    const int verticalTolerance = std::max(14, targetHeight / 2 + 4);
+    if (verticalDistance > verticalTolerance || rect.right > search->target.left + 4)
+        return TRUE;
+
+    const LONG horizontalDistance = std::max<LONG>(0, search->target.left - rect.right);
+    const long long score = static_cast<long long>(verticalDistance) * 10000LL +
+        horizontalDistance;
+    if (score < search->score)
+    {
+        search->score = score;
+        search->label.assign(text.data());
+    }
+    return TRUE;
+}
+
+std::wstring FindNearbyRowLabel(HWND control)
+{
+    if (!control || !IsWindow(control)) return {};
+    HWND root = GetAncestor(control, GA_ROOT);
+    if (!root) return {};
+
+    RowLabelSearch search;
+    if (!GetWindowRect(control, &search.target)) return {};
+    GetWindowThreadProcessId(control, &search.processId);
+    EnumChildWindows(root, FindRowLabelWindow, reinterpret_cast<LPARAM>(&search));
+    return search.label;
+}
+
+std::wstring GetAutomationName(IUIAutomationElement* element)
+{
+    if (!element) return {};
+    BSTR value = nullptr;
+    if (FAILED(element->get_CurrentName(&value)) || !value) return {};
+    std::wstring name(value, SysStringLen(value));
+    SysFreeString(value);
+    return name;
+}
+
+std::wstring GetAutomationClassName(IUIAutomationElement* element)
+{
+    if (!element) return {};
+    BSTR value = nullptr;
+    if (FAILED(element->get_CurrentClassName(&value)) || !value) return {};
+    std::wstring name(value, SysStringLen(value));
+    SysFreeString(value);
+    return name;
+}
+
+bool IsGenericPickerName(const std::wstring& name)
+{
+    const std::wstring key = NormalizeSlotName(name);
+    return key.empty() || key == L"value" || key == L"nomap" || key == L"none" ||
+        key == L"user1" || key == L"dropdownbutton";
+}
+
+bool AssignNamedSubTexmapDrop(MtlBase* owner, MtlBase* dropped, const std::wstring& label)
+{
+    if (!owner || !dropped || owner == dropped ||
+        dropped->SuperClassID() != TEXMAP_CLASS_ID)
+        return false;
+
+    const int slot = ResolveSubTexmapSlot(owner, label);
+    if (slot < 0) return false;
+
+    Texmap* map = static_cast<Texmap*>(dropped);
+    owner->SetSubTexmap(slot, map);
+    if (owner->GetSubTexmap(slot) != map) return false;
+
+    if (IsStandardMaterial(owner))
+        static_cast<StdMat*>(owner)->EnableMap(slot, TRUE);
+
+    owner->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
+    if (Interface* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
+    return true;
+}
+
+// Qt pickers expose the ParamBlock2 internal name through UI Automation. Native
+// material panels instead expose a picker HWND and a visible row label.
 bool TryQtMeditParameterDrop(MtlBase* dropped)
 {
     if (!dropped) return false;
@@ -152,12 +364,16 @@ bool TryQtMeditParameterDrop(MtlBase* dropped)
         automation->get_RawViewWalker(&walker);
 
     bool assigned = false;
+    HWND nativePicker = nullptr;
+    std::wstring pickerName;
     for (int depth = 0; element && depth < 6 && !assigned; ++depth)
     {
         int processId = 0;
         CONTROLTYPEID controlType = 0;
+        UIA_HWND nativeHandle = nullptr;
         element->get_CurrentProcessId(&processId);
         element->get_CurrentControlType(&controlType);
+        element->get_CurrentNativeWindowHandle(&nativeHandle);
 
         if (processId == static_cast<int>(GetCurrentProcessId()) &&
             controlType == UIA_ButtonControlTypeId)
@@ -174,6 +390,20 @@ bool TryQtMeditParameterDrop(MtlBase* dropped)
             }
         }
 
+        if (!assigned && !nativePicker &&
+            processId == static_cast<int>(GetCurrentProcessId()) && nativeHandle)
+        {
+            const std::wstring className = GetAutomationClassName(element);
+            if ((_wcsicmp(className.c_str(), L"CustButton") == 0 ||
+                 _wcsicmp(className.c_str(), L"ComboBox") == 0) &&
+                IsWindow(static_cast<HWND>(nativeHandle)))
+            {
+                nativePicker = static_cast<HWND>(nativeHandle);
+                const std::wstring name = GetAutomationName(element);
+                if (!IsGenericPickerName(name)) pickerName = name;
+            }
+        }
+
         if (!assigned && walker)
         {
             IUIAutomationElement* parent = nullptr;
@@ -181,6 +411,13 @@ bool TryQtMeditParameterDrop(MtlBase* dropped)
             element->Release();
             element = parent;
         }
+    }
+
+    if (!assigned && nativePicker)
+    {
+        std::wstring label = FindNearbyRowLabel(nativePicker);
+        if (label.empty()) label = pickerName;
+        assigned = AssignNamedSubTexmapDrop(owner, dropped, label);
     }
 
     if (element) element->Release();
