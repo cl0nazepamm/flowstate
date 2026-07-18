@@ -25,6 +25,7 @@
 #include "normalize_edges/normalize_poly.h"
 #include "modifiers/loop_subdivision/loop_subdivision.h"
 #include <cmath>
+#include <atomic>
 #include <string>
 #include <vector>
 #include <set>
@@ -67,7 +68,8 @@ static const int kEditW     = 96;
 static const int kEditH     = 22;
 static const int kMaxParams = 50;
 static const int kMinW      = 320;
-static const int kRefreshMs = 500;
+static const UINT_PTR kPB1FallbackTimerId = 0x4653;
+static const UINT kPB1FallbackMs = 2000;
 static const int kBtnW      = 30;    // side button width
 static const int kBtnH      = 20;    // side button height
 static const int kBtnGap    = 2;     // gap between side buttons
@@ -807,10 +809,22 @@ static bool     g_visEditMode   = false;  // visibility edit mode — shows hidd
 static const UINT WM_PP_TOGGLE   = WM_USER + 100;
 static const UINT WM_PP_GRAB_START = WM_USER + 106;
 static const UINT WM_PP_GRAB_END   = WM_USER + 107;
+static const UINT WM_PP_REFRESH    = WM_APP + 41;
+
+enum PanelRefreshFlags : unsigned {
+    PANEL_REFRESH_VALUES    = 1u << 0,
+    PANEL_REFRESH_SELECTION = 1u << 1,
+    PANEL_REFRESH_STRUCTURE = 1u << 2,
+};
+
+static std::atomic<unsigned> g_panelRefreshFlags { 0 };
+static std::atomic<bool>     g_panelRefreshPosted { false };
+static std::atomic<bool>     g_panelObserversActive { false };
 
 // Forward declarations
 static LRESULT CALLBACK ModSearchEditProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 static void KillActiveEdit(bool apply);
+static void QueuePanelRefresh(unsigned flags);
 
 // Modifier search cache
 struct ModCacheEntry { std::wstring label; std::wstring normLabel; std::wstring search; std::wstring internalName; ClassDesc* cd = nullptr; SClass_ID sid = 0; };
@@ -974,8 +988,149 @@ static const TCHAR* kFavClass = _T("PPFavStrip");
 static std::set<std::wstring> g_favorites;
 static std::vector<EditField> g_favEdits;
 static const int kFavMaxParams = 12;
+static std::map<std::wstring, std::wstring> g_pb1ValueCache;
 
 static ULONG        g_nodeHandle       = 0;
+
+static std::wstring PB1CacheKey(const EditField& ef) {
+    size_t sep = ef.key.find(L':');
+    const std::wstring prop = sep == std::wstring::npos ? ef.key : ef.key.substr(sep + 1);
+    return ef.msPath + L"\x1f" + prop;
+}
+
+static std::wstring NormalizePB1DisplayValue(const std::wstring& raw, ParamType2 type) {
+    if (type == (ParamType2)TYPE_BOOL) {
+        if (_wcsicmp(raw.c_str(), L"true") == 0 ||
+            _wcsicmp(raw.c_str(), L"on") == 0 || raw == L"1")
+            return L"On";
+        if (_wcsicmp(raw.c_str(), L"false") == 0 ||
+            _wcsicmp(raw.c_str(), L"off") == 0 || raw == L"0")
+            return L"Off";
+    }
+    return raw;
+}
+
+static void QueuePanelRefresh(unsigned flags) {
+    if (!g_panelObserversActive.load(std::memory_order_acquire) || !g_panel) return;
+    g_panelRefreshFlags.fetch_or(flags, std::memory_order_relaxed);
+    bool expected = false;
+    if (g_panelRefreshPosted.compare_exchange_strong(expected, true,
+            std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        if (!PostMessage(g_panel, WM_PP_REFRESH, 0, 0))
+            g_panelRefreshPosted.store(false, std::memory_order_release);
+    }
+}
+
+class PanelNodeWatcher final : public SingleRefMaker {
+public:
+    PanelNodeWatcher() : SingleRefMaker(Never) {}
+
+    void GetClassName(MSTR& s, bool localized = true) const override {
+        UNUSED_PARAM(localized);
+        s = _T("FlowStatePanelNodeWatcher");
+    }
+
+    RefResult NotifyRefChanged(const Interval& changeInt, RefTargetHandle hTarget,
+                               PartID& partID, RefMessage message, BOOL propagate) override {
+        if (g_panelObserversActive.load(std::memory_order_acquire)) {
+            switch (message) {
+            case REFMSG_CHANGE:
+                // Moving the selected node does not change any displayed parameter.
+                if (partID != PART_TM) QueuePanelRefresh(PANEL_REFRESH_VALUES);
+                break;
+            case REFMSG_TARGET_SELECTIONCHANGE:
+            case REFMSG_CONTROLREF_CHANGE:
+            case REFMSG_BECOMING_ANIMATED:
+            case REFMSG_SUBANIM_STRUCTURE_CHANGED:
+            case REFMSG_REF_DELETED:
+            case REFMSG_REF_ADDED:
+                QueuePanelRefresh(PANEL_REFRESH_VALUES);
+                break;
+            case REFMSG_NODE_NAMECHANGE:
+                QueuePanelRefresh(PANEL_REFRESH_SELECTION);
+                break;
+            case REFMSG_TARGET_DELETED:
+                QueuePanelRefresh(PANEL_REFRESH_SELECTION | PANEL_REFRESH_STRUCTURE);
+                break;
+            case REFMSG_OBREF_CHANGE:
+            case REFMSG_MODIFIER_ADDED:
+            case REFMSG_OBJECT_REPLACED:
+                QueuePanelRefresh(PANEL_REFRESH_STRUCTURE);
+                break;
+            }
+        }
+        return SingleRefMaker::NotifyRefChanged(
+            changeInt, hTarget, partID, message, propagate);
+    }
+};
+
+class PanelTimeChangeCallback final : public TimeChangeCallback {
+public:
+    void TimeChanged(TimeValue) override {
+        if (g_panelObserversActive.load(std::memory_order_acquire))
+            QueuePanelRefresh(PANEL_REFRESH_VALUES);
+    }
+};
+
+static PanelNodeWatcher* g_panelNodeWatcher = nullptr;
+static PanelTimeChangeCallback g_panelTimeChangeCallback;
+
+static unsigned g_panelSelectionNotifyFlags = PANEL_REFRESH_SELECTION | PANEL_REFRESH_VALUES;
+static unsigned g_panelValueNotifyFlags = PANEL_REFRESH_VALUES;
+static unsigned g_panelStructureNotifyFlags = PANEL_REFRESH_STRUCTURE;
+
+static void PanelRefreshNotifyCB(void* param, NotifyInfo*) {
+    if (!g_panelObserversActive.load(std::memory_order_acquire) || !param) return;
+    QueuePanelRefresh(*static_cast<unsigned*>(param));
+}
+
+static void StartPanelObservers() {
+    if (g_panelObserversActive.load(std::memory_order_acquire)) return;
+
+    if (!g_panelNodeWatcher)
+        g_panelNodeWatcher = new PanelNodeWatcher();
+
+    Interface* ip = GetCOREInterface();
+    INode* node = (ip && ip->GetSelNodeCount() > 0) ? ip->GetSelNode(0) : nullptr;
+    g_panelNodeWatcher->SetRef(node);
+
+    RegisterNotification(PanelRefreshNotifyCB, &g_panelSelectionNotifyFlags,
+                         NOTIFY_SELECTIONSET_CHANGED);
+    RegisterNotification(PanelRefreshNotifyCB, &g_panelSelectionNotifyFlags,
+                         NOTIFY_NODE_RENAMED);
+    RegisterNotification(PanelRefreshNotifyCB, &g_panelValueNotifyFlags,
+                         NOTIFY_MODPANEL_SEL_CHANGED);
+    RegisterNotification(PanelRefreshNotifyCB, &g_panelValueNotifyFlags,
+                         NOTIFY_MODPANEL_SUBOBJECTLEVEL_CHANGED);
+    RegisterNotification(PanelRefreshNotifyCB, &g_panelStructureNotifyFlags,
+                         NOTIFY_POST_MODIFIER_ADDED);
+    RegisterNotification(PanelRefreshNotifyCB, &g_panelStructureNotifyFlags,
+                         NOTIFY_POST_MODIFIER_DELETED);
+    if (ip) ip->RegisterTimeChangeCallback(&g_panelTimeChangeCallback);
+    g_panelObserversActive.store(true, std::memory_order_release);
+}
+
+static void StopPanelObservers() {
+    if (g_panelObserversActive.exchange(false, std::memory_order_acq_rel)) {
+        UnRegisterNotification(PanelRefreshNotifyCB, &g_panelSelectionNotifyFlags,
+                               NOTIFY_SELECTIONSET_CHANGED);
+        UnRegisterNotification(PanelRefreshNotifyCB, &g_panelSelectionNotifyFlags,
+                               NOTIFY_NODE_RENAMED);
+        UnRegisterNotification(PanelRefreshNotifyCB, &g_panelValueNotifyFlags,
+                               NOTIFY_MODPANEL_SEL_CHANGED);
+        UnRegisterNotification(PanelRefreshNotifyCB, &g_panelValueNotifyFlags,
+                               NOTIFY_MODPANEL_SUBOBJECTLEVEL_CHANGED);
+        UnRegisterNotification(PanelRefreshNotifyCB, &g_panelStructureNotifyFlags,
+                               NOTIFY_POST_MODIFIER_ADDED);
+        UnRegisterNotification(PanelRefreshNotifyCB, &g_panelStructureNotifyFlags,
+                               NOTIFY_POST_MODIFIER_DELETED);
+        if (Interface* ip = GetCOREInterface())
+            ip->UnRegisterTimeChangeCallback(&g_panelTimeChangeCallback);
+    }
+    if (g_panelNodeWatcher) g_panelNodeWatcher->SetRef(nullptr);
+    g_panelRefreshFlags.store(0, std::memory_order_release);
+    g_panelRefreshPosted.store(false, std::memory_order_release);
+}
 
 // EPoly takeover state — active tool detected on panel open
 static int          g_epolyOp       = -1;
@@ -2273,6 +2428,7 @@ static void SpawnEditAt(int paramIdx);
 static int  FindParamAtY(int clickY);
 static LRESULT CALLBACK ModSearchEditProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 static void BuildLayout();
+static void RefreshPB1ValueCache();
 
 // ── Mouse hook — Mouse5=panel, Mouse4=pin ───────────────────────
 // Uses WH_MOUSE (thread-level) instead of WH_MOUSE_LL (system-wide)
@@ -2322,6 +2478,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
         s_xb1Changed = false;
         s_xb1BoolToggledV = false;
         s_xb1BoolToggledH = false;
+        QueuePanelRefresh(PANEL_REFRESH_VALUES);
         HideDragTip();
     };
 
@@ -3336,6 +3493,8 @@ static void CollectAllParams(ReferenceTarget* obj, const std::wstring& groupTitl
                 ef.type  = (typeChar == L'f') ? (ParamType2)TYPE_FLOAT
                          : (typeChar == L'b') ? (ParamType2)TYPE_BOOL
                          : (ParamType2)TYPE_INT;
+                g_pb1ValueCache[PB1CacheKey(ef)] =
+                    NormalizePB1DisplayValue(line.substr(sep2 + 1), ef.type);
                 g_edits.push_back(ef);
                 tot++;
             }
@@ -3552,6 +3711,7 @@ static void GatherParams() {
     g_groups.clear();
     g_edits.clear();
     g_actions.clear();
+    g_pb1ValueCache.clear();
     g_nodeName.clear();
     g_nodeHandle = 0;
     g_epolyOp = -1;
@@ -3736,6 +3896,17 @@ static void GatherParams() {
         if (gh.count > 0) g_groups.push_back(gh);
     }
 
+    // PB1 enumeration already returns initial values. A few scripted extras
+    // are added outside that enumeration, so fill only if any cache entry is
+    // still missing before the first paint.
+    for (const EditField& ef : g_edits) {
+        if (!ef.pb && !ef.msPath.empty() &&
+            g_pb1ValueCache.find(PB1CacheKey(ef)) == g_pb1ValueCache.end()) {
+            RefreshPB1ValueCache();
+            break;
+        }
+    }
+
 }
 
 
@@ -3745,27 +3916,109 @@ static std::wstring PropFromKey(const EditField& ef) {
     return (sep != std::wstring::npos) ? ef.key.substr(sep + 1) : ef.key;
 }
 
+static bool IsPB1Field(const EditField& ef) {
+    return !ef.pb && !ef.msPath.empty();
+}
+
+static void StorePB1Value(const EditField& ef, const std::wstring& raw) {
+    if (!IsPB1Field(ef)) return;
+    g_pb1ValueCache[PB1CacheKey(ef)] = NormalizePB1DisplayValue(raw, ef.type);
+}
+
+static bool RefreshPB1ValueNow(const EditField& ef) {
+    if (!IsPB1Field(ef)) return false;
+    const std::wstring prop = PropFromKey(ef);
+    const std::wstring script = L"try((getProperty " +
+        MsFirstSelectedPath(ef.msPath) + L" #" + prop +
+        L") as string)catch(\"--\")";
+    FPValue result;
+    const BOOL ok = ExecuteMAXScriptScript(script.c_str(),
+        MAXScript::ScriptSource::Dynamic, TRUE, &result);
+    if (!ok || result.type != TYPE_STRING || !result.s) return false;
+    StorePB1Value(ef, result.s);
+    return true;
+}
+
+static void RefreshPB1ValueCache() {
+    struct BatchEntry {
+        std::wstring cacheKey;
+        std::wstring path;
+        std::wstring prop;
+        ParamType2 type;
+    };
+
+    std::vector<BatchEntry> entries;
+    std::set<std::wstring> seen;
+    auto addField = [&](const EditField& ef) {
+        if (!IsPB1Field(ef)) return;
+        const std::wstring cacheKey = PB1CacheKey(ef);
+        if (!seen.insert(cacheKey).second) return;
+        entries.push_back({ cacheKey, MsFirstSelectedPath(ef.msPath),
+                            PropFromKey(ef), ef.type });
+    };
+    for (const EditField& ef : g_edits) addField(ef);
+    for (const EditField& ef : g_favEdits) addField(ef);
+    if (entries.empty()) return;
+
+    // One MAXScript boundary for every legacy field. Paint and brick refreshes
+    // only consume this cache and never execute script themselves.
+    std::wstring script = L"(local s=\"\";";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const std::wstring index = std::to_wstring(i);
+        script += L"try(s+=\"" + index + L"|\"+((getProperty " +
+            entries[i].path + L" #" + entries[i].prop +
+            L") as string)+\"\\n\")catch(s+=\"" + index + L"|--\\n\");";
+    }
+    script += L"s)";
+
+    FPValue result;
+    const BOOL ok = ExecuteMAXScriptScript(script.c_str(),
+        MAXScript::ScriptSource::Dynamic, TRUE, &result);
+    if (!ok || result.type != TYPE_STRING || !result.s) return;
+
+    std::wstring data(result.s);
+    size_t pos = 0;
+    while (pos < data.size()) {
+        size_t nl = data.find(L'\n', pos);
+        if (nl == std::wstring::npos) nl = data.size();
+        const std::wstring line = data.substr(pos, nl - pos);
+        pos = nl + 1;
+        const size_t sep = line.find(L'|');
+        if (sep == std::wstring::npos) continue;
+        const int index = _wtoi(line.substr(0, sep).c_str());
+        if (index < 0 || index >= (int)entries.size()) continue;
+        g_pb1ValueCache[entries[index].cacheKey] =
+            NormalizePB1DisplayValue(line.substr(sep + 1), entries[index].type);
+    }
+}
+
+static bool HasPB1Fields() {
+    for (const EditField& ef : g_edits)
+        if (IsPB1Field(ef)) return true;
+    for (const EditField& ef : g_favEdits)
+        if (IsPB1Field(ef)) return true;
+    return false;
+}
+
+static void UpdatePB1FallbackTimer() {
+    if (!g_panel) return;
+    KillTimer(g_panel, kPB1FallbackTimerId);
+    if (g_open && HasPB1Fields())
+        SetTimer(g_panel, kPB1FallbackTimerId, kPB1FallbackMs, nullptr);
+}
+
 static void FormatValue(const EditField& ef, TimeValue t, TCHAR* buf, int len) {
     // Spline op values — read from local storage (sentinel-marked IDs)
     if (!ef.pb && (int)ef.id >= kSpSentinel && (int)ef.id < kSpSentinel + kSpCount) {
         swprintf(buf, len, _T("%.4g"), g_splineVals[(int)ef.id - kSpSentinel]);
         return;
     }
-    // MaxScript-based params (legacy PB1 objects)
+    // Legacy PB1 values are populated in a single batched read when the
+    // selected node reports a change. Never execute MAXScript from WM_PAINT.
     if (!ef.pb) {
-        std::wstring prop = PropFromKey(ef);
-        std::wstring path = MsFirstSelectedPath(ef.msPath);
-        std::wstring script = L"try((getProperty " + path + L" #" + prop + L") as string)catch(\"--\")";
-        FPValue result;
-        BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic,
-            TRUE, &result);
-        if (ok && result.type == TYPE_STRING && result.s) {
-            // Convert "true"/"false" to 1/0
-            if (_wcsicmp(result.s, L"true") == 0) swprintf(buf, len, _T("On"));
-            else if (_wcsicmp(result.s, L"false") == 0) swprintf(buf, len, _T("Off"));
-            else swprintf(buf, len, _T("%s"), result.s);
-        } else
-            swprintf(buf, len, _T("--"));
+        const auto it = g_pb1ValueCache.find(PB1CacheKey(ef));
+        swprintf(buf, len, _T("%s"),
+            it != g_pb1ValueCache.end() ? it->second.c_str() : _T("--"));
         return;
     }
     if (IsFloat(ef.type))      swprintf(buf, len, _T("%.4g"), ef.pb->GetFloat(ef.id, t));
@@ -3897,6 +4150,7 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     if (ok) theHold.Accept(_T("Set Pinned Parameter"));
                     else theHold.Cancel();
                 }
+                if (ok) RefreshPB1ValueNow(*ef);
             }
             NotifyParamChanged();
             InvalidateRect(g_panel, nullptr, FALSE);
@@ -3961,6 +4215,7 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 if (ok) theHold.Accept(_T("Adjust Pinned Parameter"));
                 else theHold.Cancel();
             }
+            if (ok) RefreshPB1ValueNow(*ef);
         }
         NotifyParamChanged();
         TCHAR buf[64]; FormatValue(*ef, t, buf, 64);
@@ -4542,6 +4797,7 @@ static void KillActiveEdit(bool apply) {
                 if (ok) theHold.Accept(_T("Set Parameter"));
                 else theHold.Cancel();
             }
+            if (ok) RefreshPB1ValueNow(ef);
             NotifyParamChanged();
         }
     }
@@ -4573,6 +4829,7 @@ static void SpawnEditAt(int paramIdx) {
     // Fill with current value
     Interface* ip = GetCOREInterface();
     TimeValue t = ip ? ip->GetTime() : 0;
+    if (IsPB1Field(ef)) RefreshPB1ValueNow(ef);
     TCHAR buf[64]; FormatValue(ef, t, buf, 64);
     SetWindowText(g_editHwnd, buf);
     SetFocus(g_editHwnd);
@@ -4974,15 +5231,14 @@ static void PositionFavStrip() {
 static void RefreshFavoritesStrip() {
     BuildFavorites();
     PositionFavStrip();
+    UpdatePB1FallbackTimer();
     if (!g_favWnd) return;
 
     if (g_favEdits.empty()) {
-        KillTimer(g_favWnd, 1);
         ShowWindow(g_favWnd, SW_HIDE);
         return;
     }
 
-    SetTimer(g_favWnd, 1, kRefreshMs, nullptr);
     if (!g_freshOpen) {
         ShowWindow(g_favWnd, SW_SHOWNOACTIVATE);
         InvalidateRect(g_favWnd, nullptr, TRUE);
@@ -5082,10 +5338,6 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             EnableAccelerators();
         }
         break;
-    case WM_TIMER:
-        RefreshFavEdits();
-        return 0;
-
     // ── Drag scrub on label area (above edit controls) ──────────
     case WM_LBUTTONDOWN: {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
@@ -5159,9 +5411,12 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                         L";setProperty o #" + prop + L" (v+" + std::to_wstring(intStep) + L"))catch()";
                 }
             }
-            if (!script.empty())
-                g_favDragChanged |= ExecuteMAXScriptScript(
+            if (!script.empty()) {
+                const bool changed = ExecuteMAXScriptScript(
                     script.c_str(), MAXScript::ScriptSource::Dynamic) != FALSE;
+                g_favDragChanged |= changed;
+                if (changed) RefreshPB1ValueNow(ef);
+            }
         }
         if (ip && !splineFakeDrag) {
             for (int ni = 0; ni < ip->GetSelNodeCount(); ni++) {
@@ -5194,6 +5449,7 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         g_favDragChanged = false;
         g_favBoolToggled = false;
         SetCursor(LoadCursor(nullptr, IDC_ARROW));
+        QueuePanelRefresh(PANEL_REFRESH_VALUES);
         return 0;
     }
     case WM_CAPTURECHANGED:
@@ -5220,6 +5476,41 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
+static void ProcessPanelRefresh() {
+    const unsigned flags = g_panelRefreshFlags.exchange(0, std::memory_order_acq_rel);
+    g_panelRefreshPosted.store(false, std::memory_order_release);
+    if (!flags || !g_open) return;
+
+    Interface* ip = GetCOREInterface();
+    INode* node = (ip && ip->GetSelNodeCount() > 0) ? ip->GetSelNode(0) : nullptr;
+    const MCHAR* nodeName = node ? node->GetName() : nullptr;
+    const std::wstring currentName = nodeName ? nodeName : L"";
+    if (!node || node->GetHandle() != g_nodeHandle || currentName != g_nodeName) {
+        ClosePanel();
+        return;
+    }
+
+    if (flags & PANEL_REFRESH_STRUCTURE) {
+        KillActiveEdit(false);
+        CancelPanelValueDrag();
+        CancelFavDrag();
+        GatherParams();
+        BuildLayout();
+        RefreshFavoritesStrip();
+    } else {
+        // Active scrubs maintain the dragged PB1 cache entry directly. Batch
+        // the whole legacy set once the drag ends instead of on every pixel.
+        if (!g_lmbDragging && !g_favDragging && !s_xb1Dragging)
+            RefreshPB1ValueCache();
+        PositionBtnStrips();
+        InvalidateRect(g_panel, nullptr, FALSE);
+        RefreshFavEdits();
+    }
+
+    const unsigned pending = g_panelRefreshFlags.load(std::memory_order_acquire);
+    if (pending) QueuePanelRefresh(pending);
+}
+
 // ── Window proc ─────────────────────────────────────────────────
 static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -5228,6 +5519,10 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_USER + 101:
         if (g_open) ClosePanel();
+        return 0;
+
+    case WM_PP_REFRESH:
+        ProcessPanelRefresh();
         return 0;
 
     case WM_PP_GRAB_START:
@@ -5545,6 +5840,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_lmbDragOwnHold = false;
             g_lmbDragChanged = false;
             g_lmbBoolToggled = false;
+            QueuePanelRefresh(PANEL_REFRESH_VALUES);
         }
         return 0;
     }
@@ -5674,13 +5970,10 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         }
                     }
                 } else if (!ef.msPath.empty()) {
-                    size_t sep = ef.key.find(L':');
-                    if (sep != std::wstring::npos) {
-                        std::wstring prop = ef.key.substr(sep + 1);
-                        std::wstring readS = L"try((getProperty " + MsFirstSelectedPath(ef.msPath) + L" #" + prop + L") as string)catch(\"\")";
-                        FPValue rv; ExecuteMAXScriptScript(readS.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &rv);
-                        if (rv.type == TYPE_STRING && rv.s) tip += rv.s;
-                    }
+                    RefreshPB1ValueNow(ef);
+                    wchar_t buf[64];
+                    FormatValue(ef, t, buf, 64);
+                    tip += buf;
                 }
                 ShowDragTip(scr, tip);
             }
@@ -5869,6 +6162,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (ok) theHold.Accept(_T("Adjust Parameter"));
                     else theHold.Cancel();
                 }
+                if (ok) RefreshPB1ValueNow(ef);
                 NotifyParamChanged();
             }
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -5887,25 +6181,12 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
-    case WM_TIMER: {
-        // Check if node changed
-        Interface* ipt = GetCOREInterface();
-        if (ipt) {
-            if (ipt->GetSelNodeCount() == 0) { ClosePanel(); return 0; }
-            INode* nd = ipt->GetSelNode(0);
-            if (!nd) { ClosePanel(); return 0; }
-            ULONG h = nd->GetHandle();
-            const MCHAR* nn = nd->GetName();
-            std::wstring cur = nn ? nn : L"";
-            if (h != g_nodeHandle || cur != g_nodeName) { ClosePanel(); return 0; }
+    case WM_TIMER:
+        if (wp == kPB1FallbackTimerId) {
+            QueuePanelRefresh(PANEL_REFRESH_VALUES);
+            return 0;
         }
-        // Update button visibility based on modify mode
-        PositionBtnStrips();
-        // Values are painted — just repaint to show updated values
-        InvalidateRect(hwnd, nullptr, FALSE);
-        RefreshFavEdits();
-        return 0;
-    }
+        break;
 
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) {
@@ -5985,9 +6266,7 @@ static void OpenPanel() {
         fadeComps[fadeCompCount++] = g_btnRight;
     FadeIn(g_panel, fadeComps, fadeCompCount);
     g_freshOpen = false;
-    SetTimer(g_panel, 1, kRefreshMs, nullptr);
-    if (g_favWnd && !g_favEdits.empty())
-        SetTimer(g_favWnd, 1, kRefreshMs, nullptr);
+    StartPanelObservers();
 
     // Create search bar in header
     if (!g_modSearchEdit) {
@@ -6013,6 +6292,8 @@ static void OpenPanel() {
 
 static void ClosePanel() {
     if (!g_open) return;
+    StopPanelObservers();
+    KillTimer(g_panel, kPB1FallbackTimerId);
     if (g_screenGrabState != SCREEN_GRAB_NONE)
         EndScreenGrab(false);
     ExitModSearch();
@@ -6035,7 +6316,6 @@ static void ClosePanel() {
     g_epolyFP = nullptr;
     g_epolyPreview = false;
 
-    KillTimer(g_panel, 1);
     KillActiveEdit(false);
     CancelPanelValueDrag();
     CancelFavDrag();
@@ -6047,9 +6327,10 @@ static void ClosePanel() {
     g_hoverParam = -1;
     g_edits.clear();
     g_groups.clear();
+    g_pb1ValueCache.clear();
     if (g_btnLeft)  ShowWindow(g_btnLeft, SW_HIDE);
     if (g_btnRight) ShowWindow(g_btnRight, SW_HIDE);
-    if (g_favWnd)   { KillTimer(g_favWnd, 1); DestroyFavEdits(); ShowWindow(g_favWnd, SW_HIDE); }
+    if (g_favWnd)   { DestroyFavEdits(); ShowWindow(g_favWnd, SW_HIDE); }
     FadeOut(g_panel);
     if (g_toolTip) ShowWindow(g_toolTip, SW_HIDE);
     g_open = false;
@@ -6359,6 +6640,11 @@ public:
         ModStack::Shutdown();
         PowerShader::Shutdown();
         ClosePanel();
+        StopPanelObservers();
+        if (g_panelNodeWatcher) {
+            g_panelNodeWatcher->DeleteThis();
+            g_panelNodeWatcher = nullptr;
+        }
         if (g_btnLeft)  { DestroyWindow(g_btnLeft);  g_btnLeft = nullptr; }
         if (g_btnRight) { DestroyWindow(g_btnRight); g_btnRight = nullptr; }
         if (g_favWnd)   { DestroyFavEdits(); DestroyWindow(g_favWnd); g_favWnd = nullptr; }

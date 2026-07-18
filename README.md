@@ -103,6 +103,7 @@ Release packages require both `FlowState.gup` and `flowstate_config.ms`.
 - Auto Orbit requires Autocam.gup to exist. If you removed it please restore it, otherwise automatic orbit will not work. If you don't know what I am talking about just ignore what I said.
 - F2 Extend can fail with weird angles.
 - Screen Grab and UV Grab are work in progress so avoid using them as they're buggy.
+- Dynamic POI is a literal hack, it can show wrong cursor for a split second and it uses polling. Other modes are much cleaner.
 
 ## Build
 
