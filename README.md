@@ -26,8 +26,6 @@ Release packages require both `FlowState.gup` and `flowstate_config.ms`.
 - SHLL button creates a shell material for textured viewports for renderers that fail to display nitrous textures. Right click to change bitmap resolution.
 - LINK button links U and V tile of bitmap nodes (including uberbitmap)
 
-- <img src="images/shader_search_utility.png" alt="Shader Search Utility" width="320">
-
 ### Floating Modifier Stack
 
 - Shows object, modifier and Editable Poly parameters
@@ -41,7 +39,6 @@ Release packages require both `FlowState.gup` and `flowstate_config.ms`.
 - Esc cancels and closes
 - Hit the O button in the panel to hide parameters completely
 
-- <img src="images/floating_modifier_stack.png" alt="Floating Modifier Stack" width="320">
 
 ### Auto Orbit
 
@@ -95,6 +92,10 @@ Release packages require both `FlowState.gup` and `flowstate_config.ms`.
 - Threshold controls how many straight verts it catches
 - Keep Select Only on to preview them
 - Turn Select Only off to remove them
+
+## Interface
+- <img src="images/flowstate.png" alt="Interface" width="320">
+
 
 ## Issues
 
