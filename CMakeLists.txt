@@ -133,6 +133,7 @@ target_link_libraries(FlowState PRIVATE
     poly.lib
     bmm.lib
     gdiplus.lib
+    uiautomationcore.lib
 )
 if(MSVC)
     target_compile_options(FlowState PRIVATE /EHa /O2 /fp:fast /openmp)

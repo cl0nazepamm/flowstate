@@ -335,6 +335,28 @@ static bool MatchRings(const MNMesh& mesh, const EdgeRing& r1, const EdgeRing& r
     return true;
 }
 
+// Give the whole bridge one shared smoothing mask. Reusing the neighboring
+// faces' groups also keeps the bridge smooth across either boundary wherever
+// the source surface is already smoothed. MNMesh::NewQuad defaults to group 0,
+// which makes every generated quad render faceted.
+static DWORD BridgeSmoothingGroup(MNMesh& mesh,
+                                  const std::vector<int>& loopEdges) {
+    DWORD smoothingGroup = 0;
+    for (int edgeIndex : loopEdges) {
+        if (edgeIndex < 0 || edgeIndex >= mesh.ENum()) continue;
+        const MNEdge* edge = mesh.E(edgeIndex);
+        if (!edge) continue;
+
+        const int adjacentFaces[2] = { edge->f1, edge->f2 };
+        for (int faceIndex : adjacentFaces) {
+            if (faceIndex < 0 || faceIndex >= mesh.FNum()) continue;
+            const MNFace* face = mesh.F(faceIndex);
+            if (face) smoothingGroup |= face->smGroup;
+        }
+    }
+    return smoothingGroup != 0 ? smoothingGroup : 1u;
+}
+
 // ── Bridge core (no undo handling — caller decides) ─────────────
 //
 // smoothA / smoothB select continuity at each ring:
@@ -389,6 +411,8 @@ static bool DoSmoothBridge(PolyObject* po, int segments, float tension,
 
     auto rings = FindEdgeRings(mesh, selEdges);
     if (rings.size() != 2) return false;
+
+    const DWORD bridgeSmoothingGroup = BridgeSmoothingGroup(mesh, selEdges);
 
     bool reverse;
     int  offset;
@@ -485,7 +509,8 @@ static bool DoSmoothBridge(PolyObject* po, int segments, float tension,
         const int i_next = (i + 1) % N;
         for (int j = 0; j < segments; ++j) {
             mesh.NewQuad(grid[i][j],       grid[i][j+1],
-                         grid[i_next][j+1], grid[i_next][j]);
+                         grid[i_next][j+1], grid[i_next][j],
+                         bridgeSmoothingGroup);
         }
     }
 

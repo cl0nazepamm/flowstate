@@ -1,5 +1,6 @@
 #include "powershader.h"
 #include <windows.h>
+#include <UIAutomation.h>
 #include <commctrl.h>
 #include <gdiplus.h>
 
@@ -80,7 +81,116 @@ bool TryDADDropOn(MtlBase* mb, HWND target)
     return ok == TRUE;
 }
 
-// Try DAD drop — SME first, then medit palette sample slots
+bool AssignParameterDrop(MtlBase* owner, MtlBase* dropped, const std::wstring& paramName)
+{
+    if (!owner || !dropped || owner == dropped || paramName.empty()) return false;
+
+    const SClass_ID droppedType = dropped->SuperClassID();
+    if (droppedType != TEXMAP_CLASS_ID && droppedType != MATERIAL_CLASS_ID) return false;
+
+    Interface* ip = GetCOREInterface();
+    const TimeValue time = ip ? ip->GetTime() : 0;
+    for (int blockIndex = 0; blockIndex < owner->NumParamBlocks(); ++blockIndex)
+    {
+        IParamBlock2* pb = owner->GetParamBlock(blockIndex);
+        if (!pb) continue;
+
+        for (int paramIndex = 0; paramIndex < pb->NumParams(); ++paramIndex)
+        {
+            const ParamID paramId = pb->IndextoID(paramIndex);
+            const ParamDef& def = pb->GetParamDef(paramId);
+            if (!def.int_name || _wcsicmp(def.int_name, paramName.c_str()) != 0) continue;
+
+            BOOL assigned = FALSE;
+            if (droppedType == TEXMAP_CLASS_ID && def.type == TYPE_TEXMAP)
+                assigned = pb->SetValue(paramId, time, static_cast<Texmap*>(dropped));
+            else if (droppedType == MATERIAL_CLASS_ID && def.type == TYPE_MTL)
+                assigned = pb->SetValue(paramId, time, static_cast<Mtl*>(dropped));
+
+            if (assigned)
+            {
+                owner->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+// Qt material panels expose each picker through UI Automation. The picker's
+// automation ID ends with the ParamBlock2 internal name (for example,
+// "base_color_map"), which lets us assign to the exact slot under the cursor.
+bool TryQtMeditParameterDrop(MtlBase* dropped)
+{
+    if (!dropped) return false;
+
+    IMtlEditInterface* medit = GetMtlEditInterface();
+    MtlBase* owner = medit ? medit->GetCurMtl() : nullptr;
+    if (!owner || owner == dropped) return false;
+
+    const HRESULT initResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool uninitialize = SUCCEEDED(initResult);
+
+    IUIAutomation* automation = nullptr;
+    HRESULT result = CoCreateInstance(
+        CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&automation));
+    if (FAILED(result) || !automation)
+    {
+        if (uninitialize) CoUninitialize();
+        return false;
+    }
+
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    IUIAutomationElement* element = nullptr;
+    result = automation->ElementFromPoint(cursor, &element);
+
+    IUIAutomationTreeWalker* walker = nullptr;
+    if (SUCCEEDED(result) && element)
+        automation->get_RawViewWalker(&walker);
+
+    bool assigned = false;
+    for (int depth = 0; element && depth < 6 && !assigned; ++depth)
+    {
+        int processId = 0;
+        CONTROLTYPEID controlType = 0;
+        element->get_CurrentProcessId(&processId);
+        element->get_CurrentControlType(&controlType);
+
+        if (processId == static_cast<int>(GetCurrentProcessId()) &&
+            controlType == UIA_ButtonControlTypeId)
+        {
+            BSTR automationId = nullptr;
+            if (SUCCEEDED(element->get_CurrentAutomationId(&automationId)) && automationId)
+            {
+                std::wstring fullId(automationId, SysStringLen(automationId));
+                SysFreeString(automationId);
+                const size_t dot = fullId.find_last_of(L'.');
+                const std::wstring paramName =
+                    dot == std::wstring::npos ? fullId : fullId.substr(dot + 1);
+                assigned = AssignParameterDrop(owner, dropped, paramName);
+            }
+        }
+
+        if (!assigned && walker)
+        {
+            IUIAutomationElement* parent = nullptr;
+            walker->GetParentElement(element, &parent);
+            element->Release();
+            element = parent;
+        }
+    }
+
+    if (element) element->Release();
+    if (walker) walker->Release();
+    automation->Release();
+    if (uninitialize) CoUninitialize();
+    return assigned;
+}
+
+// Try context-aware drop — SME DAD, Qt material parameters, then legacy DAD controls
 bool TryDADDrop(MtlBase* mb)
 {
     if (!mb) return false;
@@ -90,7 +200,10 @@ bool TryDADDrop(MtlBase* mb)
     HWND smeHwnd = FindSmeNodeViewWindowAtPoint(screenPos);
     if (smeHwnd && TryDADDropOn(mb, smeHwnd)) return true;
 
-    // 2. Direct window under cursor — only try if it has DAD
+    // 2. Qt material/map parameter picker in the Compact Material Editor.
+    if (TryQtMeditParameterDrop(mb)) return true;
+
+    // 3. Direct window under cursor — only try if it has DAD
     //    (medit sample slots, color swatches, etc.)
     HWND under = WindowFromPoint(screenPos);
     if (under && under != smeHwnd) {
@@ -1344,11 +1457,21 @@ private:
                             RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
                     }
                 }
+
+                // Once this becomes a PowerShader drag, do not pass motion to
+                // the native listbox. Its built-in capture handling otherwise
+                // auto-scrolls the results while the cursor is outside it.
+                if (self->dragging_) return 0;
             }
             break;
+        case WM_MOUSEWHEEL:
+            if (self->dragging_) return 0;
+            break;
         case WM_LBUTTONUP:
+        {
+            const bool wasDragging = self->dragging_;
             if (GetCapture() == h) ReleaseCapture();
-            if (self->dragging_)
+            if (wasDragging)
             {
                 POINT p{}; GetCursorPos(&p);
                 HWND under = WindowFromPoint(p);
@@ -1362,7 +1485,9 @@ private:
                 RedrawWindow(self->wnd_, &header, nullptr,
                     RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
             }
+            if (wasDragging) return 0;
             break;
+        }
         case WM_RBUTTONDOWN:
         {
             // Right-click = file-local pin (toggle at start of list)
@@ -2236,7 +2361,7 @@ private:
         if (drag)
         {
             // ── Drag path ───────────────────────────────────────
-            // 1. Try DAD drop on any target (SME, medit palette slots, etc.)
+            // 1. Try context-aware drop (SME, Qt material parameters, legacy DAD controls)
             bool dropped = TryDADDrop(mb);
 
             if (!dropped && isMat)

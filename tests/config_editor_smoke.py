@@ -28,15 +28,15 @@ def main() -> None:
 
         side_keys.Checked = False
         if any(bool(control.Enabled) for control in buttons):
-            raise RuntimeError("XButton1 mapping buttons remained enabled")
+            raise RuntimeError("Mouse4 mapping buttons remained enabled")
         if any(bool(control.Enabled) for control in labels):
-            raise RuntimeError("XButton1 mapping labels remained enabled")
+            raise RuntimeError("Mouse4 mapping labels remained enabled")
 
         side_keys.Checked = True
         if not all(bool(control.Enabled) for control in buttons):
-            raise RuntimeError("XButton1 mapping buttons did not re-enable")
+            raise RuntimeError("Mouse4 mapping buttons did not re-enable")
         if not all(bool(control.Enabled) for control in labels):
-            raise RuntimeError("XButton1 mapping labels did not re-enable")
+            raise RuntimeError("Mouse4 mapping labels did not re-enable")
 
         print("FLOWSTATE_CONFIG_EDITOR_SMOKE_OK")
     finally:

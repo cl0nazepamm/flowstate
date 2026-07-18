@@ -1,63 +1,101 @@
 # flowstate
 
-![flowstate](images/flowstate_logo.png)
+<img src="images/flowstate_logo.png" alt="flowstate" width="360">
 
 flowstate 1.3 is a collection of 3ds Max tools for faster parameter editing, shader creation, modifier access, modeling, and mouse-driven viewport workflows.
-
-## Tools
-
-- **Stack** — Opens a floating editor for object, modifier, multi-selection, and Editable Poly command parameters with typing, scrubbing, favorites, and V/H slider slots.
-- **Timeline Slider** - Timeline scrubbing anywhere just by dragging. 
-- **Automatic Orbit** - Switch between orbit modes. Also registers them to hotkey editor.
-- **Opacity Slider** - Change object opacity smoothly by dragging on viewport
-- **Shader Search** — Searches materials, texmaps, scene shaders, and OSL categories with pins, bricks, previews, drag/drop, assignment, and SHLL preview generation.
-- **Macro Search** — Searches macros and modifiers, noticably faster than standard 3dsMax search
-- **Normalize Poly** — Shiva Tools's vertex cleaner but works in modifier level.
-- **Smooth Bridge** — Bridge with proper continuity
-- **F2 Extend** — Blender style sideways bridge/extend or monorail.
-- **Loop Subdivision** - Subdivision surface modifier for triangular meshes
-- **Config UI** — Controls modules, sub-object buttons, Slate Tab search, theme, the XButton1 action map, and a master opt-out that releases both mouse side buttons.
-- **FlowState.cfg** — Stores all module flags, key mappings, collapsed/hidden parameters, favorites, shader pins, and brick layouts in `<plugcfg>`.
-
-
-## Shortcuts
-
-| Input | Action |
-| --- | --- |
-| `XButton2` | Toggle PowerParams |
-| `Shift+XButton2` | Toggle PowerShader |
-| `Tab` in Slate Material Editor | Toggle PowerShader when enabled |
-| `Ctrl+XButton2` | Cycle auto-orbit mode |
-| `Alt+Shift+XButton2` | Swap V/H slider assignments |
-| `XButton1` combinations | Run the configurable action map |
-| Mouse wheel over a value | Scrub the value |
-| `Shift` while dragging | Use 10x coarse speed |
-| `Alt` while dragging | Use 0.1x fine speed |
-| `Enter` or `Tab` while typing | Apply the value |
-| `Esc` | Cancel the current operation and close |
-
-## XButton1 defaults
-
-| Modifiers | Action |
-| --- | --- |
-| None | Screen Grab |
-| `Shift` | Time Slider |
-| `Ctrl` | Param Slider |
-| `Ctrl+Shift` | Opacity Slider |
-| `Ctrl+Alt+Shift` | Clear Sliders |
-| `Alt` | UV Grab |
-
-Every XButton1 action can be reassigned, mapped to `Alt+Shift` or `Ctrl+Alt`, or turned off in the Config UI.
 
 ## Install
 
 1. Copy the matching `FlowState.gup` build to `3ds Max <version>\plugins`.
-2. Run `flowstate_config.ms` once to install the user macro and startup loader.
-3. Restart 3ds Max after first installation or after replacing the GUP.
+2. Drag `flowstate_config.ms` to viewport.
+3. Restart 3ds Max.
 
 Release packages require both `FlowState.gup` and `flowstate_config.ms`.
 
-All native tools and modifiers are exported from `FlowState.gup`. The build does not produce companion `.dlm`, `.dlo`, or secondary `.gup` files. Remove legacy `normalize_poly.dlm` and `clone_loop.dlm` copies when upgrading so Max does not load duplicate classes.
+## Quick Start
+
+### Shader Search Utility
+
+- Search materials, maps, scene shaders and OSL
+- Open with TAB key in SME or Shift+M5 anywhere
+- Start typing to search
+- Right Click to pin to list
+- Middle Click to pin to brick
+- Drag and Drop to any slot, object, or SME location
+- Right Click a pinned brick to rename it (max 4 chars)
+
+### Floating Modifier Stack
+
+- Shows object, modifier and Editable Poly parameters
+- Open with Mouse5 or via hotkey
+- Click on a parameter to type a value
+- Enter or Tab applies typed value
+- Drag on a parameter to change it
+- Scroll on a parameter for small changes
+- Hold Shift for 10x or Alt for 0.1x while dragging
+- Right Click on a parameter to pin it
+- Esc cancels and closes
+- Hit the O button in the panel to hide parameters completely
+
+### Auto Orbit
+
+- Ctrl+M5 to cycle Orbit / Selected / POI / Dynamic / Off
+- Dynamic switches between POI and Selected depending on your selection
+- All modes are in Hotkey Editor too
+
+### Macro Search
+
+- Open with the M button in Floating Modifier Stack or via hotkey
+- Search modifiers and macros
+- Enter adds the modifier or runs the macro
+- Delete removes top modifier
+- Middle Click a modifier to add it to quick access
+
+### Mouse Slider Macros
+
+- Mouse4 to Screen Grab
+- Shift+M4 to Time Slider
+- Ctrl+M4 to Param Slider
+- Ctrl+Shift+M4 to Opacity Slider
+- Alt+M4 to UV Grab
+- Ctrl+Alt+Shift+M4 to clear parameter sliders
+- Alt+Shift+M5 swaps vertical and horizontal parameters
+- Change any combo in Config
+- Turn off Mouse Slider Macros in Config to release both side buttons
+
+### Smooth Bridge
+
+- Editable Poly only
+- Select 2 open edge loops with the same amount of verts
+- Run Smooth Bridge from CloneTools
+- Use Smooth A / B for continuity and Flip if bridge twists
+
+### F2 Extend
+
+- Editable Poly only
+- Select an open edge and run F2 Extend
+- Select 2 verts to connect or 3+ verts to make a face
+- Select the new edge again if you want to keep extending
+
+### Loop Subdivision
+
+- Add it from modifier list or Macro Search
+- Made for triangle meshes
+- Increase Iterations to smooth it
+
+### Normalize Poly
+
+- Add it from modifier list or Macro Search
+- Threshold controls how many straight verts it catches
+- Keep Select Only on to preview them
+- Turn Select Only off to remove them
+
+## Issues
+
+- When creating materials/maps in SME make sure to drag and drop from the menu, otherwise it will create at SME origin.
+- Auto Orbit requires Autocam.gup to exist. If you removed it please restore it, otherwise automatic orbit will not work. If you don't know what I am talking about just ignore what I said.
+- F2 Extend can fail with weird angles.
+- Screen Grab and UV Grab are work in progress so avoid using them as they're buggy.
 
 ## Build
 
@@ -85,7 +123,7 @@ The CMake project groups those areas explicitly while linking them into the sing
 
 ## Uninstall
 
-Remove `FlowState.gup`, the installed `flowstate_config.ms` copies/startup loader, and optionally `<plugcfg>\FlowState.cfg`. Legacy standalone `normalize_poly.dlm` and `clone_loop.dlm` files are not part of the collection and can also be removed.
+Remove `FlowState.gup`, the installed `flowstate_config.ms` copies/startup loader, and optionally `<plugcfg>\FlowState.cfg`.
 
 ## License
 

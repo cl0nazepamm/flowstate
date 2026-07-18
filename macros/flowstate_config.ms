@@ -239,120 +239,116 @@ macroscript flowstate_Config
     logoP.BackColor = cBg
 
     -- Inline base64 logo (no external file needed)
-    local logoB64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0d"
-    logoB64 += "Hx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4e"
-    logoB64 += "Hh4eHh4eHh7/wAARCAELAZADASIAAhEBAxEB/8QAHAABAAIDAQEBAAAAAAAAAAAAAAUGAwQHAgEI/8QAQBAAAQQBAgMGAwYEAwcF"
-    logoB64 += "AAAAAQACAwQFBhESITEHEyJBUWEycYEUI0JSYpEVcoKhJDOxFlNjg5LB0QhDRHPh/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAH/xAAV"
-    logoB64 += "EQEBAAAAAAAAAAAAAAAAAAAAAf/aAAwDAQACEQMRAD8A/MSIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiA"
-    logoB64 += "iIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiA"
-    logoB64 += "iIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiA"
-    logoB64 += "iIgIiICIiAiIgIiICIiAiIgIiICIiAiLYx9R9uZzWkNYxpfLIejGDqT/AKe5ICDXRe5ix0jjG3hZ+Eey8ICIiAiIgIiICIiAiIgI"
-    logoB64 += "iICIiAiIgIiICIiAiIgIt27TNGJsdkbWngOMfnE08xxfqPXbyC0kBERAREQEREBERAREQEREBERAREQEREBERARF9Y1z3hjGlznH"
-    logoB64 += "YADckoM+OpWsjfgoUYH2LViQRxRMG7nuJ2ACldRPr4yN2nqErJ+5k3vWmHds8w5cLT/u2cwPzHc+m1sy9I9mOl460h4db5ytxPH4"
-    logoB64 += "sRSeP7TSjl6tbv5lc2AAGw6BAREQEREBERAREQEREBERAREQEREBERAREQERe4IpZ52QQRvllkcGsYxu7nE9AAOpQeFbxi4dJ4mL"
-    logoB64 += "JZdjH520wPx+PeN/s7D0sTD1/Iw9ep5bA2mTT+O7J8VDlNSw18hrazGJKGGk2dFjmnpPYH4n+bY/qVy7I3bmRvz38hZltW7Dy+aa"
-    logoB64 += "Q7ue4+ZQYpZJJZXyyvdJI9xc5zjuXE9SSvKIgIiICIiAiIgIiICIiAiIgIiICIiAi26eNv3InzVqkskUY3fLw7Mb83HkP3WJ8cMb"
-    logoB64 += "i11hkrh1EPiH/V0/bdBhRfdxsfD/AHV+7NOyPV2uXMs06zMfii7x5C4e7iA8+EdXn5fugolWCa1Yjr1onzTSODWMYN3OPoAuh6cr"
-    logoB64 += "Vezuu/VWerxT5GvJ3ePpP2Iksgb7EflZuC4/JvU8uhMsdn2hftendCSMymZr13S53VM7WyR46BvJ/dAbt7w/C1o/EQCSeQ4FqTNz"
-    logoB64 += "akzjr74nQU4W91RrufxGGLcnmfxPcSXOd5uJQY8pkcjmcrbzGXtSWshdlM1iV53LnH/t7eS10RAREQEREBERAREQEREBERAREQER"
-    logoB64 += "EBERARfQCTsBuT5K46E7P8tqW65gidFDC3vJ3uIY2Fn5pHu8MTfd3P0BQV/TmDyuoctDi8PSlt2pnBrWMbv19fQLuV+PTP8A6f8A"
-    logoB64 += "HCGE1M/2mWIt+NwD4MQHD4tvN/pvzPsOsNku0XTnZtiptP8AZo6PI56RpZazoj2ir7jYiuHc3H/iO5+gAXF7E9i1ZltXJ5LFmZ5f"
-    logoB64 += "LLI4uc9x5kknqiM2Uv3cpkrGSyVqW3csyGSeeV3E+Rx6klayIiiIiAiIgIiICIiAiIgIiICIiAi+taXODWgkk7AAcyus9lWmNF4q"
-    logoB64 += "tNqjtCm+1QUwHtxsZ2YOfIzPHqeQjbuSfqgo+nNF6hztcW6WPlFQkgWHjhYduuxPXbzPQeZClL1jRmloW1cfXGqc8G/fWJ3bUKzv"
-    logoB64 += "ysaOcpHqTw+x6re7Uu1PM6+vPxmKrnE4JoEUFKuBHxRt6ce3ID9O+w8yTzWLs40zgclnIcabda/cLHPdI+Xu6NchpPiPxzHl0bs3"
-    logoB64 += "3IQV0Qan1jYMkzprrIhybyjrwgeQaNmtACh52QRvMcMwn4eReweAn9J8x7q/dsGq7MMFfs+xpirsrxh2YkgaG95I48QgGwAaxg23"
-    logoB64 += "aAAXb777Bc8AAAAGwHIIRsQ2GwR7xQsM/wDvJBxhvyb0/fdZMrYyWWwN21PlrrrNDuiYjO4xvie4t3a0nwkO4Rt08S1Gtc5wa0Ek"
-    logoB64 += "8gB5qf0PXhguZbUOTY2TE4mBrnxnm2zM14MUPuHSAb/pa70QYc4TpvSFPRVfwX7pjyGcI6hxG8FY/wArTxuH5n7H4VCMaGt2CxNl"
-    logoB64 += "tXr1rJ35XTW7MrpZZHdXPcSXH9ysyAiL2yKV43ZG9w9mkoPCLZNG21vE+B0beu7/AA/6rx3Hh3M8A9uPf/RBhREHM7BAREQERZK8"
-    logoB64 += "E1iQRwRvkeTsA0boMa2XUrDKDb0jO7hkcWxF3LvCOvD6geZXQMbpDA6UxEeoteTG0ZATSxFWTnYeNuT5B0Hrw7+5HQ0fUOYt5vJP"
-    logoB64 += "vWxHHyDIoIm8MUEY+GNjfJo//eqCORNl9DXHbYE7+yD4i38fib12ZkUMEhe87NaGEucfZo5ldN0f2c5XFSPyd/GWBYrRPmZBJHtI"
-    logoB64 += "4taT+LwReWxceLnyCCi2MM7T+Khv5lgZfux8dGk8eNrOnfyD8I/KDzJ59Bzrqs2cpW7uWs5TU+ocTVtWHcUjXWxO9o8mhsfEdgOW"
-    logoB64 += "xWrFPoym4nfLZt7ejY4hXiJ/mcSdvoghoYpZpBHDG+R56Na3cn6KxYzRmVsxOnsNbVgZze57h4fmSeFv9RC3MRldU5h5qaR0vRoR"
-    logoB64 += "AbF8NczvA9Xvf4R+wW7ldDZT7A3M691M6vQBP3luYuaSOrYoxzkd7NGw8yERqUnaVxU7YYDa1BfJ4WVcZudz6OnI2A9o2n+YLBqr"
-    logoB64 += "XGXyNAYMOqVKcLt247H8qdd3q87kzy/qcXAe/lC5HPQPhkx2lacmLxj2d3NZeR9qtt8w4j4GH8jeXqXKLijZEwMYNgEHyKMRg7bk"
-    logoB64 += "k7knqV7REUREQEREBERAREQEREBERAREQEA3Ow5orPoS7FiMpXvw4h2Zy4kH2Oq6Ivja7ycWjm879B0+aCYwHZln20mZzUDTgMUG"
-    logoB64 += "GUTWgWvdGBu54b1DQNufmSAOZCqmp89HmZ21MZFJWwtVx+ywvPieehmk9ZD+zRyHTn0XtyzGrNQzU9J3b7J8nMxlnMS96BFG8846"
-    logoB64 += "rAOojB3cGg7vJ/KFRotC5mnG5lr7PWaz/wByeTuuIeoa/ZxH0VRXmNLeIBx4XADh8tletBMr4Oe3qa6wmvhaZne09Jp38ooffd22"
-    logoB64 += "/wClr1HYzE4GtL3uTzlcFh/yo43zOPyawbfu4Kb11mtNY3G1tPjEZbINdwXrTZbDKokmkbvFxBoe7lGR4eLlxHzJUHNa89i9Ys5G"
-    logoB64 += "498lqzK6SWR3V7nHcn6krfqUrNoOdFEe7b8cjjwsZ83HkFMO1bbjhbDicPh8RE1uze7hdO8D+aVzh/ZRdm7k8pNGy1asXJC7aNrj"
-    logoB64 += "uNz5NaOQ+gRXqCEzTx4/G/e2J3iMzkbBo8y0ddgNySf7ecz2lPhxNahofHEiOoW2bxPV07m+FrvdjSdx5Oe8Ka0hTraZr5PUeXi3"
-    logoB64 += "/hkQbHG4f5k7j4WfUgD+VryqG7vruSmsWZeOxI8vsTPO/FI47vcT8zt9ERjhjLi2OJpcegAG5U1jcDaP+Iu0bQqs5vdxNhaB7vfy"
-    logoB64 += "H910jS+rtG6A0ZLeraZF+1L4RkL4Aksy7b8ELNjwRjlu7meY8yAuTZ7UuodUZY5bJWg1vGXwwMG0UX8reg+Z5orreC1Vo3SembOQ"
-    logoB64 += "ZoDC2p43NjimsuksSyPIJ6yDgAAG5LW+Y267jnGW1Hm9RWHWRFBBE9+7GVW+FvoNzvsdvIbKxYP+EZ7QOcgzONmq2cbjjcqZOGd5"
-    logoB64 += "DphK1nDI1xIdxl+3LmobsMtY6nrexey1WO5hY6Fs3qrh4ZmCJzmj2PGGbHyKqK1Kx4PHJuS78RO5Ox26rYxGPuZXIwY+hA+ezO7h"
-    logoB64 += "Yxo6+/yHUlfchcly+UmumCGA2HlzIYW8EcTfJrR5ABdQ03ksRoXs/wA+YI+PUd7Fhv2lw8deKZwYA0fh4gSR5kDfptvFcnlZwSuY"
-    logoB64 += "DxcLiAR5qdr41mM0/LmMg3aec9zj4j+J345PkwHb+Zw9Ct/s0safbayGZzmMbPjKTd5DI52zCegbsRxPJ5Bv1PIFTfZzXwnaJ2gO"
-    logoB64 += "y+s8lFh9PQMkcyFrtmw14+bYgfIc+Z6k7nqUFP05prI5smSHua1RrtpLVl/BG3/u4+zQSrJldLaTwbBBks9YluEDdjYuAt/5Y3eP"
-    logoB64 += "6+BWHtvzMGC1bNp7QtGSlQpRRxxWS3iml7yPjErN/hZsdgW8+p33K5HJXfBYc21HKyUu3k7wEPJ8yd+e/wA0R0luJ7Lcdj62Ss5H"
-    logoB64 += "UmXjlcW9zRqxRFrxzLXue9xZy8y3n5KxdneV7LbU1yz/ALG5HH46nC6aXK3bpt8AaQNuEtbGHEkAeF/MjkuK3RDcdwui7qBg3DGE"
-    logoB64 += "9B5n1J9fddD7bNUwnT+ndMUa0WPpCnDafWg+GOLh3jafVzncUhJ6gs9EFc1RlMTk87PkZ7ORy73OIia1grxRs3OzWlxe4j6AlZsZ"
-    logoB64 += "i8nMBPDiKVCAeIyTxGUgepDyRt7kALBp7NUtO41ttmPq5DNznijE+7mVGeRcPzH06+qjr8+f1HK+xcfdyDeLiLI4z3LD7NaOEIro"
-    logoB64 += "Wksdp3LZqpVzmuqVWWeVsbXSVHyxh2+wHCwNjH1cQrn2t4TC6FtNhfi7+etMdwCxkbDalZx9I4o9pHj12IAXOuzzQrJ7cM2fuQ4u"
-    logoB64 += "B5PBA8/fOaBxOeGDnsACdzs0bbk8tjC9o2rP9rNUZvLCzbniszGCh3x5xVATyA8idgPlxb9VUW3Sestb6jr5ZukstiNNsx1fv5mY"
-    logoB64 += "um2CR7N9iBLzkcfm5QPa1qHN2H4rSF/OX8i/FwmfIyzWHvc+1Lz4CSekbdm7eTuNafZ5HBpajktXXgPs+OiayvA7pZtP3MTCPNoI"
-    logoB64 += "Lz+lm3movQdClmtRsdqfKy1K88hsX7QZ3krtzuQ0ebj78h1QiKqUzNKWwxcTurjtvt7kq2VsdgsNXbPm3uE5AdHFIOJzx+mIcyPd"
-    logoB64 += "5A+atnapq7B4KOvhND4WHF8UYLA8B8zWEbiWZx6yuGx2/C0jzPh5pRx9/LT2Lr5C/h8Vq7Zk2Yz3c4/2A3J8gVB1LQWqMtnbxwWj"
-    logoB64 += "sFCbz2H7NJkpdoYgAS5xjaOAbAE+LcclzbWUWQu5N9/U+edm8juWsDZOKJjQfwnpw+gaNlkmzTMfjp8Rp2zOK1pvDduOHA+0PNjQ"
-    logoB64 += "ObIuXTfd3n6KKqV7V+5FVqwSWLErgyOKNpc5x8gAEVgAAGw6IpXN4+HEONCSaOfINP8AiO7cHRwn8gI5OcPMjkOg35qKQEREBERA"
-    logoB64 += "REQEREBERAREQEREBS2Gwc15gs2bVbG0d+dm0/hafUMb8Tz7NB99lFMdwuDgAdvUbhe7E81iTvJ5HSOA2Bcd9h6D0HsgvdPWejtG"
-    logoB64 += "wAad0rDnsh0flMx42tP/AA4G+FvzcSVLaK7VtT2sjfyd51ShiasXf231azWvkHRkLHHc8T3EADfkOI+RXKRRvXclFSqxF73s2dv0"
-    logoB64 += "G+3X+37rdylhrasOEpSB1Os4ySyN/wDkTHkX/IDk323PVxVG/k9b6kyU0xr2Y8NBK4l8WMjEBdufNzdnEfMlQDIyJHSOe573Hcue"
-    logoB64 += "eJxPzKyABo2AVh7OsBFqPVtPH3JxWocYfcnJ2EcIPi+p6D3IUG72fRWP4sG5V8x0/FCb1+I/C6OI8QA9C7bhH8yqmYydjPamv5i3"
-    logoB64 += "w95NM6RwaNmh7juQB6NGzR7BdZ7YM1pvEXRhMNJH9hyVhglmA5MqxnhAG3VpeCffuwfNcyq4KWJje/sQ143ku7yU8PFueoHUj5BV"
-    logoB64 += "Gguq9k/Zxqe1jXayhp1IoIH8Nd12URgHbnLsfwt9fr5KmUMxicFcbPjMYzJWo9uGe94ow71bG3b6bkre1P2h6mOGORtXT/Eb/wB3"
-    logoB64 += "X4GBohY3bjkaB0J5NB6jxeY3UH3teyNmzbgxlY7YikTMbkp4Bdsu+KfY8y0bcLBtvwjfbdxVq7AJdI1KUrJalfManyThBjWWY+KK"
-    logoB64 += "Dc/5haeXIbuJPkFxiWnNkrsEglsTsma3v5Xgvc1++7t9/wB11+vV7PdHY61cwOYzGT1XJQ4qRmqthgic7YeHYkkjnsN/Lny33oqP"
-    logoB64 += "a3VLta2obttll1ZxijgjPhrsBJAdty4zvxOaOhPP0UTp/EWsveFOow7NaXyv28MUY6uPsP8AwFIae0dnMpRN6SKSCDiJmnstLOe+"
-    logoB64 += "5cS7l59SQpKXUdbT+ItYXTMhc+1s23cB+LY8g0+fP05D3OxEWNntBzdOLBVtKYuuyvHGGG6W9XFm/AwnzIJLnfqdt+FV/D4+87DX"
-    logoB64 += "BjKk09m6GUoYom7ule9wdsAOvJgH1WDS+Ev6hzsGLoRPmsTkk7cyGgFznH5AEq0Z/Uz9OxjT+lbIjdC1zLeSiP3j3u+JsTvwtAAa"
-    logoB64 += "XDm7Y89upHzO6fw2h4aVSfK1MvrCQBs9BpDquOeSOESvHJ7x+Qct+vIbH3mdIWGYibHT5qGeae4LOcysh+6i4GkkF3U8PGNgOp5A"
-    logoB64 += "b7KB0Fh6uRzT7GQeyHHUmGzclc7h3A+Fu/q52w+pPkst+LL6xdJisLD3eJqF1qd7vA0nzlkP9mt8uQ5kneiB1NO2/VfSwMMtfT2O"
-    logoB64 += "cDGJXbSTvd4e9f8Ard5N/COXqTmqz4uPERU30cg9zWgP/wAa1jCdyfhDOf1JVv1Roirp/SGBxOPuQXc7duGXJU2vHe1PBtC2T0J3"
-    logoB64 += "cT6HYHmoHK6Q1BhsqzG5zHTYqw/Y7Whw7NP4vcfJRXi1ZoClXsQvyG8JEbIZrHexjbnsDs10fttuFcNdYrEz6Vw2qcrrOyZ7lUx1"
-    logoB64 += "6FmsH2IhG5zSwkOG7QQQHEDl+y1s5i9CaTxtF38cZqfMk99PUqsIrxuHwMc88iAebttyenLqqJnLV7UN8WchKSeENbGxoa1jRvyA"
-    logoB64 += "HQdT9SepKI652F9lNnWumbWaLB9jfaFdr9+bowRxlo8jtvzPLcLn2usJkct2hzY9uQxt/Iz2jvHjp++jjA5MbxbBoDGgN67clK4H"
-    logoB64 += "VeawOkLGnaFiZkuTZ3basZO8cPmQBz4n9APQO9Qq23C5DT8nFl5zip7MrHOjMobOY+LfbhB4gem24VFyn7PrOk6VbM6otVcXUlBM"
-    logoB64 += "XecFiWyfSGIEh/8AMSGj1UVnddZrKQx4rFSWKVBp4Y4y5pled+p4QGtJ9Gj9+qkcvpW5nLFrMz6hwrMfEGxUX/b2GOOFu+zODfvG"
-    logoB64 += "OA25Fu5O+/PmsOhM3pfSWd+2imzUeTYCK32hhjqwP5+Mt5uefTfYc1BD2hfweFtPfLK/K5Jj6sT3vLnMh3++k3Prtwb+YL/RbPYl"
-    logoB64 += "pmvqbXWLxF6eNlZ0oMvGduLbmGD3O2y189nKmfkjy2VoSU5GVxBG2vPt3rWk7bNLTsOfN3Ib7nmSsul9VXMHA7L4VsWPr1i0tjjZ"
-    logoB64 += "95JKT4GmQ8z0LjtsNmn1VFj7f9N3MRqWPBZC5j6GNrPNhrI52yyySybcR7pp3HCA1g4uEbM3810Ds7q6Rx2kJoMjhKeOrfZvtVq1"
-    logoB64 += "ln8Vp8TSC57Ix4tncgNxsd9ue64A4ZPPTG1I2zYnnvGS7Z4S8ni58R+R3P1V/t6WrQXpcG7tDxeSjvY19dtpneExlr43sjeNierP"
-    logoB64 += "LcAIKhPkdOsz16/HVvZ+SWVz2zXpRAxxLid3MYC4/LiatHM5W7lntFp0bK8Z3iqwRiOCL+Vg5b+55qdxGnK9C7D/ABrN6dsUItmm"
-    logoB64 += "Rt1hLmg9AGvB8yr7ns92RGsyjo7STLdmvGDcuz2HNqx/qe5wJ29ADueg5qDnWh9GZnVt6SDGwtZDCwyT2ZTwxQsHm5x5AfMhSuYz"
-    logoB64 += "mI0vSnwOi7P2q3KwxZHONGxf+aKudt2s9X8i7oOXWL1XqizkA7G46cVcQOsFaLuIpnfm4BzI9OMk/Loq2OQ2HRFEREBERAREQERE"
-    logoB64 += "BERAREQEREBERAVz7HtPYnO6wrnUVttTB1XCW5ITtxgcxGPd223y3VNAJOwG5UzBJ3Vs1Xue3HYpne3iw7GWV3LuwfUnZg9AHO8k"
-    logoB64 += "HSu0BmHyWTmxuiaccAsbuiLpGiWZriRxOJ24WnnsPJoJ8wVyzIU6mIkdUgvsyVxrj39iIfcMP5Yvzbfm6eg8zhflbtiSzZMndyWi"
-    logoB64 += "e8LOXh6Bg9GgAAD0AWohH0AucAASSdgB5q24rGOpGavdstpVYAHZKdzttndRC3lzf5bDfbmTyC3tEwYnS1Mar1HEZrbmE4fH/ie/"
-    logoB64 += "oLD/AEY3q0H4iN+g51DNZKxlJw+w77tri6OIfAwk7k7eZPmTuT5lBt5jOMsX5bGMrNie/Zv2uVgMoYBs1kQ5iJoGwG27vVyh9iXu"
-    logoB64 += "e9znved3Pcdy4+5RbuHpNuWCZ5e4qRDjnm2+Bvt6uPQD1QXvsk0BPn6FzP2hFFRr8UcL53hkZcBvJISeQaxu25/M5oURqK7pajkX"
-    logoB64 += "T0a8eob7AGRSTgijWYOjWs5GZ3mSdmkknYhaOp9WXcrUjxNXelha7BHBTjceHhB38X5iTu4k9SSflBVmwE8ViR7WD8LBu4/vyCDZ"
-    logoB64 += "s2stnb7GyyzWpnHaOCFgYxvs2NgDR9ApoZoae0df0/3sEuVvWGPc4QNmfRY1u20bvwyPPXY8gB5nlDzZWRtZ1WhGKMDhs/uz95IP"
-    logoB64 += "1P6kew2Hso1rWtGzQB8kHs27ttrI8ndyd+Fh5Rz3HBo+Q57LPw/a5mQ1KbWEnwsjLnE/UkrWWRk8jInRsdwNfydtyLh6H29kFioZ"
-    logoB64 += "06axN2jhZR/EshF3Fy+w/wCVCT4oYT+rYcT/AE5DluTWo27kNGw9z5LYx9C5kJhDTrSTvJ22Y3dTzsLVwJ77P2K8Mreba8gLnn/l"
-    logoB64 += "DxH+rhb7oNjGYDKZLTk88YFLTtNwls3JvCJ5Og23+I9Q0DpzJ5krE/OW6GJbUgtsw2La/vYpHt++ncOj2sHiefRztmjyO60tQ62z"
-    logoB64 += "GXayCAvbBC3hhfOG+Afojb4I/oCfdVgVC+V09mV88rju5zzuT8yUG3QvGPI/acVJYgl4iTfsP4pufUgDkCfqfdSV7JmR5eLF69O5"
-    logoB64 += "uz7F6YvJ+TN9gPnuotrWtGzQAFkhikmkEcTHPeegAQeDzJceZPmui6Z0zQwWAj1FquzHSfdZvSglZxOER5GUs6nfo0ct+u4HNVXG"
-    logoB64 += "y4zCyNtTxw5W+w7x19968Z8jI78ZH5Ry9T5LRzmUyGbykmSy1qS3akO5e89PYDyCCVt6qfUnnGlK78X3u7ZMjKQ+9MOnx9Iht+Fm"
-    logoB64 += "3LluVAU3mvcbdLnTWWO42vkO+z/Jx9TvzXhEH2pBNJJ3Ub3vc93EQXbDc9Sf/JUpLNTx1V1ei4T3JAW2LPVjR+SMefu49egG3MxS"
-    logoB64 += "kcNjBcJnt2G0sfGfvrL2k7fpa3q958gPrsOaCf7NtE29XT3bcszK2NoMDrNqZ2zS93JkYPm5x8vQFZNRf7MY+ZsEjxl3VpHGKpAe"
-    logoB64 += "CAO5AvleDu88gAxpAAHxE7qNzWp5p8VHgsUJKOGhJLYQ7xSuPV8hHVx5f2A5BV0DoAPkAglszqHJ5SNkEsjK9SPlHVrNEcTPk1vL"
-    logoB64 += "f36+qneyyOlV1BTyeoMi+rhoJhYMTeb5nRni3G/wtG2xd77Dc9GL0RJUxH8f1ZYGIx2wdDBJysWt/wArD8Lf1O29t1AZrLi3M5mO"
-    logoB64 += "rMq1dg0FwDnuA6bkj+wACDX1M6LPapyOoLzfsVS3YfLXrQtAkewuOwa3oxu34j9AVjs25J60dNkcdWjE7iiqxfCD+Zx6vf8AqP02"
-    logoB64 += "HJa+3iLiS5zju5zjuSfcogIiICIiAiIgIiICIiAiIgIiICIiAiIg3MW17Hm1HE6WSNzWwRtG5kmcdmNA8+fP6L5mO7h4cNWlEsVa"
-    logoB64 += "QvuTA7ixZ6OIPm1vwj5E/iUm+Q4XGMfEeG+4OZXPnG9w2kl+bGEMb6Oc4/hUBGxsbAxo2A6IPoHkFI03V8dw2Z447Noc44HjeNh8"
-    logoB64 += "jIPP+X9/Qx4JB3B2IXxBnv3LV+5LcuzyWLEp3fI87kn/ALD28lgREHuFgkfwl4Y3qXHyCy2bHHG2vECyuw7hvm4/md6n/Ra6ICIi"
-    logoB64 += "As8dSzI3ibC/h/MRsP3PJYWOcx3ExxafUFfXve87ve559XHdBv1sfU34r2VrV2DqIwZn/QN5fuQpinktGYvxQ4C7nJx8L8jY7mHf"
-    logoB64 += "/wCqLxH6vVWRBZctrnUV6t9jgtRYqgOlTGRCtH9eDZzv6iVWAxnEXcILidyTzJK9IgIiICyuneWd23ZjCNiG8t/n6rEiAiIgIi9M"
-    logoB64 += "Ac4AuDR6lB9ic1j+JzA/boCeX1WSzZsW3MEjy4N8MbANmtHo0Dos8QxcWzpnWbTvyR7Rt/6juf7Ldi1Jbps4MNXrYnlt3sDN5z/z"
-    logoB64 += "XbuH9PCgzV9KXY67bmcnhwdMjia62dpZB+iIeN3z2A91u43VWL01N3mlcNHNdb8GUysbZZGn1jh+Bh9zxH3VUnllnmdNPLJNK87u"
-    logoB64 += "kkcXOd8yeZXhBu53LZPO5J+SzN+xftvO5lnfxH6eQ+i0kRAREQEREBERAREQEREBERAREQEREBERAUlpumLeSBk4RDA0zSud8IaP"
-    logoB64 += "X232/uo1TU5bjdMxVgP8Vkz30h/JA0kMH9R4j8gPVBG5O2b1+SyQQw+GJp6tYCdt/c7lx9yVroiAiIgIiICIiAiIgIiICIiAiIgI"
-    logoB64 += "iICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiINjG1vtd6KuX8DXO8b/ytHNzvoASvWWuG/kJbPDwsOzY2fkY0"
-    logoB64 += "bNb9AAF7qHucdZn/ABy7QM+R5uP7AD+paSAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIiICIiAiIgIi"
-    logoB64 += "ICIiAiIgIiICIiD0ZHGNsZPhaSQPn1/0XlEQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREB"
-    logoB64 += "ERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREB"
-    logoB64 += "ERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREB"
-    logoB64 += "ERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREBERAREQEREH/9k="
+    local logoB64 = "iVBORw0KGgoAAAANSUhEUgAAAgAAAAFVCAMAAACuDacRAAAAhFBMVEX///9mZmaIiIhVVVV3d3eZmZmqqqozMzMiMzO7u7sAAADd3d0RERHMzMwiIiJERFXu"
+    logoB64 += "7u7///8AABEAERFERER3d4gRABEiIhFEVVVmd3dVVWYzREQzM0QRESKImZkiIjNVZmYRIiJ3iIi7zMyId3fu7t1mZneqqplEM0SqmZmId4iqmarh+H68AAAA"
+    logoB64 += "AXRSTlMAQObYZgAAJc5JREFUeNrtfYti27qObfgWn5ZkJlZsy46TtrvnzP//3wCU7fiZnaY9dRth3Zk73Yljy1wksACC4N0dgUAgEAgEAoFAIBAIBAKBQCAQ"
+    logoB64 += "CAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAg"
+    logoB64 += "EAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIhE8PdusHuB34rR/gT8CI+Re3foA/AWy8E0De+gH+CIyXf7L/CHXrB7gZtLn1E/wJUNWtn+BWsMQ/QI9W"
+    logoB64 += "Bunxur4DSO5u/Qg3giYBCGA+3PoRbgStxzrzj+DH6ga1Jf4BUY50GLQf6Rc/hlIjHQbt00i/+RFidOMchugn4/zix2D1SJdBrMU4v/gJmpEOg23EWEOfIzTK"
+    logoB64 += "tbd+hluA1v8AX4dRroO6pvWP0I0Z5TgA/+nWz/AngDdsjBEAa2D9j/B7n4GBABihAQD+GfF/VwYijHAgWNMQ/wV1Y0ZoADTw3xL/d8g/HyH/Efgf4de+ANtY"
+    logoB64 += "Nz5LWCP/FADcoSWs0/hWAvAv3Vj3vo/Am0aMjn/40sj/2L72JfC60aNzAKzwn6a3fo4/ANKDABibAQD5j/6fBACsf9340QmAOPA/sm99EZLFJo/NAdTE/w6S"
+    logoB64 += "3YMAfBjVUKD8gy89G9WXvgLGuoa7cRkANP9g9Gbk/4H/x1TrEfJfZ9J/ACNYsj64USXDfVM3taH1DxBSJt6kURkAhvLPGxeI/zupeM7gC93DiPi3wH9Mgfi/"
+    logoB64 += "u1NWs9BIN6YUkEb/bxOtf0C0Vjpt3YgcgOaY/lOB1j+Y/8ZH7lgTgP+xGAA9V5j+J/7vgvCNh+jPoABwIzkJpGW2GP6FMPICAJMZOELf6DZgBmgs6VC1WHiU"
+    logoB64 += "fymMSPKcYwnKH/xgXTfKOTwGOhIHoB97WaP7HzX/gWnFBfDvazwAwJsWIsAxKECmc8Jpz0bNv9FeZ8N8U8e6Ni6YRowkAlAydWD+rZmFkRi8cwQRvV4k9P7R"
+    logoB64 += "NhEGwuEWwBjGg6lFkPvl//m/7+VB8LVKhX4PS6Fs/qmm8P/ZDQCTXVjA99apTaMJeE4QsOJv2QsYhhq8v4WBcC1DFRA+/YKQLPUcpj3u/cH3HePJdwPqN+Zk"
+    logoB64 += "ZIxaScaMw5WffByBAZDCtBlEj3TOhHHonVMwsQLFH4yQLK+D26J1j01y7Sc3AJKZkDhafxfYuLY8d2BsKXysEmM5hSmawO0MCJgG+Fv5j+/77k9mgxnPuADX"
+    logoB64 += "L9MY5R/T0jzXvJrL3IZkTOX20MMewF+5JOLyHS+SAqZ81o0XsPDN/Sjlf9SPT9FD5G8G0jcL8IjDPw0qwL90TPg7mvmypyXSX0cUum7O/9bv+jPQtea6VrDy"
+    logoB64 += "h2WO/t+oNEwA+xcrwH9t5mnkY04boN8K58DvSTlC/iHwiyqi/XtlGaSfVIX/3Ji/VQGw+l928piUOSWhvV4U+hPPI+Qf897K2jXQf7BewBnaKU4Ar/9WAxAb"
+    logoB64 += "89ZTZ8mBfsNfIk8lze2EGqP7r5vGq4iFD0ejBWNSkkClCqT9A/iPP3orRWy6N55aSM4MLP4X1e3ErvoywuVfqt50LVx/stMP5JehqeWwOm79oD98N4PGJ7/y"
+    logoB64 += "OyafIdbN3OqnTeH+zriMKmB0/JeqN4uHPU8rPYBzCSPCv7o/wgD4H72VJEZ1hX/TAftZcGv5NuQByROw+ff4sj9g/qPEPO8Z/3dm6lh24Q/ZBa5/8G6OGLm+"
+    logoB64 += "uJqXgjGRBdY4b9mHN07BDErn5t/zN6P28Tl7TPOdH3yE9ZCNU39ECMghQv2xP1ALnc8NwLJjjEmutRKbPft3xgTpRcl53/Zr/m4wy7noanGRYQMTwMxCqQO9"
+    logoB64 += "Nf++0T/EP5PM8FMBEIwQTCpt9WPesY+vWJqUow0j5F/zji0EnvW/tMIxAMh/hAGITa1nP7Azy56yqbg9otOYhZgD+5qLcEA+1rymtEK12I6N/juezZMRJclz"
+    logoB64 += "qfABHaQxf4AB0I22P1CZAQ6+SmblX+OWYEzOjMPSl2Z6wr6AQND7NMLlfyfWZpKWzRLW96XhrWAAN0Hf3gA0Xr+8vxSddQuzWa+sNYMChC83cK+4SO6I/TtQ"
+    logoB64 += "g11Ktpx2c7cPc38zliktgf98hf9QjoBsDcANG2P5hj+9VO9lJ2dw6BtmXzhbY+xqOrnSYPafFuGE/DsseWA58canMdJ/l9LGVIXfi/zfLcADpDQcBfwhA4Ab"
+    logoB64 += "ycaIrhOd+elbVXWt71cqtO8yAGDnF0C/sFbmqhaJrWIEq3+w8F+/h5Fcykch65Eu/7s+bGC8MMQPFxtfJAyKshl2gd43OslUOQtENlhQ9/MPyTzHcL1/D/+m"
+    logoB64 += "y/CxITEbuRAL3XhveTdw37bHFAehXhTnbB4huBgn/yD7FyJj22Pg/5IALPwn9T4DkJZAeu6yKByEXzOeWTCRpFeqd//mgUxhv0op669Nba2v6/i8lXvtGb9G"
+    logoB64 += "giLgSgmFfV9Gyn9fift1zbHM7yL/uZ26IAwoxH/jn2ml+DcIpUw2Jj28Zyz/1TEYcE44lYzVHT/fhIjsjjMhTCWl5gzmncgL0P1s5bGXz9e6xnPsbgNvcIFb"
+    logoB64 += "gaedHjkXvG74dvmPLft/16aF5Ito3fQa/+EuOIEGoG3f2hyJeHxSZgim5l0Z7/d8+pv8A+tmDVakdaHTNTOr/ogeJpRSkmWzDndmpSTYHIjjNik/2xrIB4dv"
+    logoB64 += "Ns7EUsDYnrOf0PNLiBMZ90h/GCqeb83H70ZYilWcqBrj+/4S/yzcgQJkCSRie9UARNxFwjFn4E3N++0+41d+YUBEGBDxrZuaLJVvopExTLdvG5gA9uZM7NQF"
+    logoB64 += "4085o88xQuHS13I5LOipKKHL+eMY8czAUYFCVTWW/m75H13z7yDVS81YA2vron1nwD9MAGkUXghw2T5yXRf6ufbDhtr7N1HthQFnAnipMHpIa6GjxzevVdb1"
+    logoB64 += "QFIC7jks7rSnlUkQ92lTZSHx+ArI/oBztU+Ikrs4+wwhi71gzwqeXVUhDNMlibEd/hCxrmuehwD/Am+COdwJzjzV1w5HSPUPOGGU/NoKtLT9+xM16swARK1V"
+    logoB64 += "cSOCMVVaMjY1nklReCWNS5mByBCHJmbJmDAQ43/TL2j3VTes5MGit5sS255/K4z6TQbvjzVg1aAPQOewsQlAUTd1Y5c1d5fXrcyF/6SM1u5ieVQHSzGldVUt"
+    logoB64 += "sy2nBo/m0b84VOGPX8AjLF/Q8FLHr4V7D449gYA3MXqvnrVVLB+KOQwOwPBPiuJDF7RIYbMpK9/khVlC6OLPDIApwWnKXPMngx1fpsX3pyznYxOAwjegkhfa"
+    logoB64 += "DwvgTCNLFIWwmARbNFW40A0A47y+5FeZAP5h3F3bv06AswlzVMUF5vmoqiPC+hXGSFjjT1yvwA4ANWjJjemDVRYEZjqK4Q3YcYOzZWC/1gIecgovB/qTUHa+"
+    logoB64 += "EItSwn70qTBhliYYbRlOJXh7IcF3wKyDuXVrQn4zmMcCADNvzKX4l/FcfpJc4slqNz2bISlBBJmSKLqvtyH1uGEUplsllarq5APt4YIXiR0WaUdvH41hyvKy"
+    logoB64 += "xqsnxSBsD/BufZi2Qdk8PZbyQjKzzvcgBxao5FD4gaDXWNabcF3rqLtwagBKZjIHCGnE7pgTRBq6sZKDzbg1Ib8ZzFtYa8uqURcSIIazISaE0BD8ZVOd5QBM"
+    logoB64 += "XqeJMBB9G0wTcR7SMJ4CxxQi81k6UXhaHbwBrN067/87RgWTSESNyxJYwllnK3DtJZcUMsNL6Y6Tt+DEJXqEsO4xTxUbq1faSxAsJeMXdK2f0okBKPynJEu5"
+    logoB64 += "3/CLCoivmyicmNyakN8MBmoZLG54qc/4N4LLXUrAOCMNGACw7Uf8d3kCUkpqeGFbSbPgeV3yfqAYQIXnnDB3cPSBspavGjsvTdw7AAbCDgIyjXU4KN5DqEDn"
+    logoB64 += "gQdaFK2ftIDXHj4fg8Uu+IqVpZ6K1WHYuwbDuaG0q53yF56PDQAEeRN4sCfND8paA0uqicmJsa3/O53XsBha1oijCYDV8GpPP1YCgX/HjsDpcIuccck15t7w"
+    logoB64 += "mLC4B5eLa9EMM8AplANOHFfh88ab/YzIYokHjIb/ELCQhYHlf6Dv1tNkhtx9kLUXdX+8+hk2qn3YPTYYio2pX2qNekVsLTsovWH7cvd3rmL8UWStWHj1Zs6I"
+    logoB64 += "3Gh0Xbfm43dDAvt93ye876eEwAZcLEbfGYX2/mXFAGh9sk1oo8UyS4W7Qy7n0E5AVWOUgG4aaKy1Efo4ppINuJrtKJs86dS+RoNBFCkZt/lotZocdvw3Qr3e"
+    logoB64 += "SmkY5/DJT+HIaqW0AC8y3UyD2gpaUKbJvuDxnu1LNlJpPuFamMOSpz6nWuG3vzUfvxuLap360DtbFCAoYVBP2Qw4eBmswkeWaywIfJ0AApuFaPC3YGkfsIC4"
+    logoB64 += "NcIKtgRjsOndtMUWYjrGoybSrPFNbtfDv2H5qjoN23pM3j9+s/espO5eXy+KBIFHm/taLerXsg0F9GtxmtgXoo8W9KJji2E6g7lPpb5pZ+lzhDDBKB2q6QH/"
+    logoB64 += "oCCsdGE2Nv4xUN6Aunb3eOFbELAGcfcU/u/JC7PLUiiNKZj9oGGnOM9tnbfZU5hH0sJ/1wJisN6FFuww+OPZIUHcW+/hA+Cf624Va1XPh5YrMloP+m1TBMTr"
+    logoB64 += "65lMRS+Alou1sbt7yUEXMF2E4rFkDWrz1CymqD+Gqn6YAMtNbfevc6LGNs9KOXRm+79rnbF4BPKM/2sZ6k8CFFobLPLSdcw5L9fO9ZnbqE9fmNchP4u6yPzd"
+    logoB64 += "iAPTWkPwvd09GbZZzaQabg8dOgeArhaHFIFYiB6EwXeIwGGaSWG3N82K2td149tNOnIxbDfdEqYFTLO9lQz+lun5+bae40/T2DD4SrxIOWfakNas2WeLsdFX"
+    logoB64 += "YwO3DlMLr+PgeMyXMqDxp4tX/mgE0+V1v5S29nxiMHiXsD71+ZfGGln5iAYg7BOq4GrnIj/a47Iatw4GKOgfhoODBgzL5nVYper0P1o6XOYQJi4z97Oyr2CG"
+    logoB64 += "HI5xy+OdyP2KNMn8J8O6LbMFPPVcZdzUP3lMKVL0NRgGI4fQde36qvj24aXgkhpQiNK7zSH/dyHai80/dHdriv6XMByMrlX6xcYXy6YboaK30lzav+vWKfNJ"
+    logoB64 += "baavCgAT9eBd7WntDDArGpgv4FZAFOTGHIyrkFnaZJcwJ/oQlmvD4hqTPBUWYTXYeM6YK7VoJhhZJMgdGvZg/tOdb+0YlReN1fhIebDu8BjrxJvdjoF79DBt"
+    logoB64 += "Q66x199rJOoyqpgL2xs/fOz0bwKzIOBASK1wFqy0jj6qoU7u/LVdTuab0Qqk9NYABGYw0y5iOBbhwEIPAeUG/H+Lm0HMP/T7CZBzxWJvLMYIPe4VLT3Kh7AR"
+    logoB64 += "WcZYowzddFcqMdYQDWASYhCERrHT50StJ3WzYhhUbOuZwNKk9dDHpNBtIGwUYBGw1fcr/2GF/Z/S2fYfxMW3Jul/CBRwFpw95/KbmMMKxK3Q9nIVvJELkxei"
+    logoB64 += "hkVthpDeZBB8vck+ufZUhi9dtK7Hn/fJab7vqheySd3X3mVUm21hybMyewzE/tyLJTLFFmFzoRwNM4Ki2bUnSuy4IBg90zJnVduFKzmk7RukCmLakgMactlL"
+    logoB64 += "DG77yN1hbWLJLV3a/2rmn3dLEFs/QMQF0g7D9QBLUWDyvr1cvsEfxUKk+gnGcTkYStP3/UaYKNyZEOuWVSPabVFNsGKnrALIvlwvnbuXbhogRAxJb1PP4Eoy"
+    logoB64 += "Zy6heNxkCNsZO1XjIBmdjiWwAIV/mJ+4C52Q/FsWXHNw7NzDNN1tQyesI9rXgbS9MZUIMiL/+/WuXky4VLSkm8mn5Z+BEGbmwZUWf22bquBhUMJl84/KfcXE"
+    logoB64 += "Rnu01tXAf1pXWWZQc6cO4I59M481vO2wszrDe5XKz4Opwrr+Dj/Vy5I1cInroToTjPdaoi9IVucwDWshVH186A93Avrmu+vLNlB65R94j17zLkvN0gbshJft"
+    logoB64 += "dJp2nyly0PbVAFRJmE2dDgiHsPUi/az2+dPyD8F3RhWOG7gtVvc5rAO63uwB3ASrhlyKCUPCVT7bOGd6sP9HVClmIMzrp6mcvklqawDgnyF5XIvZ9kNJLovu"
+    logoB64 += "1QAkzCLAPyEWDW6Wma2PbEDOBgI1l0I46ksHq15ZjjsRqF03JkxNDSFg2KaLE/w4NVtd4wJbrSyfwqxN+5jQwmy89LVlA+r01jz9j6Abbso+6bSdwvqftiDW"
+    logoB64 += "IFZH0XZ5Fxx35SebRpWs6sA/VmepZWwdJuGPNnpkzLwOfYtrMPWteCzZ1gRyMJnCf2KrhzJvJnbXb9KUXD9MxfLffTYBXp4P39awnNG5D8XlO3/dSTzRnxl2"
+    logoB64 += "dMEbC/C3oDnaXUWjYeoRDX75G5fks7IN7zxONXwHw2ubwyXxn3nzI6cO/yrA6gchVCXUey3+L3pV9YLu+soVOBLsf97oesir4lJKEW8K6XURAOF4oyfqSf3U"
+    logoB64 += "9qWkFmiZC+S/WJtcqu3DnA3C79EfnMwBr27KySG8fBQ3/1K1OZyNwHQStZuaV48TSrlHaCf6OQ33t2AVytqDuJhulWxW4Ba8GdxUYhD0NrX227QltoASs4tG"
+    logoB64 += "LzP/Q6eO/yZ4joEx0DEDdnACoOHF/Fr/0F7m3zDRVUs5XAtV1lJSELLFxZN1CfRDPhopLgW38J5r/On35Lgp/PdzIcr6Bx7kHBNETygHh90a81+tlPqvZHOu"
+    logoB64 += "bVnMRkn0+WE3CbBwD5w7vNRsJ0DKkzXyLmIUYVt4nloz5dztz/MaFu0CN4/K56poNfw/pm3CuqV/vBWXzzYIsWrsJ+0IpPi+nBfW+7oYAPCXHk8CXfvKLC9g"
+    logoB64 += "ZTZ8cAAYu8EYRi9DfCr7bEdDiDVVHiKEIsKAoZ5jbRCMfs2H0zZLJTgE+6Fr2Jb/hxlMsTWWFOEyTlJZ3N5b1ZrLZyYYGIVgmFQZe5IVqvG2zlIoHMIC2z3t"
+    logoB64 += "WIRfmhSnYX+g3yivnvxQQAxBBlerb88oLyP4tKsF6yAbVaM+55mQXWXXABjGHhVg7zjG5dfqd4HSTuRYF1HfutSlhJ1U9PKpzj2Ty+PSIJUNxn3DscIq9Zlh"
+    logoB64 += "7V54aeqveJgoza2egH1vq3LP2LBbuzPq6AeWPWaIlwl3ERuvtZVYTgIK33L11QwVmzDrTJ48fZ+B2MD87b5eAfiXjzhPhyNjiXnPvUKf0gHhWKzcAf1YK371"
+    logoB64 += "3K+RTOiGu0/p/9lxoYtr+x4TcsH4N9Z/8lHxx9hs/bUR4DAEe5RdiDqv1Em7Rc5gdjz022OlqWplRk2u8TAHmI7MtJJLmdbrbfExVvAcDTZwu07oy6fJW4W1"
+    logoB64 += "YdijFkyOjzAb6vofrFBIYVZlA+sb00ivZaciLQ3WgWxDAAPmwetGJgMiMaUFGIxORe+jTOFKZwsIbtiXBmzTw625+h0oRRso0e3kervXKtaom5plL6pNZmXp"
+    logoB64 += "mIVZLKZdw208Ucpcme867Y+VJtP/B/49tQ2etU4gDKWVkyVPhX/87MRONx4CbkY73BC0jTXbon5d1z7Gr00UhbtJ9NbqutFHf9wBy2ruduanXS9k7cupQIV1"
+    logoB64 += "H6B1Oc6iJrkrx1XwLJGMOFU/5fo/A5pKPAIm+VX+W4EHan39EgLG2tsD9anfgHB8ibo+4Z8BQdiAY8d/SpMVxH+2eTGDfgSJlmdzlcvKxQmYzxs2hiFD0bXW"
+    logoB64 += "hq2HWACPNVD5OLiL7yvQik2ZVIfbeawzc1sqe4ftokXO0uMhpYHxjfRaLHrLQYBML/g7sDQZb8L7kj6n/z+DadGlh9aUYx4X53ynI1daqqdsuch70Q7zZuqM"
+    logoB64 += "lv7krL+AJany67FykGmcrXNsVnsv/5hNP3nUQ/cxiAXYhWTbcl3K+TY13s5UEgNSRryhblD7bs6zzGAU8vFTM77AxDTYjgo+aBrWJmVdbvloQRu4kFcRHFZf"
+    logoB64 += "m6FQ4eRDh/MjurE5fVL9f4Z+WM2tDrPL/BtptZaPUlbclvLa6SDY+k07nTr+hFHU4eszxFU8u9d9HBDqyoivGHfvPmA5WZsc93X4SV745A2mc1Sw0uEcLUVq"
+    logoB64 += "EM9bz8JwSxG4ARB0QOSR/TFaCzyzOO03BtMO4ABsVGCkMDaA+CNNN4tldosa65TS8U5DKX5LGDTiJvZI+DdlAiwDzw+Xz/kKrpS1ClQcj4X4tqSB3Dph6lBI"
+    logoB64 += "po7njbFKqEP+IUJ8/MYa3j7s9/dBPq7Xcaf/3Uxcatm67k0ruLTt9pieM3g80KtkZtsooHUzzU4+3Tc+eV4UQID1j7VGEEFikV8Iw+5gCBUYCAW/xarXofTT"
+    logoB64 += "DMdLwbtBnBEZPv1I+L/D6KxN3zMHo3mh0QZ2y3hRDM/KLn0RYrsOiuX4nJmzWLnpAQVYz63z4S5N+t4rHs1hhMmes8Njgy48lG2F1aUTmGJpguXMDWXlDsO7"
+    logoB64 += "nITP3/syASp48lby4wQ+lhNpKSEChYdqN4Ypaaao+qfI/6BApn0yba/KrNpAVDARUoGwrKNijOuoMM30d9598BGY0E5Dy9L/hXDeCSAIpZXArfdUpcSLxV7s"
+    logoB64 += "2ueCDTBgHIYeSvs/YSAStHlYH4zfvOpqhamb158B+fq+yIgHiCbXWA1y9uFqlQO25ywBSmnXukkwbVhIszRsMMOf6gTT4NWMA/8eTwprwdnSTDDsA8+fpqui"
+    logoB64 += "J9F/DXsNEJKq5VbIgA0QXIPGhVAhWg7c437krXn5bViGzSZA0J7PL3033IKUC+VUXQWucdiyRz9avADDU+RN4zGC2P0p2FsjVDryyoaliKI8vJ4KZDHdA/93"
+    logoB64 += "0we8gOl7tnU69T4GfP0E637SvjQU/jHLGn6wwZRSj6u02C3HhspF08kXzUyawXviuV4pIFqZFua7Mo1y6Xgpcu+Wa/f4vHctbRJ4lLi2eDLYof0aD/+ySmsY"
+    logoB64 += "EqNe6+92ZwCS6DCST2WXB+Ilvq2uZ4PpBNZgyXitzXRX62mYzEbyh4ej8Xue33vM2h7sFNRSlBwbBqBLEWxTn2zFMOWb0sgnvFaGG9yzthXMglCcO/YIyhGZ"
+    logoB64 += "NVYkI6VSDI+EVcNx9NLHGpy8WEyXQ4IbM0nwUw3LXKbNU7yH91gscaYoja0CRekVyO0v6V/2l4Ddg46WMvzzsN3fBw2/M6hfGA7xbuxTta3ZCSUHNA2bjqln"
+    logoB64 += "Znq9LnsDQgjMskolTpIr8OPaPByZF+kF35b09lI6VmqAX1+RDNe6bjzE7WH26l7QEkiUZz3uAYQZnulO6kXCJP0uQaWysicYsihX+oQsMXaAsD85ZbYToOwx"
+    logoB64 += "qKZualFp20QO71BVuevwZNEjfrENHjcYz/q/i1w8aosOYNtdxbz2QxCvOh4HXO4aprmyEbcxi8xh8fdy2BgSssMO++xsV9UyWMjHnQbr++GcIbzTygdTe4VH"
+    logoB64 += "MxkeBgxYqicYe4nwTg+HXaXMLPVLXtQIPE4nsSMMPDQHK1RHa1meoW2AqZkTHgZh3VY7bqaGD/xjZyH42VO02EUKZqyK2CdSa7Xi98OuAEamI6If22zqqGHd"
+    logoB64 += "ujRIO/Fa/GYOzkqgK9C77M+gnEAT5AkMdW8goF+j4IJwm59bT/1VqxP+td3uHK6zarrgI7hqJkJ4wWwd3ki6SYKVKrJDYQBzY4Ztu9LQ61ENBQHJGWxDB54/"
+    logoB64 += "zErBCfwewpSFMLttpeRWgwFoy5+KeVcEIfiwCX5Gl5fV7vZTJ1Fz3pqU3wjegIrTT2uLyg6rsNTlG5SwoFaK3Y7dFO+NHZpvsaWbtuvSZxsPkVzqFwM/P91f"
+    logoB64 += "jGk4IZYyZvHsC5YkwZIVAlu+4NuWcM0c60LM0MiSvEtfvJe9G0qQSghiyr5wmXxAMkOdN/wtvPHSgVCcTlFLQEyjvgiD9cBiGfq14rtGQOU6OOdKZeqtSfmd"
+    logoB64 += "KM1g7qvV9/RfHFkZzZWtMRh8tV39WZV++rgUgYSVwpYAT+yZ5Spcujr6S2NPK7vt1sskYeNy+s8KIgE8O5q4xvZ++FlDD4jjv8q5EqXuiHls+ICnTyGCVFjA"
+    logoB64 += "lr+nXd7OVUmGal8pjNMilBzwxgUwG6xUDOHEuZehnw9bzDvkyNytr734vdCNr+1/k3xsWWj7tY5Xap86IUK5LBGrN73an66F4GANVvvxoJ5rF6/tJkKq/Wkf"
+    logoB64 += "b7a92QXsuAq97KZlKwJEhNmRATrubCYm9NqFpa8KGxPNsOOoq+RW8L+KFdR1rymovAxsKAQSfqB/+AV8k67P0Yv2wPyPJ/m3hY0Q++RsnZiLzP3VK5ckqPvS"
+    logoB64 += "WTPHWh6OdtUG2dzvycf6bvAN84O+Slg+cPxmfMt/EPIpGbbuhxUpJmnIMj9UgpkzIgL7ggWE2fovYWjtjD91Ej3/wQEWcAmTg4MCYdmZrMG6tyyC0Khee1HA"
+    logoB64 += "j3IryobvdtJp6cbGv1JYaRVecpg/Cnn9yjXQ2wnEEVjsoXhj/4vQuzbuDoRikJUfIZY63F3h9VlFrdqlDGDFZzE0jzBPbGglGXqISc0FHhiXsH61V8k97Iv3"
+    logoB64 += "29Pms85ocfiBE5ErvNyYWSsw7X/whmB2+ogbxIMFENqMzPxjeWWGAQoST2GmiZbXal+Y5UnPHV6dnI4HCeT2c11ibbCt1Xp91gKexzNNJbdOYi5AWZoHGH7s"
+    logoB64 += "7VNSu32YCSUvyhChFUtPNbL0sKe8zWc6wR+d4OpgkoHrMqVa1BwXurYu2cay6cD/Fz665Q/sgBpemhRdWIesrrfDtHoBbpvX8ahbC8K4VGeIrbG0PJyeC8RP"
+    logoB64 += "OHcqchhmgV1dyzGs/F85tOxvH9xasssl+Ea/yKTrp4dwcGLNmNMlK+L3o+5vWnVg2FUtUzLrk7d0S+21HVIbRuXRLX+8OSf1S9PCd+/BFV8/+8QaKayIeND+"
+    logoB64 += "RCOmNumJqUw41H8H4PLsR8Puu5MK+39hWS9XeffnIP2qK0+h45fO6nKC4fXTz+aKVMc/UV4plaI26fxkj6u0FIoPVSZ8XMH/bnjWfb92c4VdNHN1ff7Dyvf+"
+    logoB64 += "6+pss+auTZ3N7fXrNNT5gcphl8HYkoLFVk9qsqf/1EYfgDdcKHZ0cd2F/k38xIiBxItKgPa7pCnAqfW5lIihkxhX8D+AZQzbXewx4/JGI2fdMNvgkZrTXySm"
+    logoB64 += "74fjWZdHT63PfjSQJm0sJZ3tXH/bafA2pOs2WDZaPMJHPbxJkzyZEgGzilyniz0mNqoLWIUG+lCOcvnDegktHgRjLlThDf5Zo+B/LoyRUMq8cfUL59cOl2gN"
+    logoB64 += "/M+w8SDbheAPb145Ihs7EWH29p195xYhNjozNr34zoFn3DTCnU0zyuVfGi5hOZcFBdjO3lgBje3it0tHZsF3v3H5i7jWT4NZXUou8hexpb99m36cgtn8y+q/"
+    logoB64 += "AN7IR5GvPKHEflHzoX/kKJf/3d0K5XSL0f2b96HoCAr5PD+IB/DbN1bO1XZaKupVfgjdarf6Hy6eyD98q0ZmE354lYqGCTG78lfSpJzh/4Po84cn1icBX7h2"
+    logoB64 += "6rj4F/5ZnS+kZbiS6UNRk8TOgy50/Et6j+0vf+KZ+MCHCc/y5NqfCWxkzxLYvrHSXxQA6F/rNqF9i/9GmHMJhT2DPzRw5UaXGeNytjX+/+5+dWTmAxf2isiy"
+    logoB64 += "uWLbg8h4cTj2Jvqkx77fAVb66tnk+jddYMzn2kpeTtX9OwRu9Cep2Lbb73uuj9PKzD7waSaK6lpTD8O44nho9cbXnd8WKoECLAXVb42CPuefyQ/2z8UrHsN3"
+    logoB64 += "rtnDEPW9x6tzLAr6wGexWoTNld9hsRnD8pbRXQR+CC5KF6bSZ+v6qzQ7zZ8uP9o9v7SNF0qLLfvv4jWqj7kaWV+/5UXUkVfBfMStfCZIbM2ksnvz8AOT5hdF"
+    logoB64 += "SEJmsP1R50H2vXNVq/wxpaFfrrb0SbqxorSe+jVf7K9FBwYAyyTeHAj5i1qj4T3RQsXVdr/3naxK8UGWFL+eUay9FKybjTPzczgQWFdn3/b/d/zX8A8L7lFH"
+    logoB64 += "K4dS/feSytgHG3Ox6x2dmfXqEefV2OnHdv/B6X8pf/uo2DuGUDbG0nPavZ/9Ozb56FW9kl/1WqocGSP67wYDILQLb0XBfP3ut7uKxGNTD/c4vNvyA9jiw9KD"
+    logoB64 += "X521Eq+bJPoHgBSfxvSmAZA/f1s2Xtgbh+ve0g9kDn7inkZ5NQHN6ibKD+STPycwj8fl2/z/rP0vd8azCo92vP/K4J8Du06/b+y8GnXe5wis5IDfWg3y5ziL"
+    logoB64 += "sf6qmZmF8LEdg1/8dUH75R8QIJ8eqMje7n7Ffmb96xjxntZyDufWX/UOr6Wq5biTvmcAA8Df7H4pPq7BviiFVzm3fwT3+EAxyuTI9x+CCZf8Ww7ggzejMMa5"
+    logoB64 += "7NbhD6qvkbVnM1r9J5DOWfGRUo43gKe5RU5/1kqLtZd/2CP9CeDCMfUrR4UJ4P5PMfmvX1M3OhP7F8BdiL9qYDKu+z/xdtXoPR9Lk9cfBBiA8zvWPhdA9+sP"
+    logoB64 += "7iOOANIZ/akHJ3r7sSKSkUBgu6RPOz5Ra/lZr/f5NZDYLeWTjhBTim1+/m0+N6RTn9I+Mqbkx/NX40F04hMqQCYk+2it4sjAPqkBILwPMvyqMj/CXwluPq0C"
+    logoB64 += "JLwDPH30TA/hU0CaZzIAY4ahJMmoIbMk/scMxiqaACMGY4z4HzOk+PlSf8LfC86eyACMGfJxdutHINwSipLAo4b+ycM+hL8clnJAo0akHNC4YSkEHDUkGYBx"
+    logoB64 += "w1LF1LjByQCMGvqDB34JnwSKDMCoEUkBjBukAMYN/pGWD4TPA0W7AOOGuvUDEG6KSFngcYMk4LjBKQYcN76QBBw3KAs8bvyaax8Ify2+3PoBCLcFeYBxg2qB"
+    logoB64 += "Rw556wcg3BYkAccN2gccOWgCEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAI"
+    logoB64 += "BAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAoFAIBAIBAKBQCAQCAQCgUAgEAgEAmEE+H94EkBcnwkS3gAAAABJRU5ErkJggg=="
 
     -- Decode base64 to Image
     local pic = dotNetObject "System.Windows.Forms.PictureBox"
@@ -391,28 +387,28 @@ macroscript flowstate_Config
     frm.controls.add (mkSep pad Y iW); Y += 12
     frm.controls.add (mkLabel "MODULES" pad Y iW 18 fObj:fBold cObj:cHead); Y += 24
 
-    global flowstate_chkPP = mkCheck "Parameters / Stack" (pad+4) Y (iW-8) chk:true
+    global flowstate_chkPP = mkCheck "Floating Modifier Stack" (pad+4) Y (iW-8) chk:true
     frm.controls.add flowstate_chkPP; Y += 26
     global flowstate_chkPS = mkCheck "Shader Search Utility" (pad+4) Y (iW-8) chk:true
-    frm.controls.add flowstate_chkPS; Y += 34
+    frm.controls.add flowstate_chkPS; Y += 26
+    global flowstate_chkSideKeys = mkCheck "Mouse Slider Macros" (pad+4) Y (iW-8) chk:true
+    frm.controls.add flowstate_chkSideKeys; Y += 26
+    frm.controls.add (mkLabel "Controls the Mouse4 and Mouse5 action layer." (pad+20) Y (iW-24) 18 fObj:fSmall cObj:cDim); Y += 30
 
     -- ── Options ──
     frm.controls.add (mkSep pad Y iW); Y += 12
     frm.controls.add (mkLabel "OPTIONS" pad Y iW 18 fObj:fBold cObj:cHead); Y += 24
 
-    global flowstate_chkSideKeys = mkCheck "FlowState Mouse Side Buttons (XButton1 / XButton2)" (pad+4) Y (iW-8) chk:true
-    frm.controls.add flowstate_chkSideKeys; Y += 26
-    frm.controls.add (mkLabel "Off releases both buttons; Tab search and Max hotkeys still work." (pad+20) Y (iW-24) 18 fObj:fSmall cObj:cDim); Y += 22
     global flowstate_chkSubObj = mkCheck "Sub-Object Toggles (V/E/B/F/El)" (pad+4) Y (iW-8) chk:false
     frm.controls.add flowstate_chkSubObj; Y += 26
-    global flowstate_chkTab = mkCheck "TAB key override for search." (pad+4) Y (iW-8) chk:false
+    global flowstate_chkTab = mkCheck "TAB key override for Shader Search Utility." (pad+4) Y (iW-8) chk:false
     frm.controls.add flowstate_chkTab; Y += 26
     global flowstate_chkLight = mkCheck "Light Theme" (pad+4) Y (iW-8) chk:false
     frm.controls.add flowstate_chkLight; Y += 34
 
-    -- ── Keymap (XButton1) ──
+    -- ── Keymap (Mouse4) ──
     frm.controls.add (mkSep pad Y iW); Y += 12
-    frm.controls.add (mkLabel "KEYMAP  (XButton1)" pad Y iW 18 fObj:fBold cObj:cHead); Y += 24
+    frm.controls.add (mkLabel "KEYMAP  (Mouse4)" pad Y iW 18 fObj:fBold cObj:cHead); Y += 24
 
     -- Modifier labels (index matches C++ combo indices 0-7); shared by keymap UI + save logic
     global flowstate_kmChoiceLabels = #("(bare)", "Shift", "Ctrl", "Ctrl+Shift", "Ctrl+Alt+Shift", "Alt", "Alt+Shift", "Ctrl+Alt")
@@ -610,11 +606,11 @@ macroscript flowstate_Config
     -- Fixed shortcuts
     frm.controls.add (mkLabel "OTHER SHORTCUTS" pad Y iW 18 fObj:fBold cObj:cHead); Y += 22
     for s in #(
-        "XButton2  --  Parameter panel",
-        "Shift + XButton2  --  Shader search",
-        "Tab (in SME)  --  Shader search",
-        "Ctrl + XButton2  --  Cycle auto orbit (Orbit / Selected / POI / Dynamic / Off)",
-        "Alt + Shift + XButton2  --  Swap V/H sliders",
+        "Mouse5  --  Floating Modifier Stack",
+        "Shift + Mouse5  --  Shader Search Utility",
+        "Tab (in SME)  --  Shader Search Utility",
+        "Ctrl + Mouse5  --  Cycle auto orbit (Orbit / Selected / POI / Dynamic / Off)",
+        "Alt + Shift + Mouse5  --  Swap V/H sliders",
         "",
         "Click value  --  Type value",
         "Drag value  --  Scrub value",
@@ -860,7 +856,7 @@ macroscript flowstate_Config
 
     -- Reset
     fn onReset s e = (
-        if queryBox "Clear all flowstate settings?\n\nThis restores all defaults, including mouse side buttons,\nand clears parameter layouts, favorites, quick modifiers,\nshader pins/bricks, and XB1 assignments." title:"flowstate" then (
+        if queryBox "Clear all flowstate settings?\n\nThis restores all defaults, including mouse side buttons,\nand clears parameter layouts, favorites, quick modifiers,\nshader pins/bricks, and Mouse4 assignments." title:"flowstate" then (
             local cfgDir = getDir #plugcfg
             local resetFiles = #(
                 cfgDir + "\\FlowState.cfg",

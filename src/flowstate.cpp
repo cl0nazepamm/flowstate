@@ -39,6 +39,7 @@ HINSTANCE hInstance = nullptr;
 
 static const ActionTableId   kTableId   = 0x7A1CE201;
 static const ActionContextId kContextId = 0x7A1CE202;
+static const TCHAR*          kActionCategory = _T("flowstate");
 static const int             kToggleId          = 1;
 static const int             kOrbitCycleId      = 2;
 static const int             kAutoOffId         = 3;
@@ -51,6 +52,8 @@ static const int             kSetSelectedId     = 9;
 static const int             kSetSubObjectId    = 10;
 static const int             kSetPOIId          = 11;
 static const int             kReloadSettingsId  = 12;
+static const int             kShaderSearchId    = 13;
+static const int             kMacroSearchId     = 14;
 
 // ── Config ──────────────────────────────────────────────────────
 static const TCHAR* kWndClass = _T("PowerParamsPanel");
@@ -1101,7 +1104,7 @@ bool IsPowerParamsQuickModifier(const wchar_t* internalName) {
     return false;
 }
 
-// XButton1 dynamic assignment — two slots: vertical (V) and horizontal (H)
+// Mouse4 dynamic assignment — two slots: vertical (V) and horizontal (H)
 // Keyed per base-object class so each object type remembers its own assignments
 struct XB1Slot {
     std::wstring key;
@@ -1125,7 +1128,7 @@ static bool         g_osdClassRegistered = false;
 static HWND         g_dragTip = nullptr; // cursor-following value tooltip
 static bool         g_dragTipClassRegistered = false;
 
-// XButton1 keymap — configurable modifier combos
+// Mouse4 keymap — configurable modifier combos
 // Combo indices: 0=bare, 1=Shift, 2=Ctrl, 3=Ctrl+Shift, 4=Ctrl+Alt+Shift,
 //                5=Alt, 6=Alt+Shift, 7=Ctrl+Alt, -1=disabled (config UI "Off")
 static int g_kmGrab    = 0;  // screen space grab
@@ -2271,7 +2274,7 @@ static int  FindParamAtY(int clickY);
 static LRESULT CALLBACK ModSearchEditProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 static void BuildLayout();
 
-// ── Mouse hook — XButton2=panel, XButton1=pin ───────────────────
+// ── Mouse hook — Mouse5=panel, Mouse4=pin ───────────────────────
 // Uses WH_MOUSE (thread-level) instead of WH_MOUSE_LL (system-wide)
 // to avoid blocking the system input pipeline when Max is busy.
 enum DragMode { DRAG_NONE, DRAG_TIME, DRAG_OPACITY, DRAG_UVGRAB };
@@ -2291,7 +2294,7 @@ static bool  s_uvOwnHold = false;
 static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     if (nCode < 0) return CallNextHookEx(g_mouseHook, nCode, wp, lp);
 
-    // Master opt-out: never consume or act on either mouse side button.
+    // Master opt-out: never consume or act on Mouse4 or Mouse5.
     // The mouse hook remains installed for panel outside-click handling.
     if (!g_enableSideKeys && (wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP))
         return CallNextHookEx(g_mouseHook, nCode, wp, lp);
@@ -2308,11 +2311,11 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
         }
     }
 
-    // ── XButton1 hold-drag tools ──────────────────────────────
+    // ── Mouse4 hold-drag tools ────────────────────────────────
     auto finishXB1Drag = [&]() {
         s_xb1Dragging = false;
         if (s_xb1OwnHold && theHold.Holding()) {
-            if (s_xb1Changed) theHold.Accept(_T("XB1 Drag"));
+            if (s_xb1Changed) theHold.Accept(_T("Mouse4 Drag"));
             else theHold.Cancel();
         }
         s_xb1OwnHold = false;
@@ -2400,7 +2403,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
         return 1;
     }
 
-    // XButton1 assigned param drag — uses cached data, works with panel closed
+    // Mouse4 assigned param drag — uses cached data, works with panel closed
     if (s_xb1Dragging && wp == WM_MOUSEMOVE && (g_xb1V.Active() || g_xb1H.Active())) {
         MOUSEHOOKSTRUCT* ms2 = (MOUSEHOOKSTRUCT*)lp;
         int dy = ClampDragDelta(s_lastMouseY - ms2->pt.y);  // up = positive
@@ -2577,7 +2580,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     if (wp == WM_XBUTTONDOWN || wp == WM_XBUTTONUP) {
         WORD xbutton = HIWORD(reinterpret_cast<MOUSEHOOKSTRUCTEX*>(lp)->mouseData);
 
-        // XButton1 combos — configurable via g_km* keymap globals
+        // Mouse4 combos — configurable via g_km* keymap globals
         // Combo indices: 0=bare, 1=Shift, 2=Ctrl, 3=Ctrl+Shift, 4=Ctrl+Alt+Shift,
         //                5=Alt, 6=Alt+Shift, 7=Ctrl+Alt
         if (xbutton == XBUTTON1) {
@@ -2821,7 +2824,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                 CycleAutoOrbitMode();
                 return 1;
             } else if (alt && shift && !ctrl) {
-                // Alt+Shift+XButton2 -> swap V/H slider assignments
+                // Alt+Shift+Mouse5 -> swap V/H slider assignments
                 SyncXB1ToSelection();
                 if (g_xb1V.Active() || g_xb1H.Active()) {
                     std::swap(g_xb1V, g_xb1H);
@@ -6108,10 +6111,10 @@ class PPAction : public ActionItem {
 public:
     int   GetId() override { return kToggleId; }
     BOOL  ExecuteAction() override { TogglePanel(); return TRUE; }
-    void  GetButtonText(MSTR& t) override { t = PPARAM_NAME; }
-    void  GetMenuText(MSTR& t) override { t = _T("Toggle PowerParams Panel"); }
-    void  GetDescriptionText(MSTR& t) override { t = _T("Show/hide PowerParams floating parameter panel"); }
-    void  GetCategoryText(MSTR& t) override { t = PPARAM_NAME; }
+    void  GetButtonText(MSTR& t) override { t = _T("flowstate: Floating Modifier Stack"); }
+    void  GetMenuText(MSTR& t) override { t = _T("flowstate: Floating Modifier Stack"); }
+    void  GetDescriptionText(MSTR& t) override { t = _T("Show or hide the flowstate Floating Modifier Stack"); }
+    void  GetCategoryText(MSTR& t) override { t = kActionCategory; }
     BOOL  IsChecked() override { return g_open; }
     BOOL  IsItemVisible() override { return TRUE; }
     BOOL  IsEnabled() override { return TRUE; }
@@ -6122,10 +6125,10 @@ class ReloadSettingsAction : public ActionItem {
 public:
     int   GetId() override { return kReloadSettingsId; }
     BOOL  ExecuteAction() override { ReloadSettingsLive(); return TRUE; }
-    void  GetButtonText(MSTR& t) override { t = _T("FlowState: Reload Settings"); }
-    void  GetMenuText(MSTR& t) override { t = _T("FlowState: Reload Settings"); }
-    void  GetDescriptionText(MSTR& t) override { t = _T("Reload FlowState settings from disk"); }
-    void  GetCategoryText(MSTR& t) override { t = PPARAM_NAME; }
+    void  GetButtonText(MSTR& t) override { t = _T("flowstate: Reload Settings"); }
+    void  GetMenuText(MSTR& t) override { t = _T("flowstate: Reload Settings"); }
+    void  GetDescriptionText(MSTR& t) override { t = _T("Reload flowstate settings from disk"); }
+    void  GetCategoryText(MSTR& t) override { t = kActionCategory; }
     BOOL  IsChecked() override { return FALSE; }
     BOOL  IsItemVisible() override { return FALSE; }
     BOOL  IsEnabled() override { return TRUE; }
@@ -6137,8 +6140,59 @@ public:
     BOOL ExecuteAction(int id) override {
         if (id == kToggleId) { TogglePanel(); return TRUE; }
         if (id == kReloadSettingsId) { ReloadSettingsLive(); return TRUE; }
+        if (id == kShaderSearchId) {
+            if (!g_enablePowerShader) return FALSE;
+            PowerShader::Toggle();
+            return TRUE;
+        }
+        if (id == kMacroSearchId) {
+            if (!g_enablePowerParams) return FALSE;
+            ModStack::Toggle();
+            return TRUE;
+        }
         return DispatchOrbitAction(id);
     }
+};
+
+class LauncherAction : public ActionItem {
+public:
+    int          id;
+    const TCHAR* label;
+    const TCHAR* description;
+
+    LauncherAction(int actionId, const TCHAR* actionLabel, const TCHAR* actionDescription)
+        : id(actionId), label(actionLabel), description(actionDescription) {}
+
+    int GetId() override { return id; }
+    BOOL ExecuteAction() override {
+        if (id == kShaderSearchId) {
+            if (!g_enablePowerShader) return FALSE;
+            PowerShader::Toggle();
+            return TRUE;
+        }
+        if (id == kMacroSearchId) {
+            if (!g_enablePowerParams) return FALSE;
+            ModStack::Toggle();
+            return TRUE;
+        }
+        return FALSE;
+    }
+    void GetButtonText(MSTR& t) override { t = label; }
+    void GetMenuText(MSTR& t) override { t = label; }
+    void GetDescriptionText(MSTR& t) override { t = description; }
+    void GetCategoryText(MSTR& t) override { t = kActionCategory; }
+    BOOL IsChecked() override {
+        if (id == kShaderSearchId) return PowerShader::IsOpen();
+        if (id == kMacroSearchId) return ModStack::IsOpen();
+        return FALSE;
+    }
+    BOOL IsItemVisible() override { return TRUE; }
+    BOOL IsEnabled() override {
+        if (id == kShaderSearchId) return g_enablePowerShader;
+        if (id == kMacroSearchId) return g_enablePowerParams;
+        return FALSE;
+    }
+    void DeleteThis() override {}
 };
 
 class OrbitAction : public ActionItem {
@@ -6151,7 +6205,7 @@ public:
     void  GetButtonText(MSTR& t) override      { t = label; }
     void  GetMenuText(MSTR& t) override        { t = label; }
     void  GetDescriptionText(MSTR& t) override { t = label; }
-    void  GetCategoryText(MSTR& t) override    { t = PPARAM_NAME; }
+    void  GetCategoryText(MSTR& t) override    { t = kActionCategory; }
     BOOL  IsChecked() override                 { return FALSE; }
     BOOL  IsItemVisible() override             { return TRUE; }
     BOOL  IsEnabled() override                 { return TRUE; }
@@ -6162,17 +6216,24 @@ static PPAction   g_action;
 static ReloadSettingsAction g_reloadSettingsAction;
 static PPActionCB g_actionCB;
 
+static LauncherAction g_launcherActions[] = {
+    { kShaderSearchId,  _T("flowstate: Shader Search Utility"),
+      _T("Show or hide the flowstate Shader Search Utility") },
+    { kMacroSearchId, _T("flowstate: Macro Search"),
+      _T("Show or hide the flowstate Macro Search palette") },
+};
+
 static OrbitAction g_orbitActions[] = {
-    { kOrbitCycleId,   _T("FlowState: Cycle Auto Orbit") },
-    { kAutoOffId,      _T("FlowState: Auto Orbit Off") },
-    { kAutoStandardId, _T("FlowState: Auto Orbit") },
-    { kAutoSelectedId, _T("FlowState: Auto Orbit Selected") },
-    { kAutoPOIId,      _T("FlowState: Auto Orbit POI") },
-    { kAutoDynamicId,  _T("FlowState: Auto Orbit Dynamic POI") },
-    { kSetOrbitId,     _T("FlowState: Set Orbit") },
-    { kSetSelectedId,  _T("FlowState: Set Orbit Selected") },
-    { kSetSubObjectId, _T("FlowState: Set Orbit SubObject") },
-    { kSetPOIId,       _T("FlowState: Set Orbit POI") },
+    { kOrbitCycleId,   _T("flowstate: Cycle Auto Orbit") },
+    { kAutoOffId,      _T("flowstate: Auto Orbit Off") },
+    { kAutoStandardId, _T("flowstate: Auto Orbit") },
+    { kAutoSelectedId, _T("flowstate: Auto Orbit Selected") },
+    { kAutoPOIId,      _T("flowstate: Auto Orbit POI") },
+    { kAutoDynamicId,  _T("flowstate: Auto Orbit Dynamic POI") },
+    { kSetOrbitId,     _T("flowstate: Set Orbit") },
+    { kSetSelectedId,  _T("flowstate: Set Orbit Selected") },
+    { kSetSubObjectId, _T("flowstate: Set Orbit SubObject") },
+    { kSetPOIId,       _T("flowstate: Set Orbit POI") },
 };
 
 static ActionTable* MakeActionTable() {
@@ -6180,14 +6241,15 @@ static ActionTable* MakeActionTable() {
     if (!contextRegistered) {
         if (Interface* ip = GetCOREInterface()) {
             if (IActionManager* am = ip->GetActionManager())
-                contextRegistered = am->RegisterActionContext(kContextId, PPARAM_NAME) != FALSE;
+                contextRegistered = am->RegisterActionContext(kContextId, kActionCategory) != FALSE;
         }
     }
-    static ActionTable table(kTableId, kContextId, TSTR(PPARAM_NAME));
+    static ActionTable table(kTableId, kContextId, TSTR(kActionCategory));
     static bool init = false;
     if (!init) {
         table.AppendOperation(&g_action);
         table.AppendOperation(&g_reloadSettingsAction);
+        for (LauncherAction& a : g_launcherActions) table.AppendOperation(&a);
         for (OrbitAction& a : g_orbitActions) table.AppendOperation(&a);
         init = true;
     }
