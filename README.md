@@ -124,7 +124,6 @@ Set `MAX_VERSION=2027` or override `MAXSDK_PATH` for another supported SDK; the 
 | Modeling commands | `src/normalize_edges/f2_extend_tool.cpp`, `smooth_bridge_tool.cpp` |
 | Normalize Poly modifier | `src/normalize_edges/normalize_poly.*` |
 | Loop Subdivision modifier | `src/modifiers/loop_subdivision/` |
-| Native smoke tests | `tests/` |
 
 The CMake project groups those areas explicitly while linking them into the single `FlowState` target.
 
