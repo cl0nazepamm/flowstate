@@ -94,7 +94,7 @@ Release packages require both `FlowState.gup` and `flowstate_config.ms`.
 - Turn Select Only off to remove them
 
 ## Interface
-- <img src="images/flowstate.png" alt="Interface" width="320">
+- <img src="images/flowstate.png" alt="Interface" width="720">
 
 
 ## Issues
