@@ -23,6 +23,10 @@ Release packages require both `FlowState.gup` and `flowstate_config.ms`.
 - Middle Click to pin to brick
 - Drag and Drop to any slot, object, or SME location
 - Right Click a pinned brick to rename it (max 4 chars)
+- SHLL button creates a shell material for textured viewports for renderers that fail to display nitrous textures. Right click to change bitmap resolution.
+- LINK button links U and V tile of bitmap nodes (including uberbitmap)
+
+- <img src="images/shader_search_utility.png" alt="Shader Search Utility" width="320">
 
 ### Floating Modifier Stack
 
@@ -36,6 +40,8 @@ Release packages require both `FlowState.gup` and `flowstate_config.ms`.
 - Right Click on a parameter to pin it
 - Esc cancels and closes
 - Hit the O button in the panel to hide parameters completely
+
+- <img src="images/floating_modifier_stack.png" alt="Floating Modifier Stack" width="320">
 
 ### Auto Orbit
 
