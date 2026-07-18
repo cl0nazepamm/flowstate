@@ -331,14 +331,36 @@ bool AssignNamedSubTexmapDrop(MtlBase* owner, MtlBase* dropped, const std::wstri
     return true;
 }
 
+MtlBase* GetParameterEditorOwner()
+{
+    FPValue result;
+    const BOOL ok = ExecuteMAXScriptScript(
+        L"try(if SME.isOpen() then SME.GetMtlInParamEditor() else false)catch(undefined)",
+        MAXScript::ScriptSource::Dynamic, TRUE, &result);
+    if (!ok) return nullptr;
+
+    if (result.type == TYPE_BOOL)
+    {
+        if (result.b) return nullptr;
+        IMtlEditInterface* medit = GetMtlEditInterface();
+        return medit ? medit->GetCurMtl() : nullptr;
+    }
+    if (result.type == TYPE_MTL) return result.mtl;
+    if (result.type == TYPE_TEXMAP) return result.tex;
+    if (result.type != TYPE_REFTARG || !result.r) return nullptr;
+
+    const SClass_ID type = result.r->SuperClassID();
+    if (type != MATERIAL_CLASS_ID && type != TEXMAP_CLASS_ID) return nullptr;
+    return static_cast<MtlBase*>(result.r);
+}
+
 // Qt pickers expose the ParamBlock2 internal name through UI Automation. Native
 // material panels instead expose a picker HWND and a visible row label.
-bool TryQtMeditParameterDrop(MtlBase* dropped)
+bool TryParameterEditorDrop(MtlBase* dropped)
 {
     if (!dropped) return false;
 
-    IMtlEditInterface* medit = GetMtlEditInterface();
-    MtlBase* owner = medit ? medit->GetCurMtl() : nullptr;
+    MtlBase* owner = GetParameterEditorOwner();
     if (!owner || owner == dropped) return false;
 
     const HRESULT initResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -437,8 +459,8 @@ bool TryDADDrop(MtlBase* mb)
     HWND smeHwnd = FindSmeNodeViewWindowAtPoint(screenPos);
     if (smeHwnd && TryDADDropOn(mb, smeHwnd)) return true;
 
-    // 2. Qt material/map parameter picker in the Compact Material Editor.
-    if (TryQtMeditParameterDrop(mb)) return true;
+    // 2. Material/map parameter picker in Compact or Slate's Parameter Editor.
+    if (TryParameterEditorDrop(mb)) return true;
 
     // 3. Direct window under cursor — only try if it has DAD
     //    (medit sample slots, color swatches, etc.)
