@@ -46,13 +46,6 @@ Release packages require both `FlowState.gup` and `flowstate_config.ms`.
 - Dynamic switches between POI and Selected depending on your selection
 - All modes are in Hotkey Editor too
 
-### Macro Search
-
-- Open with the M button in Floating Modifier Stack or via hotkey
-- Search modifiers and macros
-- Enter adds the modifier or runs the macro
-- Delete removes top modifier
-- Middle Click a modifier to add it to quick access
 
 ### Mouse Slider Macros
 
@@ -77,7 +70,6 @@ Release packages require both `FlowState.gup` and `flowstate_config.ms`.
 
 - Editable Poly only
 - Select an open edge and run F2 Extend
-- Select 2 verts to connect or 3+ verts to make a face
 - Select the new edge again if you want to keep extending
 
 ### Loop Subdivision
