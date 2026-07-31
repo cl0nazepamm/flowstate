@@ -6,6 +6,7 @@ build_*/
 build_log.txt
 dist/
 tests/
+docs/
 
 # Local build/dev scripts — only build.bat is tracked
 *.bat

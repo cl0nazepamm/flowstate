@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cwctype>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -589,6 +590,12 @@ constexpr int kSceneId   = 1004;
 constexpr int kTabMatId  = 1006;
 constexpr int kTabMapId  = 1007;
 constexpr int kTabFavId  = 1009;
+constexpr int kToolsMenuId = 1010;
+constexpr int kAutoApplyId = 1011;
+constexpr int kShllRes128Id  = 1012;
+constexpr int kShllRes256Id  = 1013;
+constexpr int kShllRes512Id  = 1014;
+constexpr int kShllRes1024Id = 1015;
 constexpr int kWindowWidth  = 380;
 constexpr int kWindowHeight = 540;   // maximum height; Favorites view shrinks to fit
 constexpr int kHeaderH      = 34;
@@ -598,16 +605,19 @@ constexpr UINT_PTR kSearchTimerId = 1;
 constexpr UINT kSearchDebounceMs = 14;
 constexpr UINT_PTR kPreviewTimerId = 2;
 constexpr UINT kPreviewDebounceMs = 90;
+constexpr UINT kRemoveBrickMessage = WM_APP + 1;
 
 enum class TabMode { All, Materials, Maps };
 enum class ItemKind { ClassMaterial, ClassMap, SceneMaterial, SceneMap };
+enum class BrickGesture { None, LeftArmed, LeftDragging, MiddleArmed, MiddleDragging };
 
 struct Item
 {
     std::wstring label;
     std::wstring normLabel;   // pre-normalized for scoring
     std::wstring search;
-    std::wstring key;
+    std::wstring key;         // legacy normalized alias (search/activation)
+    std::wstring favoriteKey; // stable, collision-free persistent identity
     std::wstring scriptName;
     std::wstring scriptKey;
     std::wstring category;
@@ -621,7 +631,7 @@ struct Item
 // ═══════════════════════════════════════════════════════════════
 struct BrickFav
 {
-    std::wstring alias;  // normalized class alias
+    std::wstring alias;  // stable favorite key (legacy aliases migrate on load)
     std::wstring label;  // display label (max 4 chars)
 };
 constexpr int kBrickBase = 1200;
@@ -1211,6 +1221,30 @@ std::wstring Normalize(const std::wstring& s, bool spaces)
     return out;
 }
 
+std::wstring MakeClassFavoriteKey(SClass_ID sid, const Class_ID& classId)
+{
+    return L"class:" + std::to_wstring(static_cast<unsigned long long>(sid)) +
+        L":" + std::to_wstring(static_cast<unsigned long long>(classId.PartA())) +
+        L":" + std::to_wstring(static_cast<unsigned long long>(classId.PartB()));
+}
+
+std::wstring MakeSceneFavoriteKey(MtlBase* item, const std::wstring& normalizedName)
+{
+    if (!item) return {};
+    const Class_ID classId = item->ClassID();
+    return L"scene:" +
+        std::to_wstring(static_cast<unsigned long long>(item->SuperClassID())) +
+        L":" + std::to_wstring(static_cast<unsigned long long>(classId.PartA())) +
+        L":" + std::to_wstring(static_cast<unsigned long long>(classId.PartB())) +
+        L":" + normalizedName;
+}
+
+bool IsStableFavoriteKey(const std::wstring& key)
+{
+    return key.compare(0, 6, L"class:") == 0 ||
+           key.compare(0, 6, L"scene:") == 0;
+}
+
 std::wstring StripOSLVersionSuffix(const std::wstring& value)
 {
     size_t end = value.size();
@@ -1574,6 +1608,7 @@ public:
         if (tab_ == TabMode::Maps)      fwprintf(f, L"PSTab=2\n");
         if (favsOnly_)                  fwprintf(f, L"PSFavs=1\n");
         if (sceneOnly_)                 fwprintf(f, L"PSScene=1\n");
+        if (applyToSel_)                fwprintf(f, L"PSAutoApply=1\n");
         if (shllRes_ != 256)            fwprintf(f, L"PSShllRes=%d\n", shllRes_);
     }
     void ReadConfigLine(const std::wstring& l)
@@ -1582,6 +1617,7 @@ public:
         if (l == L"PSTab=2")  tab_ = TabMode::Maps;
         if (l == L"PSFavs=1") favsOnly_ = true;
         if (l == L"PSScene=1") sceneOnly_ = true;
+        if (l == L"PSAutoApply=1") applyToSel_ = true;
         if (l.compare(0, 10, L"PSShllRes=") == 0) {
             int v = _wtoi(l.c_str() + 10);
             if (v == 128 || v == 256 || v == 512 || v == 1024) shllRes_ = v;
@@ -1591,6 +1627,7 @@ public:
     {
         tab_ = TabMode::All;
         favsOnly_ = sceneOnly_ = false;
+        applyToSel_ = false;
         shllRes_ = 256;
     }
 
@@ -1623,11 +1660,12 @@ public:
         RestoreAccelerators();
         if (g_previewWnd) { DestroyWindow(g_previewWnd); g_previewWnd = nullptr; }
         if (wnd_) { DestroyWindow(wnd_); wnd_ = nullptr; }
-        edit_ = list_ = link_ = shll_ = scene_ = favs_ = status_ = nullptr;
+        edit_ = list_ = toolsMenu_ = autoApply_ = scene_ = favs_ = status_ = nullptr;
         renameEdit_ = nullptr;
         brickBtns_.clear();
-        renameIdx_ = brickDragId_ = -1;
-        renaming_ = brickDragging_ = dragging_ = false;
+        renameIdx_ = brickDragFrom_ = -1;
+        renaming_ = dragging_ = false;
+        brickGesture_ = BrickGesture::None;
         activeItems_ = nullptr;
         filtered_.clear();
         classItems_.clear();
@@ -1642,6 +1680,7 @@ public:
         forcedAliasRetry_ = false;
         sceneCacheReady_ = rebuildPending_ = false;
         sceneOnly_ = favsOnly_ = false;
+        applyToSel_ = false;
         hoverClose_ = trackingMouse_ = false;
         closeRect_ = {};
         dragStart_ = {};
@@ -1669,15 +1708,7 @@ public:
     {
         Theme::Update(light);
         if (!wnd_) return;
-        if (list_) {
-            HMODULE hUx = LoadLibraryW(L"uxtheme.dll");
-            if (hUx) {
-                typedef HRESULT(WINAPI* SWTF)(HWND, LPCWSTR, LPCWSTR);
-                auto swt = reinterpret_cast<SWTF>(GetProcAddress(hUx, "SetWindowTheme"));
-                if (swt) swt(list_, Theme::lightTheme ? L"Explorer" : L"DarkMode_Explorer", nullptr);
-                FreeLibrary(hUx);
-            }
-        }
+        ApplyListTheme(list_);
         RedrawWindow(wnd_, nullptr, nullptr,
             RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
         Rebuild(true);
@@ -1714,6 +1745,10 @@ private:
         case WM_USER + 50:
             if (IsWindowVisible(h)) self->UpdatePreviewForSelection();
             else HidePreview();
+            return 0;
+
+        case kRemoveBrickMessage:
+            self->RemoveBrickFav(static_cast<int>(w));
             return 0;
 
         case WM_USER + 51:
@@ -1820,14 +1855,63 @@ private:
         case WM_LBUTTONUP:
             // Finish rename on click outside
             if (self->renameEdit_) self->FinishRename();
-            // Brick drag completion
-            if (self->brickDragging_ && self->brickDragId_ >= kBrickBase) {
-                ReleaseCapture();
-                int bi = self->brickDragId_ - kBrickBase;
-                self->brickDragging_ = false;
-                self->brickDragId_ = -1;
-                if (bi >= 0 && bi < static_cast<int>(self->brickFavs_.size()))
-                    self->ActivateAlias(self->brickFavs_[bi].alias, true);
+            // Brick left-drag mirrors list-row drag: only release outside the
+            // palette creates/drops the item. Releasing over FlowState is a
+            // safe no-op, never a DAD call against our own controls.
+            if (self->brickGesture_ == BrickGesture::LeftDragging &&
+                self->brickDragFrom_ >= 0) {
+                POINT screenPos{};
+                GetCursorPos(&screenPos);
+                const int from = self->brickDragFrom_;
+                const bool outside = self->IsExternalDropPoint(screenPos);
+                std::wstring alias;
+                if (outside && from < static_cast<int>(self->brickFavs_.size()))
+                    alias = self->brickFavs_[static_cast<size_t>(from)].alias;
+
+                // Keep the shared external-drag flag alive through Max's drop
+                // callback, exactly like ListProc. Only the brick source state
+                // is cleared before entering external code.
+                self->brickGesture_ = BrickGesture::None;
+                self->brickDragFrom_ = -1;
+                if (GetCapture() == h) ReleaseCapture();
+                if (!alias.empty()) self->ActivateAlias(alias, true);
+                self->dragging_ = false;
+                self->RedrawDragHeader();
+                return 0;
+            }
+            break;
+
+        case WM_MBUTTONUP:
+            if (self->brickGesture_ == BrickGesture::MiddleDragging &&
+                self->brickDragFrom_ >= 0) {
+                POINT screenPos{};
+                GetCursorPos(&screenPos);
+                const int from = self->brickDragFrom_;
+                const int to = self->BrickIndexFromScreenPoint(screenPos);
+                self->ClearBrickGesture();
+                // RebuildBrickUI destroys the old brick HWNDs, so capture must
+                // be gone before the ordered vector and controls are changed.
+                if (GetCapture() == h) ReleaseCapture();
+                self->ReorderBrickFav(from, to);
+                return 0;
+            }
+            break;
+
+        case WM_CAPTURECHANGED:
+            // A menu, another Max window, or deactivation can steal capture.
+            if ((self->brickGesture_ == BrickGesture::LeftDragging ||
+                 self->brickGesture_ == BrickGesture::MiddleDragging) &&
+                reinterpret_cast<HWND>(l) != h) {
+                self->ClearBrickGesture();
+                return 0;
+            }
+            break;
+
+        case WM_CANCELMODE:
+            if (self->brickGesture_ == BrickGesture::LeftDragging ||
+                self->brickGesture_ == BrickGesture::MiddleDragging) {
+                self->ClearBrickGesture();
+                if (GetCapture() == h) ReleaseCapture();
                 return 0;
             }
             break;
@@ -1843,16 +1927,6 @@ private:
                     PostMessage(h, WM_USER + 50, 0, 0);
                 }
             }
-            // Middle-click on brick button → remove it
-            if (LOWORD(w) == WM_MBUTTONDOWN) {
-                POINT cp = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
-                HWND child = ChildWindowFromPoint(h, cp);
-                int cid = child ? GetDlgCtrlID(child) : 0;
-                if (cid >= kBrickBase && cid < kBrickBase + kBrickMax) {
-                    self->RemoveBrickFav(cid - kBrickBase);
-                    return 0;
-                }
-            }
             break;
         }
 
@@ -1860,16 +1934,8 @@ private:
         {
             HWND target = reinterpret_cast<HWND>(w);
             int cid = target ? GetDlgCtrlID(target) : 0;
-            // Right-click SHLL → cycle resolution (persisted; label stays
-            // "SHLL" — the header button is too small for "SHLL 1024")
-            if (cid == kShllId) {
-                static const int kRes[] = {128, 256, 512, 1024};
-                int cur = 0;
-                for (int i = 0; i < 4; i++) if (kRes[i] == self->shllRes_) { cur = i; break; }
-                self->shllRes_ = kRes[(cur + 1) % 4];
-                self->SetStatus(L"SHLL preview " +
-                    std::to_wstring(self->shllRes_) + L" px");
-                FlowState_SaveSettings();
+            if (cid == kToolsMenuId) {
+                self->ShowHeaderMenu();
                 return 0;
             }
             // Right-click on brick button → rename
@@ -1947,8 +2013,8 @@ private:
             if (dis->CtlID == kListId)
                 { self->DrawListItem(dis); return TRUE; }
             if (dis->CtlID == kTabMatId || dis->CtlID == kTabMapId ||
-                dis->CtlID == kTabFavId || dis->CtlID == kLinkId ||
-                dis->CtlID == kShllId || dis->CtlID == kSceneId ||
+                dis->CtlID == kTabFavId || dis->CtlID == kToolsMenuId ||
+                dis->CtlID == kAutoApplyId || dis->CtlID == kSceneId ||
                 (dis->CtlID >= kBrickBase && dis->CtlID < kBrickBase + kBrickMax))
                 { self->DrawButton(dis); return TRUE; }
             break;
@@ -2011,10 +2077,33 @@ private:
             break;
         case WM_MOUSEWHEEL:
             if (self->dragging_) return 0;
-            if (self->ListContentFits()) return 0;  // fitted list never scrolls
+            if (self->ListContentFits()) {
+                self->EnforceListScrollInvariant();
+                return 0;  // fitted list never scrolls
+            }
             break;
         case WM_VSCROLL:
-            if (self->ListContentFits()) return 0;
+            if (self->ListContentFits()) {
+                // The control can expose its non-client scrollbar before it
+                // dispatches this message. Re-hide it, not merely the scroll.
+                self->EnforceListScrollInvariant();
+                return 0;
+            }
+            break;
+        case WM_STYLECHANGING:
+            if (w == GWL_STYLE && self->ListContentFits()) {
+                // Reject any late internal attempt to restore WS_VSCROLL.
+                // Overflow mode is unaffected because ListContentFits is false.
+                auto* change = reinterpret_cast<STYLESTRUCT*>(l);
+                if (change) change->styleNew &= ~WS_VSCROLL;
+            }
+            break;
+        case WM_KEYDOWN:
+            // Keep keyboard navigation on our invariant-preserving path. The
+            // stock listbox can recreate its scrollbar while ensuring the last
+            // exact-fit row is visible, even after WS_VSCROLL was removed.
+            if (w == VK_DOWN) { self->MoveSelection(1); return 0; }
+            if (w == VK_UP)   { self->MoveSelection(-1); return 0; }
             break;
         case WM_LBUTTONUP:
         {
@@ -2023,8 +2112,7 @@ private:
             if (wasDragging)
             {
                 POINT p{}; GetCursorPos(&p);
-                HWND under = WindowFromPoint(p);
-                if (!under || (under != self->wnd_ && !IsChild(self->wnd_, under)))
+                if (self->IsExternalDropPoint(p))
                     self->ActivateByIndex(self->dragIndex_, true);
             }
             self->dragging_ = false;
@@ -2062,27 +2150,75 @@ private:
         switch (m)
         {
         case WM_LBUTTONDOWN:
-            self->brickDragId_ = GetDlgCtrlID(h);
-            self->brickDragging_ = false;
+            self->brickDragFrom_ = GetDlgCtrlID(h) - kBrickBase;
+            self->brickGesture_ = BrickGesture::LeftArmed;
             GetCursorPos(&self->dragStart_);
             break;
+        case WM_MBUTTONDOWN:
+            self->brickDragFrom_ = GetDlgCtrlID(h) - kBrickBase;
+            self->brickGesture_ = BrickGesture::MiddleArmed;
+            GetCursorPos(&self->dragStart_);
+            SetCapture(h);
+            if (GetCapture() != h) self->ClearBrickGesture();
+            return 0;
         case WM_MOUSEMOVE:
-            if (self->brickDragId_ >= 0 && (w & MK_LBUTTON) && !self->brickDragging_)
-            {
-                POINT p{}; GetCursorPos(&p);
-                if (std::abs(p.x - self->dragStart_.x) > 6 ||
-                    std::abs(p.y - self->dragStart_.y) > 6)
-                {
-                    self->brickDragging_ = true;
-                    ReleaseCapture();
+            if (self->brickDragFrom_ >= 0) {
+                POINT p{};
+                GetCursorPos(&p);
+                const bool moved = std::abs(p.x - self->dragStart_.x) > 6 ||
+                                   std::abs(p.y - self->dragStart_.y) > 6;
+
+                if (moved && self->brickGesture_ == BrickGesture::LeftArmed &&
+                    (w & MK_LBUTTON)) {
+                    self->brickGesture_ = BrickGesture::LeftDragging;
+                    self->dragging_ = true;
                     SetCapture(self->wnd_);
+                    if (GetCapture() != self->wnd_) self->ClearBrickGesture();
+                    else self->RedrawDragHeader();
+                    return 0;
+                }
+
+                if (moved && self->brickGesture_ == BrickGesture::MiddleArmed &&
+                    (w & MK_MBUTTON)) {
+                    self->brickGesture_ = BrickGesture::MiddleDragging;
+                    SetCapture(self->wnd_);
+                    if (GetCapture() != self->wnd_) self->ClearBrickGesture();
                     return 0;
                 }
             }
             break;
         case WM_LBUTTONUP:
-            self->brickDragId_ = -1;
+            if (self->brickGesture_ == BrickGesture::LeftArmed) {
+                self->brickGesture_ = BrickGesture::None;
+                self->brickDragFrom_ = -1;
+                break; // preserve the normal BUTTON click notification
+            }
+            if (self->brickGesture_ == BrickGesture::LeftDragging) {
+                self->ClearBrickGesture();
+                return 0;
+            }
             break;
+        case WM_MBUTTONUP:
+            if (self->brickGesture_ == BrickGesture::MiddleArmed) {
+                const int from = self->brickDragFrom_;
+                self->ClearBrickGesture();
+                if (GetCapture() == h) ReleaseCapture();
+                // Defer destruction of this button until its window proc has
+                // returned. A plain middle-click retains the remove shortcut.
+                PostMessageW(self->wnd_, kRemoveBrickMessage,
+                    static_cast<WPARAM>(from), 0);
+                return 0;
+            }
+            return 0;
+        case WM_CAPTURECHANGED:
+            // Transfer to the palette is intentional after either threshold.
+            if (reinterpret_cast<HWND>(l) != self->wnd_)
+                self->ClearBrickGesture();
+            break;
+        case WM_CANCELMODE:
+            self->ClearBrickGesture();
+            if (GetCapture() == h) ReleaseCapture();
+            return 0;
         }
         return DefSubclassProc(h, m, w, l);
     }
@@ -2127,6 +2263,58 @@ private:
     }
 
     // ─── UI creation ────────────────────────────────────────────
+    void ApplyListTheme(HWND list)
+    {
+        if (!list) return;
+        HMODULE hUx = LoadLibraryW(L"uxtheme.dll");
+        if (!hUx) return;
+        using SetWindowThemeFn = HRESULT(WINAPI*)(HWND, LPCWSTR, LPCWSTR);
+        auto setTheme = reinterpret_cast<SetWindowThemeFn>(
+            GetProcAddress(hUx, "SetWindowTheme"));
+        if (setTheme)
+            setTheme(list, Theme::lightTheme ? L"Explorer" : L"DarkMode_Explorer", nullptr);
+        FreeLibrary(hUx);
+    }
+
+    HWND CreateResultsList(int x, int y, int w, int h, bool withScrollbar)
+    {
+        DWORD style = WS_CHILD | WS_VISIBLE | LBS_NOTIFY |
+            LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_NODATA;
+        if (withScrollbar) style |= WS_VSCROLL;
+
+        HWND list = CreateWindowExW(0, L"LISTBOX", L"", style,
+            x, y, w, h, wnd_,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kListId)),
+            hInstance, nullptr);
+        if (list) {
+            SetWindowSubclass(list, ListProc, 1, reinterpret_cast<DWORD_PTR>(this));
+            ApplyListTheme(list);
+        }
+        return list;
+    }
+
+    void RecreateResultsList(bool withScrollbar, int x, int y, int w, int h,
+                             int count, int selection, int top)
+    {
+        const bool restoreFocus = list_ && GetFocus() == list_;
+        HWND old = list_;
+        list_ = nullptr;
+        if (old) DestroyWindow(old);
+
+        list_ = CreateResultsList(x, y, w, h, withScrollbar);
+        if (!list_) return;
+
+        SendMessageW(list_, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(list_, LB_SETCOUNT, static_cast<WPARAM>((std::max)(0, count)), 0);
+        if (selection >= 0 && selection < count)
+            SendMessageW(list_, LB_SETCURSEL, selection, 0);
+        SendMessageW(list_, LB_SETTOPINDEX,
+            withScrollbar ? (std::max)(0, top) : 0, 0);
+        SendMessageW(list_, WM_SETREDRAW, TRUE, 0);
+        if (restoreFocus) SetFocus(list_);
+        RedrawWindow(list_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+    }
+
     void OnCreate(HWND h)
     {
         wnd_ = h;
@@ -2136,18 +2324,19 @@ private:
         closeRect_ = { cr.right - pad - 18, pad, cr.right - pad, pad + 18 };
         int y = kHeaderH;
 
-        // Header micro-buttons: LINK | SHLL, tucked next to the close ×
-        const int hbW = 38, hbH = 18, hbGap = 3;
-        int hbX = closeRect_.left - 4 - hbW;
-        shll_ = CreateWindowExW(0, L"BUTTON", L"SHLL",
+        // Header controls: tools menu | persistent Auto Apply | close ×
+        const int hbH = 18, hbGap = 3;
+        const int autoW = 30, menuW = 24;
+        int hbX = closeRect_.left - 4 - autoW;
+        autoApply_ = CreateWindowExW(0, L"BUTTON", L"AUTO",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            hbX, pad, hbW, hbH, h,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kShllId)), hInstance, nullptr);
-        hbX -= hbGap + hbW;
-        link_ = CreateWindowExW(0, L"BUTTON", L"LINK",
+            hbX, pad, autoW, hbH, h,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kAutoApplyId)), hInstance, nullptr);
+        hbX -= hbGap + menuW;
+        toolsMenu_ = CreateWindowExW(0, L"BUTTON", L"\x22EF",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            hbX, pad, hbW, hbH, h,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLinkId)), hInstance, nullptr);
+            hbX, pad, menuW, hbH, h,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kToolsMenuId)), hInstance, nullptr);
 
         // Search box
         edit_ = CreateWindowExW(0, L"EDIT", L"",
@@ -2187,12 +2376,10 @@ private:
         // Results list (owner-drawn)
         listBaseY_ = y;
         int listH = cr.bottom - y - 26;
-        list_ = CreateWindowExW(0, L"LISTBOX", L"",
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY |
-            LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_NODATA,
-            pad, y, cw, listH, h,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kListId)), hInstance, nullptr);
-        SetWindowSubclass(list_, ListProc, 1, reinterpret_cast<DWORD_PTR>(this));
+        // Start without a scrollbar. Layout recreates this control with
+        // WS_VSCROLL only after the window reaches its height cap and rows
+        // genuinely overflow.
+        list_ = CreateResultsList(pad, y, cw, listH, false);
 
         // Status bar
         status_ = CreateWindowExW(0, L"STATIC", L"Ready",
@@ -2200,15 +2387,6 @@ private:
             pad, cr.bottom - 22, cw, 18, h, nullptr, hInstance, nullptr);
         SendMessageW(status_, WM_SETFONT, reinterpret_cast<WPARAM>(Theme::fontUI), TRUE);
 
-        // Dark scrollbar on list
-        HMODULE hUx = LoadLibraryW(L"uxtheme.dll");
-        if (hUx)
-        {
-            typedef HRESULT(WINAPI* SWTF)(HWND, LPCWSTR, LPCWSTR);
-            auto swt = reinterpret_cast<SWTF>(GetProcAddress(hUx, "SetWindowTheme"));
-            if (swt) swt(list_, Theme::lightTheme ? L"Explorer" : L"DarkMode_Explorer", nullptr);
-            FreeLibrary(hUx);
-        }
     }
 
     // ─── Drawing ────────────────────────────────────────────────
@@ -2251,9 +2429,10 @@ private:
 
         // Left side: favorite indicator + item name
         // Solid diamond = file pin, hollow diamond = brick favorite
-        bool isPinned = std::find(filePins_.begin(), filePins_.end(), item.key) != filePins_.end();
+        bool isPinned =
+            std::find(filePins_.begin(), filePins_.end(), item.favoriteKey) != filePins_.end();
         bool isBrick = !isPinned && std::any_of(brickFavs_.begin(), brickFavs_.end(),
-            [&](const BrickFav& bf) { return bf.alias == item.key; });
+            [&](const BrickFav& bf) { return bf.alias == item.favoriteKey; });
         RECT lr = dis->rcItem;
         lr.left += 8;
         if (isPinned || isBrick) {
@@ -2292,6 +2471,7 @@ private:
         else if (id == kTabMapId) active = (tab_ == TabMode::Maps);
         else if (id == kTabFavId) active = favsOnly_;
         else if (id == kSceneId)  active = sceneOnly_;
+        else if (id == kAutoApplyId) active = applyToSel_;
         else                      active = (dis->itemState & ODS_SELECTED) != 0;
 
         COLORREF bgc = active ? Theme::accent : Theme::panelLt;
@@ -2309,17 +2489,78 @@ private:
         SelectObject(dis->hDC, oldP);
         DeleteObject(pen);
 
-        wchar_t buf[32] = {};
-        GetWindowTextW(dis->hwndItem, buf, 32);
         SetBkMode(dis->hDC, TRANSPARENT);
         SetTextColor(dis->hDC, active ? Theme::textBrt : Theme::text);
         HFONT old = static_cast<HFONT>(SelectObject(dis->hDC, Theme::fontUI));
-        DrawTextW(dis->hDC, buf, -1, &dis->rcItem,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (id == kAutoApplyId) {
+            RECT box = {
+                dis->rcItem.left + 4,
+                dis->rcItem.top + 4,
+                dis->rcItem.left + 14,
+                dis->rcItem.bottom - 4
+            };
+            HPEN checkPen = CreatePen(PS_SOLID, 1,
+                active ? Theme::textBrt : Theme::textDim);
+            HPEN oldCheckPen = static_cast<HPEN>(SelectObject(dis->hDC, checkPen));
+            HBRUSH oldCheckBrush = static_cast<HBRUSH>(
+                SelectObject(dis->hDC, GetStockObject(NULL_BRUSH)));
+            Rectangle(dis->hDC, box.left, box.top, box.right, box.bottom);
+            if (applyToSel_) {
+                MoveToEx(dis->hDC, box.left + 2, box.top + 5, nullptr);
+                LineTo(dis->hDC, box.left + 4, box.bottom - 2);
+                LineTo(dis->hDC, box.right - 2, box.top + 2);
+            }
+            SelectObject(dis->hDC, oldCheckBrush);
+            SelectObject(dis->hDC, oldCheckPen);
+            DeleteObject(checkPen);
+
+            RECT label = dis->rcItem;
+            label.left = box.right + 1;
+            DrawTextW(dis->hDC, L"A", -1, &label,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            wchar_t buf[32] = {};
+            GetWindowTextW(dis->hwndItem, buf, 32);
+            DrawTextW(dis->hDC, buf, -1, &dis->rcItem,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
         SelectObject(dis->hDC, old);
     }
 
     // ─── Show / Hide ────────────────────────────────────────────
+    void RedrawDragHeader()
+    {
+        if (!wnd_) return;
+        RECT header = { 0, 0, kWindowWidth, kHeaderH };
+        RedrawWindow(wnd_, &header, nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+    }
+
+    bool IsExternalDropPoint(POINT screenPos) const
+    {
+        HWND under = WindowFromPoint(screenPos);
+        if (!under) return true;
+        if (under == wnd_ || IsChild(wnd_, under)) return false;
+        // The preview is another top-level FlowState window. Treat it as
+        // internal too so neither rows nor bricks ever probe it as a Max DAD
+        // target.
+        if (g_previewWnd &&
+            (under == g_previewWnd || IsChild(g_previewWnd, under))) return false;
+        return true;
+    }
+
+    void ClearBrickGesture()
+    {
+        const bool wasExternalDrag =
+            brickGesture_ == BrickGesture::LeftDragging;
+        brickGesture_ = BrickGesture::None;
+        brickDragFrom_ = -1;
+        if (wasExternalDrag) {
+            dragging_ = false;
+            RedrawDragHeader();
+        }
+    }
+
     void Show()
     {
         CancelPendingRebuild();
@@ -2425,6 +2666,10 @@ private:
     {
         CancelPendingRebuild();
         FinishRename(true);
+        HWND capture = GetCapture();
+        if (capture && (capture == wnd_ || IsChild(wnd_, capture)))
+            ReleaseCapture();
+        ClearBrickGesture();
         // Drop any in-flight preview load and pending debounce
         g_previewGen.fetch_add(1, std::memory_order_release);
         if (wnd_) KillTimer(wnd_, kPreviewTimerId);
@@ -2445,15 +2690,71 @@ private:
     }
 
     // ─── Commands ───────────────────────────────────────────────
+    void ShowHeaderMenu()
+    {
+        if (!wnd_ || !toolsMenu_) return;
+
+        HMENU popup = CreatePopupMenu();
+        HMENU resolution = CreatePopupMenu();
+        if (!popup || !resolution) {
+            if (resolution) DestroyMenu(resolution);
+            if (popup) DestroyMenu(popup);
+            return;
+        }
+
+        AppendMenuW(popup, MF_STRING, kLinkId, L"Link bitmap tiling values");
+        AppendMenuW(popup, MF_STRING, kShllId, L"Quick Shell Material");
+        AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(resolution, MF_STRING, kShllRes128Id, L"128 px");
+        AppendMenuW(resolution, MF_STRING, kShllRes256Id, L"256 px");
+        AppendMenuW(resolution, MF_STRING, kShllRes512Id, L"512 px");
+        AppendMenuW(resolution, MF_STRING, kShllRes1024Id, L"1024 px");
+        AppendMenuW(popup, MF_POPUP, reinterpret_cast<UINT_PTR>(resolution),
+            L"Quick Shell Resolution");
+
+        const UINT checkedId =
+            shllRes_ == 128 ? kShllRes128Id :
+            shllRes_ == 512 ? kShllRes512Id :
+            shllRes_ == 1024 ? kShllRes1024Id : kShllRes256Id;
+        CheckMenuRadioItem(resolution, kShllRes128Id, kShllRes1024Id,
+            checkedId, MF_BYCOMMAND);
+
+        RECT buttonRect{};
+        GetWindowRect(toolsMenu_, &buttonRect);
+        SetForegroundWindow(wnd_);
+        const UINT command = TrackPopupMenuEx(popup,
+            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTALIGN | TPM_TOPALIGN,
+            buttonRect.right, buttonRect.bottom, wnd_, nullptr);
+        DestroyMenu(popup); // also destroys the attached resolution submenu
+        PostMessageW(wnd_, WM_NULL, 0, 0);
+
+        if (command == kLinkId) {
+            ExecuteMAXScriptScript(kLinkScript, MAXScript::ScriptSource::Dynamic);
+        } else if (command == kShllId) {
+            ExecuteShellCommand(shllRes_);
+        } else if (command >= kShllRes128Id && command <= kShllRes1024Id) {
+            shllRes_ =
+                command == kShllRes128Id ? 128 :
+                command == kShllRes512Id ? 512 :
+                command == kShllRes1024Id ? 1024 : 256;
+            SetStatus(L"Quick Shell preview " + std::to_wstring(shllRes_) + L" px");
+            FlowState_SaveSettings();
+        }
+    }
+
     void OnCommand(int id, int code)
     {
         if (id == kSearchId && code == EN_CHANGE) { ScheduleRebuild(); return; }
-        if (id == kLinkId) {
-            ExecuteMAXScriptScript(kLinkScript, MAXScript::ScriptSource::Dynamic);
+        if (id == kToolsMenuId) {
+            ShowHeaderMenu();
             return;
         }
-        if (id == kShllId) {
-            ExecuteShellCommand(shllRes_);
+        if (id == kAutoApplyId)
+        {
+            applyToSel_ = !applyToSel_;
+            InvalidateRect(autoApply_, nullptr, FALSE);
+            SetStatus(applyToSel_ ? L"Auto Apply on." : L"Auto Apply off.");
+            FlowState_SaveSettings();
             return;
         }
         if (id == kTabFavId)
@@ -2488,6 +2789,7 @@ private:
             return;
         }
         if (id == kListId && code == LBN_SELCHANGE) {
+            EnforceListScrollInvariant();
             UpdatePreviewForSelection();
             return;
         }
@@ -2624,7 +2926,10 @@ private:
         AddClassList(TEXMAP_CLASS_ID, ItemKind::ClassMap, classItems_);
 
         std::sort(classItems_.begin(), classItems_.end(),
-            [](const Item& a, const Item& b) { return a.label < b.label; });
+            [](const Item& a, const Item& b) {
+                if (a.label != b.label) return a.label < b.label;
+                return a.favoriteKey < b.favoriteKey;
+            });
 
         classCacheReady_ = true;
         oslCategoryReady_ = false;
@@ -2682,7 +2987,10 @@ private:
                 item.search = Normalize(item.label + L" " + it->second + L" OSL", true);
             }
             std::sort(classItems_.begin(), classItems_.end(),
-                [](const Item& a, const Item& b) { return a.label < b.label; });
+                [](const Item& a, const Item& b) {
+                    if (a.label != b.label) return a.label < b.label;
+                    return a.favoriteKey < b.favoriteKey;
+                });
         }
 
         oslCategoryReady_ = true;
@@ -2707,6 +3015,7 @@ private:
         item.search = Normalize(
             item.label + L" " + std::wstring(className.data()), true);
         item.key = Normalize(item.label, false);
+        item.favoriteKey = MakeSceneFavoriteKey(m, item.key);
         item.kind = (m->SuperClassID() == MATERIAL_CLASS_ID)
             ? ItemKind::SceneMaterial : ItemKind::SceneMap;
         item.category = std::wstring(className.data());
@@ -2742,7 +3051,10 @@ private:
             }
         }
         std::sort(sceneItems_.begin(), sceneItems_.end(),
-            [](const Item& a, const Item& b) { return a.label < b.label; });
+            [](const Item& a, const Item& b) {
+                if (a.label != b.label) return a.label < b.label;
+                return a.favoriteKey < b.favoriteKey;
+            });
         sceneCacheReady_ = true;
     }
 
@@ -2784,6 +3096,7 @@ private:
                 std::wstring(internalName ? internalName : L"") + L" " +
                 std::wstring(categoryName ? categoryName : L""), true);
             item.key        = key;
+            item.favoriteKey = MakeClassFavoriteKey(sid, classId);
             item.scriptName = (internalName && internalName[0])
                 ? std::wstring(internalName) : L"";
             item.scriptKey  = Normalize(item.scriptName, false);
@@ -2795,12 +3108,92 @@ private:
         }
     }
 
-    // ─── List rebuild ───────────────────────────────────────────
-    void Rebuild(bool forceFull)
+    std::wstring ResolveStoredFavoriteKey(const std::wstring& stored) const
     {
+        if (stored.empty() || IsStableFavoriteKey(stored)) return stored;
+
+        // Old configurations stored only a normalized display name. Resolve
+        // that inherently ambiguous token to one deterministic class identity
+        // so a single "composite" pin can never fan out to several classes.
+        for (const Item& item : classItems_)
+            if (item.key == stored || item.scriptKey == stored)
+                return item.favoriteKey;
+
+        // Scene aliases can only be resolved after that cache has been built.
+        // Keep unavailable tokens intact so loading a scene/plugin later can
+        // still migrate them instead of silently discarding the favorite.
+        if (sceneCacheReady_) {
+            for (const Item& item : sceneItems_)
+                if (item.key == stored || item.scriptKey == stored)
+                    return item.favoriteKey;
+        }
+        return stored;
+    }
+
+    bool CanonicalizeFavoriteStorage()
+    {
+        bool changed = false;
+
+        std::vector<std::wstring> pins;
+        pins.reserve(filePins_.size());
+        std::set<std::wstring> seenPins;
+        for (const std::wstring& stored : filePins_) {
+            std::wstring key = ResolveStoredFavoriteKey(stored);
+            if (key != stored) changed = true;
+            if (!key.empty() && seenPins.insert(key).second)
+                pins.push_back(std::move(key));
+            else
+                changed = true;
+        }
+
+        std::vector<BrickFav> bricks;
+        bricks.reserve(brickFavs_.size());
+        std::set<std::wstring> seenBricks;
+        for (const BrickFav& stored : brickFavs_) {
+            std::wstring key = ResolveStoredFavoriteKey(stored.alias);
+            if (key != stored.alias) changed = true;
+            if (!key.empty() && seenBricks.insert(key).second)
+                bricks.push_back({std::move(key), stored.label});
+            else
+                changed = true;
+        }
+
+        if (changed) {
+            filePins_.swap(pins);
+            brickFavs_.swap(bricks);
+        }
+        return changed;
+    }
+
+    // ─── List rebuild ───────────────────────────────────────────
+    void Rebuild(bool forceFull, bool preserveView = false)
+    {
+        int preservedTopIndex = 0;
+        int preservedSelectionIndex = LB_ERR;
+        std::wstring preservedTopKey;
+        std::wstring preservedSelectionKey;
+        if (preserveView && list_ && activeItems_) {
+            preservedTopIndex =
+                static_cast<int>(SendMessageW(list_, LB_GETTOPINDEX, 0, 0));
+            preservedSelectionIndex =
+                static_cast<int>(SendMessageW(list_, LB_GETCURSEL, 0, 0));
+
+            auto keyAt = [&](int filteredIndex) -> std::wstring {
+                if (filteredIndex < 0 ||
+                    filteredIndex >= static_cast<int>(filtered_.size())) return {};
+                const int sourceIndex = filtered_[filteredIndex];
+                if (sourceIndex < 0 ||
+                    sourceIndex >= static_cast<int>(activeItems_->size())) return {};
+                return (*activeItems_)[sourceIndex].favoriteKey;
+            };
+            preservedTopKey = keyAt(preservedTopIndex);
+            preservedSelectionKey = keyAt(preservedSelectionIndex);
+        }
+
         const bool sceneOnly = IsSceneOnly();
         EnsureClassCache();
         if (sceneOnly && !sceneCacheReady_) RefreshSceneCache();
+        if (CanonicalizeFavoriteStorage()) FlowState_SaveSettings();
 
         const std::vector<Item>& source = sceneOnly ? sceneItems_ : classItems_;
         activeItems_ = &source;
@@ -2809,18 +3202,18 @@ private:
         const std::wstring normQ = Normalize(q, true);
         const std::vector<std::wstring> tokens = TokenizeQuery(normQ);
 
-        // Favorites = file pins ∪ brick favorites, matched by normalized key
+        // Favorites is intentionally the right-click pin set only. Brick
+        // favorites already occupy the button strip above the list; they keep
+        // their hollow diamond in normal results but do not duplicate here.
         std::set<std::wstring> favKeys;
-        if (favsOnly_) {
+        if (favsOnly_)
             favKeys.insert(filePins_.begin(), filePins_.end());
-            for (const auto& bf : brickFavs_) favKeys.insert(bf.alias);
-        }
 
         auto passesTab = [&](const Item& item) -> bool
         {
             bool isScene = (item.kind == ItemKind::SceneMaterial || item.kind == ItemKind::SceneMap);
             if (sceneOnly != isScene) return false;
-            if (favsOnly_ && favKeys.find(item.key) == favKeys.end()) return false;
+            if (favsOnly_ && favKeys.find(item.favoriteKey) == favKeys.end()) return false;
             if (tab_ == TabMode::Materials &&
                 item.kind != ItemKind::ClassMaterial && item.kind != ItemKind::SceneMaterial) return false;
             if (tab_ == TabMode::Maps &&
@@ -2831,11 +3224,16 @@ private:
         struct Scored { int idx; int score; };
         std::vector<Scored> scored;
         scored.reserve(source.size());
+        std::set<std::wstring> emittedFavoriteKeys;
 
         for (size_t i = 0; i < source.size(); ++i)
         {
             const Item& item = source[i];
             if (!passesTab(item)) continue;
+            // Defense in depth: a bad registry or repeated scene reference
+            // still cannot render the same favorite identity more than once.
+            if (favsOnly_ && !emittedFavoriteKeys.insert(item.favoriteKey).second)
+                continue;
             int s = ScoreMatch(item.search, item.normLabel, tokens);
             if (s > 0) scored.push_back({static_cast<int>(i), s});
         }
@@ -2848,26 +3246,54 @@ private:
         filtered_.clear();
         filtered_.reserve(scored.size());
 
-        // File-pinned items go first, alphabetically — source order is already
-        // sorted by label. Skip the grouping while searching (score order
-        // wins) and in Favs view (everything shown is a favorite; plain
-        // alphabetical order is what users expect there).
+        // Right-click pins go first, alphabetically — source order is already
+        // sorted by label. Brick favorites are deliberately excluded from
+        // this grouping because their buttons are already pinned above.
+        // Skip grouping while searching (score order wins) and in Favs view
+        // (everything shown is a favorite; plain alphabetical order wins).
         if (tokens.empty() && !filePins_.empty() && !favsOnly_) {
             std::set<std::wstring> pinSet(filePins_.begin(), filePins_.end());
             for (const auto& s : scored)
-                if (pinSet.count(source[static_cast<size_t>(s.idx)].key))
+                if (pinSet.count(source[static_cast<size_t>(s.idx)].favoriteKey))
                     filtered_.push_back(s.idx);
             for (const auto& s : scored)
-                if (!pinSet.count(source[static_cast<size_t>(s.idx)].key))
+                if (!pinSet.count(source[static_cast<size_t>(s.idx)].favoriteKey))
                     filtered_.push_back(s.idx);
         } else {
             for (const auto& s : scored) filtered_.push_back(s.idx);
         }
 
+        int restoredTopIndex = 0;
+        int restoredSelectionIndex = filtered_.empty() ? LB_ERR : 0;
+        if (preserveView && !filtered_.empty()) {
+            auto findKey = [&](const std::wstring& key) -> int {
+                if (key.empty()) return LB_ERR;
+                for (int i = 0; i < static_cast<int>(filtered_.size()); ++i) {
+                    const Item& item =
+                        source[static_cast<size_t>(filtered_[static_cast<size_t>(i)])];
+                    if (item.favoriteKey == key) return i;
+                }
+                return LB_ERR;
+            };
+
+            restoredTopIndex = findKey(preservedTopKey);
+            if (restoredTopIndex == LB_ERR)
+                restoredTopIndex = std::clamp(
+                    preservedTopIndex, 0, static_cast<int>(filtered_.size()) - 1);
+
+            restoredSelectionIndex = findKey(preservedSelectionKey);
+            if (restoredSelectionIndex == LB_ERR && preservedSelectionIndex != LB_ERR)
+                restoredSelectionIndex = std::clamp(
+                    preservedSelectionIndex, 0, static_cast<int>(filtered_.size()) - 1);
+        }
+
         SendMessageW(list_, WM_SETREDRAW, FALSE, 0);
         SendMessageW(list_, LB_RESETCONTENT, 0, 0);
         SendMessageW(list_, LB_SETCOUNT, static_cast<WPARAM>(filtered_.size()), 0);
-        if (!filtered_.empty()) SendMessageW(list_, LB_SETCURSEL, 0, 0);
+        if (restoredSelectionIndex != LB_ERR)
+            SendMessageW(list_, LB_SETCURSEL, restoredSelectionIndex, 0);
+        if (!filtered_.empty())
+            SendMessageW(list_, LB_SETTOPINDEX, restoredTopIndex, 0);
         SendMessageW(list_, WM_SETREDRAW, TRUE, 0);
         // Auto-compact to the result count. This also re-syncs the listbox
         // scroll state at the final geometry — see LayoutListAndStatus.
@@ -2881,7 +3307,7 @@ private:
         lastSceneOnly_ = sceneOnly;
 
         if (favsOnly_ && filtered_.empty() && normQ.empty())
-            SetStatus(L"No favorites yet. Right-click pins, middle-click bricks.");
+            SetStatus(L"No favorites yet. Right-click an item to add it.");
         else
             SetStatus(std::to_wstring(filtered_.size()) + L" items" +
                 (normQ.empty() ? L"" : (L"  |  " + normQ)));
@@ -2891,10 +3317,11 @@ private:
     void ActivateAlias(const std::wstring& alias, bool drag = false)
     {
         EnsureClassCache();
-        std::wstring key = Normalize(alias, false);
+        std::wstring key = IsStableFavoriteKey(alias)
+            ? alias : Normalize(alias, false);
         for (const Item& item : classItems_)
             if (!item.live &&
-                (item.key == key || item.scriptKey == key))
+                (item.favoriteKey == key || item.key == key || item.scriptKey == key))
                 { Activate(item, drag); return; }
 
         // Retry once after forcing a fresh cache build.
@@ -2905,7 +3332,7 @@ private:
             EnsureClassCache();
             for (const Item& item : classItems_)
                 if (!item.live &&
-                    (item.key == key || item.scriptKey == key))
+                    (item.favoriteKey == key || item.key == key || item.scriptKey == key))
                     { Activate(item, drag); return; }
         }
 
@@ -2998,6 +3425,13 @@ private:
                 // though the core interface still accepts the slot update.
                 ip->PutMtlToMtlEditor(mb, slot);
             }
+
+            if (applyToSel_ && isMat && ip->GetSelNodeCount() > 0) {
+                Mtl* mtl = static_cast<Mtl*>(mb);
+                const int selectedCount = ip->GetSelNodeCount();
+                for (int i = 0; i < selectedCount; ++i)
+                    if (INode* node = ip->GetSelNode(i)) node->SetMtl(mtl);
+            }
             Hide();
         }
 
@@ -3009,26 +3443,73 @@ private:
     }
 
     // ─── Helpers ────────────────────────────────────────────────
-    // True when every item is visible without scrolling. Half a row of
-    // tolerance so the control's off-by-one page math can't reclassify a
-    // fitted list as scrollable; a real overflow is a full row or more.
+    // The scrollbar is legal only after auto-compact reaches its height cap
+    // and the rows genuinely exceed the list client. This makes the window
+    // geometry—not the listbox's off-by-one internal page math—the authority.
     bool ListContentFits() const
     {
         if (!list_) return true;
         RECT lr; GetClientRect(list_, &lr);
         const int count =
             static_cast<int>(SendMessageW(list_, LB_GETCOUNT, 0, 0));
-        return count <= 0 || count * kListItemH <= lr.bottom + kListItemH / 2;
+        if (count <= 0) return true;
+        RECT pr{}; if (wnd_) GetClientRect(wnd_, &pr);
+        const bool reachedMaxHeight = wnd_ && pr.bottom >= kWindowHeight;
+        const bool rowsOverflow = count * kListItemH > lr.bottom;
+        return !reachedMaxHeight || !rowsOverflow;
+    }
+
+    void EnforceListScrollInvariant()
+    {
+        if (!list_) return;
+
+        const bool fits = ListContentFits();
+        LONG_PTR style = GetWindowLongPtrW(list_, GWL_STYLE);
+        const bool hasBar = (style & WS_VSCROLL) != 0;
+        if (fits == hasBar) {
+            style = fits ? (style & ~WS_VSCROLL) : (style | WS_VSCROLL);
+            SetWindowLongPtrW(list_, GWL_STYLE, style);
+            SetWindowPos(list_, nullptr, 0, 0, 0, 0,
+                SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER |
+                SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+
+        // ShowScrollBar is intentional in addition to the style update:
+        // LISTBOX can call it internally while bringing a selection into view.
+        ShowScrollBar(list_, SB_VERT, fits ? FALSE : TRUE);
+        if (fits && SendMessageW(list_, LB_GETTOPINDEX, 0, 0) != 0)
+            SendMessageW(list_, LB_SETTOPINDEX, 0, 0);
     }
 
     void MoveSelection(int delta)
     {
         int count = static_cast<int>(SendMessageW(list_, LB_GETCOUNT, 0, 0));
         if (count <= 0) return;
-        int cur = static_cast<int>(SendMessageW(list_, LB_GETCURSEL, 0, 0));
-        if (cur == LB_ERR) cur = 0;
-        else cur = std::clamp(cur + delta, 0, count - 1);
-        SendMessageW(list_, LB_SETCURSEL, cur, 0);
+        const int current =
+            static_cast<int>(SendMessageW(list_, LB_GETCURSEL, 0, 0));
+        const int next = current == LB_ERR
+            ? 0 : std::clamp(current + delta, 0, count - 1);
+
+        // Do nothing at either boundary. Re-sending the last/first selection
+        // makes the native listbox run its ensure-visible scroll path again.
+        if (current != LB_ERR && next == current) return;
+
+        const bool fits = ListContentFits();
+        if (fits) SendMessageW(list_, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(list_, LB_SETCURSEL, next, 0);
+
+        if (fits) {
+            // The stock control may adjust its top index while selecting the
+            // last exact-fit row. Restore it before redraw is enabled so that
+            // internal motion is never presented as a one-frame snap.
+            SendMessageW(list_, LB_SETTOPINDEX, 0, 0);
+            ShowScrollBar(list_, SB_VERT, FALSE);
+            SendMessageW(list_, WM_SETREDRAW, TRUE, 0);
+            RedrawWindow(list_, nullptr, nullptr,
+                RDW_INVALIDATE | RDW_UPDATENOW);
+        } else {
+            EnforceListScrollInvariant();
+        }
         // LB_SETCURSEL doesn't fire LBN_SELCHANGE — schedule the (debounced)
         // preview update ourselves so it follows keyboard navigation too.
         UpdatePreviewForSelection();
@@ -3046,7 +3527,7 @@ private:
             filteredIdx >= static_cast<int>(filtered_.size())) return {};
         int si = filtered_[filteredIdx];
         if (si < 0 || si >= static_cast<int>(activeItems_->size())) return {};
-        return (*activeItems_)[si].key;
+        return (*activeItems_)[si].favoriteKey;
     }
     std::wstring GetItemLabel(int filteredIdx)
     {
@@ -3066,7 +3547,7 @@ private:
         if (wasPinned) filePins_.erase(it);
         else filePins_.insert(filePins_.begin(), alias);
         SaveFilePins();
-        Rebuild(true);
+        Rebuild(true, true);
         SetStatus(wasPinned ? L"Unpinned." : L"Pinned.");
     }
 
@@ -3108,10 +3589,8 @@ private:
             SetStatus(L"Added to favorites.");
         }
         SaveBrickFavs();
-        // Bricks are part of the favorites set — refresh the list contents
-        // (and its shrink-wrapped height) before laying the bricks out.
-        if (favsOnly_) Rebuild(true);
         RebuildBrickUI();
+        if (list_) InvalidateRect(list_, nullptr, FALSE); // refresh hollow diamond
     }
 
     void RemoveBrickFav(int brickIdx)
@@ -3119,14 +3598,71 @@ private:
         if (brickIdx < 0 || brickIdx >= static_cast<int>(brickFavs_.size())) return;
         brickFavs_.erase(brickFavs_.begin() + brickIdx);
         SaveBrickFavs();
-        if (favsOnly_) Rebuild(true);
         RebuildBrickUI();
+        if (list_) InvalidateRect(list_, nullptr, FALSE); // remove hollow diamond
         SetStatus(L"Removed from favorites.");
     }
 
     void SaveBrickFavs()
     {
         FlowState_SaveSettings(); // unified save
+    }
+
+    int BrickIndexFromScreenPoint(POINT screenPos) const
+    {
+        if (brickBtns_.empty()) return -1;
+
+        RECT brickBounds{};
+        bool haveBounds = false;
+        int nearest = -1;
+        long long nearestDistance = (std::numeric_limits<long long>::max)();
+
+        for (int i = 0; i < static_cast<int>(brickBtns_.size()); ++i) {
+            HWND button = brickBtns_[static_cast<size_t>(i)];
+            if (!button || !IsWindow(button)) continue;
+
+            RECT rect{};
+            if (!GetWindowRect(button, &rect)) continue;
+            if (PtInRect(&rect, screenPos)) return i;
+
+            if (!haveBounds) {
+                brickBounds = rect;
+                haveBounds = true;
+            } else {
+                brickBounds.left = (std::min)(brickBounds.left, rect.left);
+                brickBounds.top = (std::min)(brickBounds.top, rect.top);
+                brickBounds.right = (std::max)(brickBounds.right, rect.right);
+                brickBounds.bottom = (std::max)(brickBounds.bottom, rect.bottom);
+            }
+
+            const long long dx = screenPos.x - (rect.left + rect.right) / 2;
+            const long long dy = screenPos.y - (rect.top + rect.bottom) / 2;
+            const long long distance = dx * dx + dy * dy;
+            if (distance < nearestDistance) {
+                nearestDistance = distance;
+                nearest = i;
+            }
+        }
+
+        // Accept the small gaps between buttons, but dropping outside the
+        // brick strip cancels the reorder.
+        if (!haveBounds) return -1;
+        InflateRect(&brickBounds, 6, 6);
+        return PtInRect(&brickBounds, screenPos) ? nearest : -1;
+    }
+
+    void ReorderBrickFav(int from, int to)
+    {
+        const int count = static_cast<int>(brickFavs_.size());
+        if (from < 0 || from >= count || to < 0 || to >= count || from == to)
+            return;
+
+        BrickFav moved = std::move(brickFavs_[static_cast<size_t>(from)]);
+        brickFavs_.erase(brickFavs_.begin() + from);
+        brickFavs_.insert(brickFavs_.begin() + to, std::move(moved));
+        SaveBrickFavs();
+        RebuildBrickUI();
+        SetStatus(L"Favorites reordered.");
     }
 
     // ─── Dynamic window height (Favorites shrink-wrap) ──────────
@@ -3170,28 +3706,29 @@ private:
                 SendMessageW(list_, LB_RESETCONTENT, 0, 0);
                 SendMessageW(list_, LB_SETCOUNT, count, 0);
                 if (sel >= 0) SendMessageW(list_, LB_SETCURSEL, sel, 0);
+                const bool fits = ListContentFits();
                 SendMessageW(list_, LB_SETTOPINDEX,
-                    (count * kListItemH <= listH) ? 0 : (std::max)(0, top), 0);
+                    fits ? 0 : (std::max)(0, top), 0);
                 SendMessageW(list_, WM_SETREDRAW, TRUE, 0);
-                RedrawWindow(list_, nullptr, nullptr, RDW_INVALIDATE);
 
-                // Structural guarantee: the control's own page math can be
-                // off by one (it then offers a blank row of scroll room).
-                // When the content fits our computed height, strip the
-                // WS_VSCROLL style so no bar can render at all, and pin the
-                // view; restore the style when content overflows. ListProc
-                // additionally swallows scroll input in the fitted state.
-                const bool fits = count * kListItemH <= listH;
-                const LONG_PTR style = GetWindowLongPtrW(list_, GWL_STYLE);
-                const bool hasBar = (style & WS_VSCROLL) != 0;
-                if (fits == hasBar) {
-                    SetWindowLongPtrW(list_, GWL_STYLE,
-                        fits ? (style & ~WS_VSCROLL) : (style | WS_VSCROLL));
-                    SetWindowPos(list_, nullptr, 0, 0, 0, 0,
-                        SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER |
-                        SWP_NOACTIVATE | SWP_FRAMECHANGED);
+                // A LISTBOX created with WS_VSCROLL retains internal scrollbar
+                // state even after the style is cleared and can resurrect the
+                // bar while bringing its last row into view. Cross the mode
+                // boundary by creating a fresh control with the correct style;
+                // compact controls have never owned a scrollbar at all.
+                const bool hasScrollbar =
+                    (GetWindowLongPtrW(list_, GWL_STYLE) & WS_VSCROLL) != 0;
+                const bool needsScrollbar = !fits;
+                if (hasScrollbar != needsScrollbar) {
+                    RecreateResultsList(needsScrollbar, pad, ListTop(), cw, listH,
+                        count, sel, fits ? 0 : top);
+                } else {
+                    RedrawWindow(list_, nullptr, nullptr, RDW_INVALIDATE);
                 }
-                if (fits) SendMessageW(list_, LB_SETTOPINDEX, 0, 0);
+
+                // Reconcile top index and visibility after the final control
+                // and geometry are both in place.
+                EnforceListScrollInvariant();
             }
         }
         if (status_)
@@ -3329,8 +3866,8 @@ private:
     HWND wnd_       = nullptr;
     HWND edit_      = nullptr;
     HWND list_      = nullptr;
-    HWND link_      = nullptr;
-    HWND shll_      = nullptr;
+    HWND toolsMenu_ = nullptr;
+    HWND autoApply_ = nullptr;
     HWND scene_     = nullptr;
     HWND favs_      = nullptr;
     HWND status_    = nullptr;
@@ -3356,7 +3893,8 @@ private:
     bool  hoverClose_ = false;
     bool  trackingMouse_ = false;
     bool  sceneOnly_  = false;
-    bool  favsOnly_   = false;  // Favs filter — show only pinned/brick favorites
+    bool  favsOnly_   = false;  // Favorites filter — brick pins stay above the list
+    bool  applyToSel_ = false;  // Persisted Auto Apply for clicked materials
     bool  acceleratorsDisabled_ = false;
     int   listBaseY_  = 0;
     int   brickAreaH_ = 0;      // height of the brick rows between filters and list
@@ -3365,8 +3903,8 @@ private:
     HWND  renameEdit_ = nullptr;
     int   renameIdx_  = -1;
     bool  renaming_   = false;
-    int   brickDragId_   = -1;
-    bool  brickDragging_ = false;
+    int   brickDragFrom_ = -1;
+    BrickGesture brickGesture_ = BrickGesture::None;
     int   shllRes_       = 256; // SHLL preview resolution
 };
 
