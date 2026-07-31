@@ -15,7 +15,9 @@ namespace PowerShader {
     // Unified config persistence (FlowState.cfg sections)
     void WritePinsSection(FILE* f);
     void WriteBricksSection(FILE* f);
+    void WriteConfigLines(FILE* f);   // PS view modes → [config] section
     void ReadPinsLine(const std::wstring& line);
     void ReadBricksLine(const std::wstring& line);
+    void ReadConfigLine(const std::wstring& line);
     void ClearPersistent();
 }

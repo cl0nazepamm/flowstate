@@ -2237,6 +2237,8 @@ static void SaveSettings() {
     if (g_kmOpacity != 3) fwprintf(f, L"Key:opacity=%d\n", g_kmOpacity);
     if (g_kmClear != 4)   fwprintf(f, L"Key:clear=%d\n", g_kmClear);
     if (g_kmUVGrab != 5)  fwprintf(f, L"Key:uvgrab=%d\n", g_kmUVGrab);
+    // PowerShader view modes (PSTab / PSFavs / PSScene / PSShllRes)
+    PowerShader::WriteConfigLines(f);
 
     // [params] — collapsed, hidden, favorites, quick mods
     fwprintf(f, L"[params]\n");
@@ -2371,6 +2373,7 @@ static void LoadSettings() {
                     }
                 }
             }
+            if (l.compare(0, 2, L"PS") == 0) PowerShader::ReadConfigLine(l);
         }
         else if (sec == SEC_PARAMS) {
             if (len < 3 || line[1] != L':') continue;

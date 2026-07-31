@@ -369,7 +369,7 @@ macroscript flowstate_Config
     frm.Tag = pic.Image
     logoP.controls.add pic
 
-    local vLbl = mkLabel "v1.3" 0 180 W 18 fObj:fSmall cObj:cDim
+    local vLbl = mkLabel "v1.4" 0 180 W 18 fObj:fSmall cObj:cDim
     vLbl.TextAlign = alC.MiddleCenter
     logoP.controls.add vLbl
     frm.controls.add logoP
@@ -908,7 +908,7 @@ macroscript flowstate_Config
     global flowstate_handlers = #(onPaint, onClose, onXEnter, onXLeave, onDragDown, onDragMove, onDragUp, onDeactivate, onSave, onReset, onKey, onClosed, flowstate_onKmMenuPick, flowstate_onKmBtnClick, flowstate_onSideKeysChanged)
 
     -- Show
-    try (format "[flowstate] config UI v1.3 -- Save applies settings to the loaded plugin.\n" to:listener) catch ()
+    try (format "[flowstate] config UI v1.4 -- Save applies settings to the loaded plugin.\n" to:listener) catch ()
     frm.Show()
 )
 

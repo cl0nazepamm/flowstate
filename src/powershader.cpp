@@ -5,14 +5,18 @@
 #include <gdiplus.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <condition_variable>
 #include <cstdint>
 #include <cwctype>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -584,12 +588,16 @@ constexpr int kShllId    = 1008;
 constexpr int kSceneId   = 1004;
 constexpr int kTabMatId  = 1006;
 constexpr int kTabMapId  = 1007;
-constexpr int kApplyId   = 1009;
+constexpr int kTabFavId  = 1009;
 constexpr int kWindowWidth  = 380;
-constexpr int kWindowHeight = 540;
+constexpr int kWindowHeight = 540;   // maximum height; Favorites view shrinks to fit
 constexpr int kHeaderH      = 34;
+constexpr int kListItemH    = 30;    // owner-draw row height (WM_MEASUREITEM)
+constexpr int kBottomM      = 26;    // space below the list for the status bar
 constexpr UINT_PTR kSearchTimerId = 1;
 constexpr UINT kSearchDebounceMs = 14;
+constexpr UINT_PTR kPreviewTimerId = 2;
+constexpr UINT kPreviewDebounceMs = 90;
 
 enum class TabMode { All, Materials, Maps };
 enum class ItemKind { ClassMaterial, ClassMap, SceneMaterial, SceneMap };
@@ -1286,6 +1294,8 @@ static const wchar_t* kSmeAtSpawnScript =
     L")";
 
 // Drag: viewport ray-hit → assign material to closest object under cursor.
+// Dropping on an object that is part of the current selection assigns to
+// every selected object instead (replaces the old Apply toggle).
 static const wchar_t* kDragScript =
     L"("
     L"local m=meditMaterials[activeMeditSlot];"
@@ -1295,20 +1305,63 @@ static const wchar_t* kDragScript =
     L"local nd=undefined;local best=1e9;"
     L"for h in hits do(local d=distance r.pos h[2].pos;"
     L"if d<best do(best=d;nd=h[1]));"
-    L"if nd!=undefined and superclassof m==material do"
-    L"(nd.material=m)"
+    L"if nd!=undefined and superclassof m==material do("
+    L"if nd.isSelected and selection.count>1 then("
+    L"for o in selection do try(o.material=m)catch()"
+    L")else(nd.material=m)"
+    L")"
     L")catch()"
     L")";
 
 // ═══════════════════════════════════════════════════════════════
-//  Texture Preview Popup
+//  Texture Preview Popup — fully async, debounced
+//
+//  Selection changes never touch the disk: they bump a generation counter
+//  and restart a short debounce timer. Once the selection has been stable,
+//  the file is stat'd, decoded and pre-scaled on a single worker thread
+//  (latest-request-wins), and the finished bitmap is handed back to the UI
+//  thread through a mutex-guarded slot + an empty window message. Results
+//  whose generation no longer matches are discarded, so a slow network EXR
+//  can arrive arbitrarily late without ever blocking the list.
 // ═══════════════════════════════════════════════════════════════
 static ULONG_PTR     g_gdipToken = 0;
 static HWND          g_previewWnd = nullptr;
-static Gdiplus::Image* g_previewImg = nullptr;
+static Gdiplus::Image* g_previewImg = nullptr;   // pre-scaled; UI thread only
 static bool          g_previewClassRegistered = false;
 constexpr wchar_t kPreviewClass[] = L"FlowStatePreview";
 constexpr int kPreviewSize = 128;
+
+static std::atomic<unsigned long long> g_previewGen{ 0 };
+static std::wstring g_previewShownPath;          // UI thread only
+
+struct PreviewLoader {
+    std::thread th;
+    std::mutex mx;
+    std::condition_variable cv;
+    bool quit = false;
+    // Latest pending request — newer submissions overwrite older ones
+    bool hasReq = false;
+    std::wstring reqPath;
+    unsigned long long reqGen = 0;
+    HWND notifyWnd = nullptr;
+    // Finished result slot (null image = load failed → hide the popup)
+    bool readyValid = false;
+    Gdiplus::Bitmap* readyImg = nullptr;
+    unsigned long long readyGen = 0;
+    std::wstring readyPath;
+
+    ~PreviewLoader() {
+        // Normal teardown is StopPreviewLoader() from Palette::Shutdown().
+        // If static destruction gets here with the thread still alive,
+        // detach — joining during DLL unload risks the loader-lock deadlock.
+        if (th.joinable()) {
+            { std::lock_guard<std::mutex> lk(mx); quit = true; }
+            cv.notify_one();
+            th.detach();
+        }
+    }
+};
+static PreviewLoader g_previewLoader;
 
 static void InitGdiPlus() {
     if (!g_gdipToken) {
@@ -1363,43 +1416,122 @@ static LRESULT CALLBACK PreviewProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     return DefWindowProc(h, msg, w, l);
 }
 
-static void ShowPreview(const std::wstring& path, HWND paletteWnd) {
-    if (path.empty() || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        if (g_previewWnd) ShowWindow(g_previewWnd, SW_HIDE);
-        delete g_previewImg;
-        g_previewImg = nullptr;
-        return;
-    }
-    InitGdiPlus();
-    // Load image
-    delete g_previewImg;
-    g_previewImg = Gdiplus::Image::FromFile(path.c_str());
-    if (!g_previewImg || g_previewImg->GetLastStatus() != Gdiplus::Ok) {
-        delete g_previewImg; g_previewImg = nullptr;
-        if (g_previewWnd) ShowWindow(g_previewWnd, SW_HIDE);
-        return;
-    }
-    // Create window if needed
-    if (!g_previewWnd) {
-        if (!g_previewClassRegistered) {
-            WNDCLASSEXW wc{ sizeof(wc) };
-            wc.lpfnWndProc = PreviewProc;
-            wc.hInstance = hInstance;
-            wc.lpszClassName = kPreviewClass;
-            g_previewClassRegistered = RegisterClassExW(&wc) != 0 ||
-                GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+// Worker thread: decode + aspect-fit pre-scale in one pass. The UI paint
+// then blits a tiny cached bitmap at 1:1 instead of re-decoding/re-scaling
+// the full-res image on every WM_PAINT.
+static Gdiplus::Bitmap* LoadScaledPreview(const std::wstring& path)
+{
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return nullptr;
+    Gdiplus::Bitmap src(path.c_str(), FALSE);
+    if (src.GetLastStatus() != Gdiplus::Ok) return nullptr;
+    const int iw = static_cast<int>(src.GetWidth());
+    const int ih = static_cast<int>(src.GetHeight());
+    if (iw <= 0 || ih <= 0) return nullptr;
+    const int box = kPreviewSize - 4;   // matches the paint inset
+    const float scale = (std::min)(static_cast<float>(box) / iw,
+                                   static_cast<float>(box) / ih);
+    const int dw = (std::max)(1, static_cast<int>(iw * scale));
+    const int dh = (std::max)(1, static_cast<int>(ih * scale));
+    auto* dst = new Gdiplus::Bitmap(dw, dh, PixelFormat32bppPARGB);
+    if (dst->GetLastStatus() != Gdiplus::Ok) { delete dst; return nullptr; }
+    Gdiplus::Graphics gfx(dst);
+    gfx.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    gfx.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    gfx.DrawImage(&src, Gdiplus::Rect(0, 0, dw, dh), 0, 0, iw, ih,
+        Gdiplus::UnitPixel);
+    return dst;
+}
+
+static void PreviewWorkerMain()
+{
+    // Background CPU + I/O priority: previews are allowed to be late; the
+    // decode must never compete with Max for the disk or a core.
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    auto& L = g_previewLoader;
+    std::unique_lock<std::mutex> lk(L.mx);
+    for (;;) {
+        L.cv.wait(lk, [&L] { return L.quit || L.hasReq; });
+        if (L.quit) return;
+        std::wstring path = std::move(L.reqPath);
+        const unsigned long long gen = L.reqGen;
+        const HWND notify = L.notifyWnd;
+        L.hasReq = false;
+        lk.unlock();
+
+        Gdiplus::Bitmap* img = nullptr;
+        if (gen == g_previewGen.load(std::memory_order_acquire))
+            img = LoadScaledPreview(path);
+
+        lk.lock();
+        if (gen != g_previewGen.load(std::memory_order_acquire)) {
+            delete img;   // selection moved on while decoding — drop it
+        } else {
+            delete L.readyImg;
+            L.readyImg = img;
+            L.readyValid = true;
+            L.readyGen = gen;
+            L.readyPath = std::move(path);
+            if (notify) PostMessageW(notify, WM_USER + 51, 0, 0);
         }
-        if (g_previewClassRegistered) {
-            g_previewWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                kPreviewClass, L"", WS_POPUP, 0, 0, kPreviewSize, kPreviewSize,
-                paletteWnd, nullptr, hInstance, nullptr);
-        }
     }
-    if (!g_previewWnd) {
-        delete g_previewImg;
-        g_previewImg = nullptr;
-        return;
+}
+
+static void SubmitPreviewLoad(const std::wstring& path, HWND notify)
+{
+    InitGdiPlus();   // the worker uses GDI+; start it from the UI thread
+    auto& L = g_previewLoader;
+    {
+        std::lock_guard<std::mutex> lk(L.mx);
+        L.reqPath = path;
+        L.reqGen = g_previewGen.load(std::memory_order_acquire);
+        L.notifyWnd = notify;
+        L.hasReq = true;
+        if (!L.th.joinable()) L.th = std::thread(PreviewWorkerMain);
     }
+    L.cv.notify_one();
+}
+
+static void StopPreviewLoader()
+{
+    auto& L = g_previewLoader;
+    {
+        std::lock_guard<std::mutex> lk(L.mx);
+        L.quit = true;
+        L.hasReq = false;
+    }
+    L.cv.notify_one();
+    if (L.th.joinable()) L.th.join();
+    std::lock_guard<std::mutex> lk(L.mx);
+    L.quit = false;   // allow a clean relaunch if the module re-inits
+    L.readyValid = false;
+    delete L.readyImg; L.readyImg = nullptr;
+    L.reqPath.clear();
+    L.readyPath.clear();
+    L.notifyWnd = nullptr;
+}
+
+static bool EnsurePreviewWindow(HWND paletteWnd)
+{
+    if (g_previewWnd) return true;
+    if (!g_previewClassRegistered) {
+        WNDCLASSEXW wc{ sizeof(wc) };
+        wc.lpfnWndProc = PreviewProc;
+        wc.hInstance = hInstance;
+        wc.lpszClassName = kPreviewClass;
+        g_previewClassRegistered = RegisterClassExW(&wc) != 0 ||
+            GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    }
+    if (g_previewClassRegistered) {
+        g_previewWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            kPreviewClass, L"", WS_POPUP, 0, 0, kPreviewSize, kPreviewSize,
+            paletteWnd, nullptr, hInstance, nullptr);
+    }
+    return g_previewWnd != nullptr;
+}
+
+static void PositionAndShowPreview(HWND paletteWnd)
+{
+    if (!g_previewWnd) return;
     // Position to the left of the palette
     RECT pr; GetWindowRect(paletteWnd, &pr);
     RECT wa{};
@@ -1420,6 +1552,7 @@ static void ShowPreview(const std::wstring& path, HWND paletteWnd) {
 static void HidePreview() {
     if (g_previewWnd) ShowWindow(g_previewWnd, SW_HIDE);
     delete g_previewImg; g_previewImg = nullptr;
+    g_previewShownPath.clear();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1433,6 +1566,33 @@ public:
     // Exposed for unified config persistence
     std::vector<std::wstring> filePins_;     // file-local pins
     std::vector<BrickFav> brickFavs_;        // persistent brick favorites
+
+    // View modes persisted in the [config] section of FlowState.cfg
+    void WriteConfigLines(FILE* f) const
+    {
+        if (tab_ == TabMode::Materials) fwprintf(f, L"PSTab=1\n");
+        if (tab_ == TabMode::Maps)      fwprintf(f, L"PSTab=2\n");
+        if (favsOnly_)                  fwprintf(f, L"PSFavs=1\n");
+        if (sceneOnly_)                 fwprintf(f, L"PSScene=1\n");
+        if (shllRes_ != 256)            fwprintf(f, L"PSShllRes=%d\n", shllRes_);
+    }
+    void ReadConfigLine(const std::wstring& l)
+    {
+        if (l == L"PSTab=1")  tab_ = TabMode::Materials;
+        if (l == L"PSTab=2")  tab_ = TabMode::Maps;
+        if (l == L"PSFavs=1") favsOnly_ = true;
+        if (l == L"PSScene=1") sceneOnly_ = true;
+        if (l.compare(0, 10, L"PSShllRes=") == 0) {
+            int v = _wtoi(l.c_str() + 10);
+            if (v == 128 || v == 256 || v == 512 || v == 1024) shllRes_ = v;
+        }
+    }
+    void ResetModes()
+    {
+        tab_ = TabMode::All;
+        favsOnly_ = sceneOnly_ = false;
+        shllRes_ = 256;
+    }
 
     bool Init(bool light)
     {
@@ -1458,11 +1618,12 @@ public:
     void Shutdown()
     {
         CancelPendingRebuild();
+        StopPreviewLoader();   // join the worker before GDI+ goes away
         HidePreview();
         RestoreAccelerators();
         if (g_previewWnd) { DestroyWindow(g_previewWnd); g_previewWnd = nullptr; }
         if (wnd_) { DestroyWindow(wnd_); wnd_ = nullptr; }
-        edit_ = list_ = link_ = shll_ = scene_ = apply_ = status_ = nullptr;
+        edit_ = list_ = link_ = shll_ = scene_ = favs_ = status_ = nullptr;
         renameEdit_ = nullptr;
         brickBtns_.clear();
         renameIdx_ = brickDragId_ = -1;
@@ -1480,11 +1641,12 @@ public:
         oslCategoryReady_ = oslCategoryBuilding_ = false;
         forcedAliasRetry_ = false;
         sceneCacheReady_ = rebuildPending_ = false;
-        sceneOnly_ = applyToSel_ = false;
+        sceneOnly_ = favsOnly_ = false;
         hoverClose_ = trackingMouse_ = false;
         closeRect_ = {};
         dragStart_ = {};
         shllRes_ = 256;
+        brickAreaH_ = 0;
         UnregisterClassW(kPaletteClass, hInstance);
         if (g_previewClassRegistered) {
             UnregisterClassW(kPreviewClass, hInstance);
@@ -1553,6 +1715,38 @@ private:
             if (IsWindowVisible(h)) self->UpdatePreviewForSelection();
             else HidePreview();
             return 0;
+
+        case WM_USER + 51:
+        {
+            // A pre-scaled preview finished on the worker thread — swap it
+            // in if it still matches the current selection generation.
+            Gdiplus::Bitmap* img = nullptr;
+            unsigned long long gen = 0;
+            bool valid = false;
+            std::wstring path;
+            {
+                auto& L = g_previewLoader;
+                std::lock_guard<std::mutex> lk(L.mx);
+                valid = L.readyValid;
+                L.readyValid = false;
+                img = L.readyImg; L.readyImg = nullptr;
+                gen = L.readyGen;
+                path = std::move(L.readyPath);
+            }
+            if (!valid) return 0;
+            if (gen != g_previewGen.load(std::memory_order_acquire) ||
+                !IsWindowVisible(h)) {
+                delete img;   // late result — the list has moved on
+                return 0;
+            }
+            if (!img) { HidePreview(); return 0; }   // load failed
+            if (!EnsurePreviewWindow(h)) { delete img; return 0; }
+            delete g_previewImg;
+            g_previewImg = img;
+            g_previewShownPath = std::move(path);
+            PositionAndShowPreview(h);
+            return 0;
+        }
 
         case WM_SHOWWINDOW:
             if (!w) HidePreview();
@@ -1666,15 +1860,16 @@ private:
         {
             HWND target = reinterpret_cast<HWND>(w);
             int cid = target ? GetDlgCtrlID(target) : 0;
-            // Right-click SHLL → cycle resolution
+            // Right-click SHLL → cycle resolution (persisted; label stays
+            // "SHLL" — the header button is too small for "SHLL 1024")
             if (cid == kShllId) {
                 static const int kRes[] = {128, 256, 512, 1024};
                 int cur = 0;
                 for (int i = 0; i < 4; i++) if (kRes[i] == self->shllRes_) { cur = i; break; }
                 self->shllRes_ = kRes[(cur + 1) % 4];
-                std::wstring lbl = L"SHLL " + std::to_wstring(self->shllRes_);
-                SetWindowTextW(self->shll_, lbl.c_str());
-                InvalidateRect(self->shll_, nullptr, FALSE);
+                self->SetStatus(L"SHLL preview " +
+                    std::to_wstring(self->shllRes_) + L" px");
+                FlowState_SaveSettings();
                 return 0;
             }
             // Right-click on brick button → rename
@@ -1743,7 +1938,7 @@ private:
         case WM_MEASUREITEM:
         {
             auto* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(l);
-            mis->itemHeight = 30;
+            mis->itemHeight = kListItemH;
             return TRUE;
         }
         case WM_DRAWITEM:
@@ -1752,8 +1947,8 @@ private:
             if (dis->CtlID == kListId)
                 { self->DrawListItem(dis); return TRUE; }
             if (dis->CtlID == kTabMatId || dis->CtlID == kTabMapId ||
-                dis->CtlID == kLinkId || dis->CtlID == kShllId ||
-                dis->CtlID == kSceneId || dis->CtlID == kApplyId ||
+                dis->CtlID == kTabFavId || dis->CtlID == kLinkId ||
+                dis->CtlID == kShllId || dis->CtlID == kSceneId ||
                 (dis->CtlID >= kBrickBase && dis->CtlID < kBrickBase + kBrickMax))
                 { self->DrawButton(dis); return TRUE; }
             break;
@@ -1816,6 +2011,10 @@ private:
             break;
         case WM_MOUSEWHEEL:
             if (self->dragging_) return 0;
+            if (self->ListContentFits()) return 0;  // fitted list never scrolls
+            break;
+        case WM_VSCROLL:
+            if (self->ListContentFits()) return 0;
             break;
         case WM_LBUTTONUP:
         {
@@ -1937,6 +2136,19 @@ private:
         closeRect_ = { cr.right - pad - 18, pad, cr.right - pad, pad + 18 };
         int y = kHeaderH;
 
+        // Header micro-buttons: LINK | SHLL, tucked next to the close ×
+        const int hbW = 38, hbH = 18, hbGap = 3;
+        int hbX = closeRect_.left - 4 - hbW;
+        shll_ = CreateWindowExW(0, L"BUTTON", L"SHLL",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            hbX, pad, hbW, hbH, h,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kShllId)), hInstance, nullptr);
+        hbX -= hbGap + hbW;
+        link_ = CreateWindowExW(0, L"BUTTON", L"LINK",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            hbX, pad, hbW, hbH, h,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLinkId)), hInstance, nullptr);
+
         // Search box
         edit_ = CreateWindowExW(0, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
@@ -1948,38 +2160,28 @@ private:
         SetWindowSubclass(edit_, EditProc, 1, reinterpret_cast<DWORD_PTR>(this));
         y += 28;
 
-        // Filter toggles: Shaders | Maps (clicking active one = show ALL)
+        // Filter row: Shaders | Maps | Favs | Scene. Shaders/Maps are
+        // exclusive type tabs (clicking the active one = show ALL); Favs and
+        // Scene are independent toggles that layer on top of them and each
+        // other (e.g. Scene+Favs = pinned scene items only).
         const int tabGap = 3;
-        int tabW = (cw - tabGap) / 2;
+        int tabW = (cw - 3 * tabGap) / 4;
         CreateWindowExW(0, L"BUTTON", L"Shaders",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             pad, y, tabW, 22, h,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTabMatId)), hInstance, nullptr);
         CreateWindowExW(0, L"BUTTON", L"Maps",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            pad + tabW + tabGap, y, cw - tabW - tabGap, 22, h,
+            pad + tabW + tabGap, y, tabW, 22, h,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTabMapId)), hInstance, nullptr);
-        y += 26;
-
-        // Command row: LINK | SHLL | Scene | Apply
-        const int gap = 3;
-        int btnW4 = (cw - 3 * gap) / 4;
-        link_ = CreateWindowExW(0, L"BUTTON", L"LINK",
+        favs_ = CreateWindowExW(0, L"BUTTON", L"Favorites",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            pad, y, btnW4, 22, h,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLinkId)), hInstance, nullptr);
-        shll_ = CreateWindowExW(0, L"BUTTON", L"SHLL",
-            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            pad + btnW4 + gap, y, btnW4, 22, h,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kShllId)), hInstance, nullptr);
+            pad + 2 * (tabW + tabGap), y, tabW, 22, h,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTabFavId)), hInstance, nullptr);
         scene_ = CreateWindowExW(0, L"BUTTON", L"Scene",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            pad + 2 * (btnW4 + gap), y, btnW4, 22, h,
+            pad + 3 * (tabW + tabGap), y, cw - 3 * (tabW + tabGap), 22, h,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSceneId)), hInstance, nullptr);
-        apply_ = CreateWindowExW(0, L"BUTTON", L"Apply",
-            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            pad + 3 * (btnW4 + gap), y, cw - 3 * (btnW4 + gap), 22, h,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kApplyId)), hInstance, nullptr);
         y += 26;
 
         // Results list (owner-drawn)
@@ -2047,13 +2249,19 @@ private:
         SIZE infoSz{};
         GetTextExtentPoint32W(dis->hDC, info.c_str(), static_cast<int>(info.size()), &infoSz);
 
-        // Left side: pin indicator + item name
+        // Left side: favorite indicator + item name
+        // Solid diamond = file pin, hollow diamond = brick favorite
         bool isPinned = std::find(filePins_.begin(), filePins_.end(), item.key) != filePins_.end();
+        bool isBrick = !isPinned && std::any_of(brickFavs_.begin(), brickFavs_.end(),
+            [&](const BrickFav& bf) { return bf.alias == item.key; });
         RECT lr = dis->rcItem;
         lr.left += 8;
-        if (isPinned) {
-            SetTextColor(dis->hDC, Theme::accent);
-            DrawTextW(dis->hDC, L"\u25C6 ", 2, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        if (isPinned || isBrick) {
+            // Accent-on-accent is invisible on the selected row \u2014 use the
+            // bright text color there instead.
+            SetTextColor(dis->hDC, sel ? Theme::textBrt : Theme::accent);
+            DrawTextW(dis->hDC, isPinned ? L"\u25C6 " : L"\u25C7 ", 2, &lr,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             lr.left += 14;
         }
         lr.right -= infoSz.cx + 12;
@@ -2082,8 +2290,8 @@ private:
         // Determine active state based on control type
         if (id == kTabMatId)      active = (tab_ == TabMode::Materials);
         else if (id == kTabMapId) active = (tab_ == TabMode::Maps);
+        else if (id == kTabFavId) active = favsOnly_;
         else if (id == kSceneId)  active = sceneOnly_;
-        else if (id == kApplyId)  active = applyToSel_;
         else                      active = (dis->itemState & ODS_SELECTED) != 0;
 
         COLORREF bgc = active ? Theme::accent : Theme::panelLt;
@@ -2198,7 +2406,7 @@ private:
         // This preserves the no-flicker spawn order without pumping a nested
         // message loop from inside the mouse hook.
         SetLayeredWindowAttributes(wnd_, 0, 0, LWA_ALPHA);
-        SetWindowPos(wnd_, HWND_TOPMOST, x, y, kWindowWidth, kWindowHeight,
+        SetWindowPos(wnd_, HWND_TOPMOST, x, y, kWindowWidth, DesiredWindowHeight(),
             SWP_NOACTIVATE);
         ShowWindow(wnd_, SW_SHOW);
         SetLayeredWindowAttributes(wnd_, 0, 255, LWA_ALPHA);
@@ -2217,6 +2425,9 @@ private:
     {
         CancelPendingRebuild();
         FinishRename(true);
+        // Drop any in-flight preview load and pending debounce
+        g_previewGen.fetch_add(1, std::memory_order_release);
+        if (wnd_) KillTimer(wnd_, kPreviewTimerId);
         HidePreview();
         ShowWindow(wnd_, SW_HIDE);
         SetLayeredWindowAttributes(wnd_, 0, 255, LWA_ALPHA);
@@ -2245,10 +2456,13 @@ private:
             ExecuteShellCommand(shllRes_);
             return;
         }
-        if (id == kApplyId)
+        if (id == kTabFavId)
         {
-            applyToSel_ = !applyToSel_;
-            InvalidateRect(apply_, nullptr, FALSE);
+            favsOnly_ = !favsOnly_;
+            InvalidateRect(favs_, nullptr, FALSE);
+            CancelPendingRebuild();
+            Rebuild(true);
+            FlowState_SaveSettings();
             return;
         }
         if (id == kSceneId)
@@ -2258,6 +2472,7 @@ private:
             CancelPendingRebuild();
             if (sceneOnly_) RefreshSceneCache();
             Rebuild(true);
+            FlowState_SaveSettings();
             return;
         }
         if (id == kTabMatId || id == kTabMapId)
@@ -2269,6 +2484,7 @@ private:
                 if (HWND tw = GetDlgItem(wnd_, tid)) InvalidateRect(tw, nullptr, FALSE);
             CancelPendingRebuild();
             Rebuild(true);
+            FlowState_SaveSettings();
             return;
         }
         if (id == kListId && code == LBN_SELCHANGE) {
@@ -2288,26 +2504,48 @@ private:
 
     void UpdatePreviewForSelection()
     {
-        // List clicks post a delayed refresh. Activation can hide the palette
-        // before that message is dispatched, so never let a stale refresh
-        // resurrect the independent topmost preview popup.
+        // Runs on every selection change while scrolling — never touch the
+        // disk or the material graph here. Invalidate any in-flight load and
+        // restart the debounce; the real work starts in OnTimer once the
+        // selection has settled for kPreviewDebounceMs.
+        g_previewGen.fetch_add(1, std::memory_order_release);
         if (!wnd_ || !IsWindowVisible(wnd_)) {
+            // Activation can hide the palette before a queued refresh is
+            // dispatched — never let it resurrect the topmost preview popup.
+            if (wnd_) KillTimer(wnd_, kPreviewTimerId);
             HidePreview();
             return;
         }
+        SetTimer(wnd_, kPreviewTimerId, kPreviewDebounceMs, nullptr);
+    }
+
+    // Debounce elapsed — resolve the selected item's bitmap path and hand it
+    // to the worker. The previous popup stays up until the replacement
+    // arrives (no flicker); items without a bitmap hide it right away.
+    void StartPreviewLoad()
+    {
+        if (!wnd_ || !IsWindowVisible(wnd_)) { HidePreview(); return; }
+        std::wstring fn;
         int sel = (int)SendMessage(list_, LB_GETCURSEL, 0, 0);
         if (sel >= 0 && sel < (int)filtered_.size() && activeItems_) {
             const Item& item = (*activeItems_)[filtered_[sel]];
-            if (item.live) {
-                std::wstring fn = GetTexmapFilename(item.live);
-                if (!fn.empty()) { ShowPreview(fn, wnd_); return; }
-            }
+            if (item.live) fn = GetTexmapFilename(item.live);
         }
-        HidePreview();
+        if (fn.empty()) { HidePreview(); return; }
+        if (fn == g_previewShownPath && g_previewImg) {
+            PositionAndShowPreview(wnd_);   // same file — no reload needed
+            return;
+        }
+        SubmitPreviewLoad(fn, wnd_);
     }
 
     void OnTimer(UINT_PTR id)
     {
+        if (id == kPreviewTimerId) {
+            KillTimer(wnd_, kPreviewTimerId);
+            StartPreviewLoad();
+            return;
+        }
         if (id != kSearchTimerId) return;
         CancelPendingRebuild();
         Rebuild(false);
@@ -2571,10 +2809,18 @@ private:
         const std::wstring normQ = Normalize(q, true);
         const std::vector<std::wstring> tokens = TokenizeQuery(normQ);
 
+        // Favorites = file pins ∪ brick favorites, matched by normalized key
+        std::set<std::wstring> favKeys;
+        if (favsOnly_) {
+            favKeys.insert(filePins_.begin(), filePins_.end());
+            for (const auto& bf : brickFavs_) favKeys.insert(bf.alias);
+        }
+
         auto passesTab = [&](const Item& item) -> bool
         {
             bool isScene = (item.kind == ItemKind::SceneMaterial || item.kind == ItemKind::SceneMap);
             if (sceneOnly != isScene) return false;
+            if (favsOnly_ && favKeys.find(item.key) == favKeys.end()) return false;
             if (tab_ == TabMode::Materials &&
                 item.kind != ItemKind::ClassMaterial && item.kind != ItemKind::SceneMaterial) return false;
             if (tab_ == TabMode::Maps &&
@@ -2602,20 +2848,17 @@ private:
         filtered_.clear();
         filtered_.reserve(scored.size());
 
-        // File-pinned items go first (only when not actively searching)
-        if (tokens.empty() && !filePins_.empty()) {
-            std::set<int> pinIndices;
-            for (const auto& pin : filePins_) {
-                for (size_t i = 0; i < source.size(); i++) {
-                    if (source[i].key == pin && passesTab(source[i])) {
-                        filtered_.push_back(static_cast<int>(i));
-                        pinIndices.insert(static_cast<int>(i));
-                        break;
-                    }
-                }
-            }
+        // File-pinned items go first, alphabetically — source order is already
+        // sorted by label. Skip the grouping while searching (score order
+        // wins) and in Favs view (everything shown is a favorite; plain
+        // alphabetical order is what users expect there).
+        if (tokens.empty() && !filePins_.empty() && !favsOnly_) {
+            std::set<std::wstring> pinSet(filePins_.begin(), filePins_.end());
             for (const auto& s : scored)
-                if (pinIndices.find(s.idx) == pinIndices.end())
+                if (pinSet.count(source[static_cast<size_t>(s.idx)].key))
+                    filtered_.push_back(s.idx);
+            for (const auto& s : scored)
+                if (!pinSet.count(source[static_cast<size_t>(s.idx)].key))
                     filtered_.push_back(s.idx);
         } else {
             for (const auto& s : scored) filtered_.push_back(s.idx);
@@ -2626,6 +2869,9 @@ private:
         SendMessageW(list_, LB_SETCOUNT, static_cast<WPARAM>(filtered_.size()), 0);
         if (!filtered_.empty()) SendMessageW(list_, LB_SETCURSEL, 0, 0);
         SendMessageW(list_, WM_SETREDRAW, TRUE, 0);
+        // Auto-compact to the result count. This also re-syncs the listbox
+        // scroll state at the final geometry — see LayoutListAndStatus.
+        ApplyWindowHeight();
         RedrawWindow(list_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
         if (wnd_ && IsWindowVisible(wnd_)) UpdatePreviewForSelection();
         else HidePreview();
@@ -2634,8 +2880,11 @@ private:
         lastTab_ = tab_;
         lastSceneOnly_ = sceneOnly;
 
-        SetStatus(std::to_wstring(filtered_.size()) + L" items" +
-            (normQ.empty() ? L"" : (L"  |  " + normQ)));
+        if (favsOnly_ && filtered_.empty() && normQ.empty())
+            SetStatus(L"No favorites yet. Right-click pins, middle-click bricks.");
+        else
+            SetStatus(std::to_wstring(filtered_.size()) + L" items" +
+                (normQ.empty() ? L"" : (L"  |  " + normQ)));
     }
 
     // ─── Activation (C++ API core) ──────────────────────────────
@@ -2743,18 +2992,6 @@ private:
                 // SME is open — drop into it
                 ip->PutMtlToMtlEditor(mb, slot);
                 ExecuteMAXScriptScript(kSmeAtSpawnScript, MAXScript::ScriptSource::Dynamic);
-                // Also assign to selection if Apply is on
-                if (applyToSel_ && isMat && ip->GetSelNodeCount() > 0) {
-                    Mtl* mtl = static_cast<Mtl*>(mb);
-                    for (int i = 0; i < ip->GetSelNodeCount(); ++i)
-                        if (INode* n = ip->GetSelNode(i)) n->SetMtl(mtl);
-                }
-            } else if (isMat && applyToSel_ && ip->GetSelNodeCount() > 0) {
-                // Apply on + has selection — assign to selected objects
-                Mtl* mtl = static_cast<Mtl*>(mb);
-                for (int i = 0; i < ip->GetSelNodeCount(); ++i)
-                    if (INode* n = ip->GetSelNode(i)) n->SetMtl(mtl);
-                ip->PutMtlToMtlEditor(mb, slot);
             } else {
                 // Always retain the created item in a material-editor slot.
                 // GetMtlEditInterface() can be unavailable transiently even
@@ -2772,6 +3009,18 @@ private:
     }
 
     // ─── Helpers ────────────────────────────────────────────────
+    // True when every item is visible without scrolling. Half a row of
+    // tolerance so the control's off-by-one page math can't reclassify a
+    // fitted list as scrollable; a real overflow is a full row or more.
+    bool ListContentFits() const
+    {
+        if (!list_) return true;
+        RECT lr; GetClientRect(list_, &lr);
+        const int count =
+            static_cast<int>(SendMessageW(list_, LB_GETCOUNT, 0, 0));
+        return count <= 0 || count * kListItemH <= lr.bottom + kListItemH / 2;
+    }
+
     void MoveSelection(int delta)
     {
         int count = static_cast<int>(SendMessageW(list_, LB_GETCOUNT, 0, 0));
@@ -2780,6 +3029,9 @@ private:
         if (cur == LB_ERR) cur = 0;
         else cur = std::clamp(cur + delta, 0, count - 1);
         SendMessageW(list_, LB_SETCURSEL, cur, 0);
+        // LB_SETCURSEL doesn't fire LBN_SELCHANGE — schedule the (debounced)
+        // preview update ourselves so it follows keyboard navigation too.
+        UpdatePreviewForSelection();
     }
 
     void SetStatus(const std::wstring& s)
@@ -2856,6 +3108,9 @@ private:
             SetStatus(L"Added to favorites.");
         }
         SaveBrickFavs();
+        // Bricks are part of the favorites set — refresh the list contents
+        // (and its shrink-wrapped height) before laying the bricks out.
+        if (favsOnly_) Rebuild(true);
         RebuildBrickUI();
     }
 
@@ -2864,6 +3119,7 @@ private:
         if (brickIdx < 0 || brickIdx >= static_cast<int>(brickFavs_.size())) return;
         brickFavs_.erase(brickFavs_.begin() + brickIdx);
         SaveBrickFavs();
+        if (favsOnly_) Rebuild(true);
         RebuildBrickUI();
         SetStatus(L"Removed from favorites.");
     }
@@ -2871,6 +3127,105 @@ private:
     void SaveBrickFavs()
     {
         FlowState_SaveSettings(); // unified save
+    }
+
+    // ─── Dynamic window height (Favorites shrink-wrap) ──────────
+    int ListTop() const { return listBaseY_ + brickAreaH_; }
+
+    // Auto-compact, all views: fit the window to the item count — no
+    // scrollbar — growing with the list until the standard height, where
+    // the scrollbar takes over.
+    int DesiredWindowHeight() const
+    {
+        int rows = (std::max)(1, static_cast<int>(filtered_.size()));
+        return (std::min)(kWindowHeight, ListTop() + rows * kListItemH + kBottomM);
+    }
+
+    void LayoutListAndStatus()
+    {
+        if (!wnd_) return;
+        RECT cr; GetClientRect(wnd_, &cr);
+        const int pad = 8, cw = cr.right - 2 * pad;
+        if (list_) {
+            const int listH = (cr.bottom - kBottomM) - ListTop();
+            SetWindowPos(list_, nullptr, pad, ListTop(), cw, listH,
+                SWP_NOZORDER);
+            // The listbox only recomputes scrollability on content changes,
+            // never on resize — a stale state leaves phantom scrollbars or a
+            // wheel-scrollable exact-fit list. Re-issuing the count (cheap
+            // with LBS_NODATA) forces a full recalc at the final geometry;
+            // then restore the view. The listbox clamps the top index, so an
+            // exact-fit list pins to 0 automatically.
+            const int count =
+                static_cast<int>(SendMessageW(list_, LB_GETCOUNT, 0, 0));
+            if (count >= 0) {
+                const int sel =
+                    static_cast<int>(SendMessageW(list_, LB_GETCURSEL, 0, 0));
+                const int top =
+                    static_cast<int>(SendMessageW(list_, LB_GETTOPINDEX, 0, 0));
+                SendMessageW(list_, WM_SETREDRAW, FALSE, 0);
+                // Reset, then set: LB_SETCOUNT with an unchanged count can be
+                // treated as a no-op by the control, which keeps the stale
+                // scrollbar alive. Emptying first forces the real recalc.
+                SendMessageW(list_, LB_RESETCONTENT, 0, 0);
+                SendMessageW(list_, LB_SETCOUNT, count, 0);
+                if (sel >= 0) SendMessageW(list_, LB_SETCURSEL, sel, 0);
+                SendMessageW(list_, LB_SETTOPINDEX,
+                    (count * kListItemH <= listH) ? 0 : (std::max)(0, top), 0);
+                SendMessageW(list_, WM_SETREDRAW, TRUE, 0);
+                RedrawWindow(list_, nullptr, nullptr, RDW_INVALIDATE);
+
+                // Structural guarantee: the control's own page math can be
+                // off by one (it then offers a blank row of scroll room).
+                // When the content fits our computed height, strip the
+                // WS_VSCROLL style so no bar can render at all, and pin the
+                // view; restore the style when content overflows. ListProc
+                // additionally swallows scroll input in the fitted state.
+                const bool fits = count * kListItemH <= listH;
+                const LONG_PTR style = GetWindowLongPtrW(list_, GWL_STYLE);
+                const bool hasBar = (style & WS_VSCROLL) != 0;
+                if (fits == hasBar) {
+                    SetWindowLongPtrW(list_, GWL_STYLE,
+                        fits ? (style & ~WS_VSCROLL) : (style | WS_VSCROLL));
+                    SetWindowPos(list_, nullptr, 0, 0, 0, 0,
+                        SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER |
+                        SWP_NOACTIVATE | SWP_FRAMECHANGED);
+                }
+                if (fits) SendMessageW(list_, LB_SETTOPINDEX, 0, 0);
+            }
+        }
+        if (status_)
+            SetWindowPos(status_, nullptr, pad, cr.bottom - 22, cw, 18,
+                SWP_NOZORDER);
+    }
+
+    // Resize the window to DesiredWindowHeight, keeping the top edge put but
+    // never letting the bottom leave the work area, then reflow the
+    // bottom-anchored children.
+    void ApplyWindowHeight()
+    {
+        if (!wnd_) return;
+        const int desired = DesiredWindowHeight();
+        RECT wr; GetWindowRect(wnd_, &wr);
+        if (wr.bottom - wr.top != desired) {
+            RECT wa{};
+            MONITORINFO mi{ sizeof(mi) };
+            HMONITOR mon = MonitorFromWindow(wnd_, MONITOR_DEFAULTTONEAREST);
+            if (mon && GetMonitorInfoW(mon, &mi)) wa = mi.rcWork;
+            else SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+            int y = wr.top;
+            if (y + desired > wa.bottom)
+                y = (std::max)(static_cast<int>(wa.top),
+                               static_cast<int>(wa.bottom) - desired);
+            SetWindowPos(wnd_, nullptr, wr.left, y, kWindowWidth, desired,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+            // A layered window can keep presenting its old-size surface
+            // until repainted — force a synchronous full refresh so live
+            // toggles resize visually, not just logically.
+            RedrawWindow(wnd_, nullptr, nullptr,
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        }
+        LayoutListAndStatus();
     }
 
     void RebuildBrickUI(bool commitRename = true)
@@ -2885,38 +3240,33 @@ private:
         RECT cr; GetClientRect(wnd_, &cr);
         int pad = 8, cw = cr.right - 2 * pad;
 
-        if (brickFavs_.empty()) {
-            // No bricks — restore list to original position
-            SetWindowPos(list_, nullptr, pad, listBaseY_, cw,
-                (cr.bottom - 26) - listBaseY_, SWP_NOZORDER);
-            InvalidateRect(wnd_, nullptr, TRUE);
-            return;
+        brickAreaH_ = 0;
+        if (!brickFavs_.empty()) {
+            // Calculate brick layout — buttons stretch to fill row width
+            int bwMin = 50, bh2 = 22, gap = 3;
+            int cols = std::max(1, (cw + gap) / (bwMin + gap));
+            int bw = (cw - (cols - 1) * gap) / cols; // stretch to fill
+            int x = pad, y2 = listBaseY_;
+            int maxY = y2;
+            int col = 0;
+            for (int i = 0; i < static_cast<int>(brickFavs_.size()) && i < kBrickMax; i++) {
+                if (col >= cols) { col = 0; x = pad; y2 += bh2 + gap; }
+                HWND btn = CreateWindowExW(0, L"BUTTON", brickFavs_[i].label.c_str(),
+                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                    x, y2, bw, bh2, wnd_,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kBrickBase + i)),
+                    hInstance, nullptr);
+                SetWindowSubclass(btn, BrickBtnProc, 1, reinterpret_cast<DWORD_PTR>(this));
+                brickBtns_.push_back(btn);
+                maxY = y2 + bh2 + gap;
+                x += bw + gap;
+                col++;
+            }
+            brickAreaH_ = maxY - listBaseY_;
         }
 
-        // Calculate brick layout — buttons stretch to fill row width
-        int bwMin = 50, bh2 = 22, gap = 3;
-        int cols = std::max(1, (cw + gap) / (bwMin + gap));
-        int bw = (cw - (cols - 1) * gap) / cols; // stretch to fill
-        int x = pad, y2 = listBaseY_;
-        int maxY = y2;
-        int col = 0;
-        for (int i = 0; i < static_cast<int>(brickFavs_.size()) && i < kBrickMax; i++) {
-            if (col >= cols) { col = 0; x = pad; y2 += bh2 + gap; }
-            HWND btn = CreateWindowExW(0, L"BUTTON", brickFavs_[i].label.c_str(),
-                WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                x, y2, bw, bh2, wnd_,
-                reinterpret_cast<HMENU>(static_cast<INT_PTR>(kBrickBase + i)),
-                hInstance, nullptr);
-            SetWindowSubclass(btn, BrickBtnProc, 1, reinterpret_cast<DWORD_PTR>(this));
-            brickBtns_.push_back(btn);
-            maxY = y2 + bh2 + gap;
-            x += bw + gap;
-            col++;
-        }
-
-        // Move list below brick area
-        SetWindowPos(list_, nullptr, pad, maxY, cw,
-            (cr.bottom - 26) - maxY, SWP_NOZORDER);
+        // Reflow list/status below the brick area (shrink-wraps in Favorites)
+        ApplyWindowHeight();
         InvalidateRect(wnd_, nullptr, TRUE);
     }
 
@@ -2982,7 +3332,7 @@ private:
     HWND link_      = nullptr;
     HWND shll_      = nullptr;
     HWND scene_     = nullptr;
-    HWND apply_     = nullptr;
+    HWND favs_      = nullptr;
     HWND status_    = nullptr;
     TabMode tab_    = TabMode::All;
     std::vector<Item> classItems_;
@@ -3006,9 +3356,10 @@ private:
     bool  hoverClose_ = false;
     bool  trackingMouse_ = false;
     bool  sceneOnly_  = false;
-    bool  applyToSel_ = false;  // Apply material to selection (off by default — just creates in SME)
+    bool  favsOnly_   = false;  // Favs filter — show only pinned/brick favorites
     bool  acceleratorsDisabled_ = false;
     int   listBaseY_  = 0;
+    int   brickAreaH_ = 0;      // height of the brick rows between filters and list
     // Dual favorites
     std::vector<HWND> brickBtns_;            // brick button HWNDs
     HWND  renameEdit_ = nullptr;
@@ -3057,6 +3408,7 @@ static void ReadBricksLineImpl(const std::wstring& line) {
 static void ClearPersistentImpl() {
     Palette::Get().filePins_.clear();
     Palette::Get().brickFavs_.clear();
+    Palette::Get().ResetModes();
 }
 
 } // anonymous namespace
@@ -3070,8 +3422,10 @@ void ReloadTheme(bool lightTheme) { Palette::Get().ReloadTheme(lightTheme); }
 
 void WritePinsSection(FILE* f)                  { WritePinsSectionImpl(f); }
 void WriteBricksSection(FILE* f)                { WriteBricksSectionImpl(f); }
+void WriteConfigLines(FILE* f)                  { Palette::Get().WriteConfigLines(f); }
 void ReadPinsLine(const std::wstring& line)     { ReadPinsLineImpl(line); }
 void ReadBricksLine(const std::wstring& line)   { ReadBricksLineImpl(line); }
+void ReadConfigLine(const std::wstring& line)   { Palette::Get().ReadConfigLine(line); }
 void ClearPersistent()                          { ClearPersistentImpl(); }
 
 } // namespace PowerShader
