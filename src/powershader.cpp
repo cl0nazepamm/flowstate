@@ -596,6 +596,8 @@ constexpr int kShllRes128Id  = 1012;
 constexpr int kShllRes256Id  = 1013;
 constexpr int kShllRes512Id  = 1014;
 constexpr int kShllRes1024Id = 1015;
+constexpr int kPersistSearchId = 1016;
+constexpr int kKeepOpenId      = 1017;
 constexpr int kWindowWidth  = 380;
 constexpr int kWindowHeight = 540;   // maximum height; Favorites view shrinks to fit
 constexpr int kHeaderH      = 34;
@@ -1609,6 +1611,10 @@ public:
         if (favsOnly_)                  fwprintf(f, L"PSFavs=1\n");
         if (sceneOnly_)                 fwprintf(f, L"PSScene=1\n");
         if (applyToSel_)                fwprintf(f, L"PSAutoApply=1\n");
+        if (persistSearch_)             fwprintf(f, L"PSPersistSearch=1\n");
+        if (keepOpen_)                  fwprintf(f, L"PSKeepOpen=1\n");
+        if (persistSearch_ && !savedSearch_.empty())
+            fwprintf(f, L"PSSearch=%s\n", savedSearch_.c_str());
         if (shllRes_ != 256)            fwprintf(f, L"PSShllRes=%d\n", shllRes_);
     }
     void ReadConfigLine(const std::wstring& l)
@@ -1618,6 +1624,10 @@ public:
         if (l == L"PSFavs=1") favsOnly_ = true;
         if (l == L"PSScene=1") sceneOnly_ = true;
         if (l == L"PSAutoApply=1") applyToSel_ = true;
+        if (l == L"PSPersistSearch=1") persistSearch_ = true;
+        if (l == L"PSKeepOpen=1") keepOpen_ = true;
+        if (l.compare(0, 9, L"PSSearch=") == 0)
+            persistedSearch_ = savedSearch_ = l.substr(9);
         if (l.compare(0, 10, L"PSShllRes=") == 0) {
             int v = _wtoi(l.c_str() + 10);
             if (v == 128 || v == 256 || v == 512 || v == 1024) shllRes_ = v;
@@ -1628,6 +1638,9 @@ public:
         tab_ = TabMode::All;
         favsOnly_ = sceneOnly_ = false;
         applyToSel_ = false;
+        persistSearch_ = keepOpen_ = false;
+        savedSearch_.clear();
+        persistedSearch_.clear();
         shllRes_ = 256;
     }
 
@@ -1788,7 +1801,23 @@ private:
             break;
 
         case WM_ACTIVATE:
-            if (LOWORD(w) == WA_INACTIVE && !self->dragging_) self->Hide();
+            if (LOWORD(w) == WA_INACTIVE && !self->dragging_)
+            {
+                if (self->keepOpen_)
+                {
+                    // Panel stays up, but Max must get its keyboard
+                    // shortcuts back while it owns focus.
+                    HidePreview();
+                    self->RestoreAccelerators();
+                }
+                else self->Hide();
+            }
+            else if (LOWORD(w) != WA_INACTIVE && IsWindowVisible(h) &&
+                     !self->acceleratorsDisabled_)
+            {
+                DisableAccelerators();
+                self->acceleratorsDisabled_ = true;
+            }
             return 0;
 
         case WM_CLOSE:
@@ -2564,7 +2593,9 @@ private:
     void Show()
     {
         CancelPendingRebuild();
-        SetWindowTextW(edit_, L"");
+        // Persistent search restores the last query verbatim; Show() below
+        // select-alls it so typing still replaces in one keystroke.
+        SetWindowTextW(edit_, persistSearch_ ? savedSearch_.c_str() : L"");
         EnsureClassCache();
         EnsureOSLCategories();
         if (IsSceneOnly()) RefreshSceneCache();
@@ -2680,6 +2711,12 @@ private:
         dragIndex_ = -1;
         // Restore Max keyboard shortcuts
         RestoreAccelerators();
+        // Flush the query to FlowState.cfg so it survives a Max restart;
+        // typing alone never triggers a save.
+        if (persistSearch_ && savedSearch_ != persistedSearch_) {
+            persistedSearch_ = savedSearch_;
+            FlowState_SaveSettings();
+        }
     }
 
     void RestoreAccelerators()
@@ -2711,6 +2748,11 @@ private:
         AppendMenuW(resolution, MF_STRING, kShllRes1024Id, L"1024 px");
         AppendMenuW(popup, MF_POPUP, reinterpret_cast<UINT_PTR>(resolution),
             L"Quick Shell Resolution");
+        AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(popup, MF_STRING | (persistSearch_ ? MF_CHECKED : MF_UNCHECKED),
+            kPersistSearchId, L"Persistent search");
+        AppendMenuW(popup, MF_STRING | (keepOpen_ ? MF_CHECKED : MF_UNCHECKED),
+            kKeepOpenId, L"Keep panel open");
 
         const UINT checkedId =
             shllRes_ == 128 ? kShllRes128Id :
@@ -2739,12 +2781,30 @@ private:
                 command == kShllRes1024Id ? 1024 : 256;
             SetStatus(L"Quick Shell preview " + std::to_wstring(shllRes_) + L" px");
             FlowState_SaveSettings();
+        } else if (command == kPersistSearchId) {
+            persistSearch_ = !persistSearch_;
+            SetStatus(persistSearch_ ? L"Persistent search on."
+                                     : L"Persistent search off.");
+            FlowState_SaveSettings();
+        } else if (command == kKeepOpenId) {
+            keepOpen_ = !keepOpen_;
+            SetStatus(keepOpen_ ? L"Keep panel open on."
+                                : L"Keep panel open off.");
+            FlowState_SaveSettings();
         }
     }
 
     void OnCommand(int id, int code)
     {
-        if (id == kSearchId && code == EN_CHANGE) { ScheduleRebuild(); return; }
+        if (id == kSearchId && code == EN_CHANGE)
+        {
+            int len = GetWindowTextLengthW(edit_);
+            savedSearch_.assign(static_cast<size_t>(len + 1), L'\0');
+            GetWindowTextW(edit_, savedSearch_.data(), len + 1);
+            savedSearch_.resize(static_cast<size_t>(len));
+            ScheduleRebuild();
+            return;
+        }
         if (id == kToolsMenuId) {
             ShowHeaderMenu();
             return;
@@ -3404,7 +3464,7 @@ private:
                 ip->PutMtlToMtlEditor(mb, slot);
             }
 
-            Hide();
+            if (!keepOpen_) Hide();
         }
         else
         {
@@ -3432,7 +3492,7 @@ private:
                 for (int i = 0; i < selectedCount; ++i)
                     if (INode* node = ip->GetSelNode(i)) node->SetMtl(mtl);
             }
-            Hide();
+            if (!keepOpen_) Hide();
         }
 
         theHold.Accept(_T("Assign Material"));
@@ -3906,6 +3966,10 @@ private:
     int   brickDragFrom_ = -1;
     BrickGesture brickGesture_ = BrickGesture::None;
     int   shllRes_       = 256; // SHLL preview resolution
+    bool  persistSearch_ = false; // keep search text across close/reopen
+    bool  keepOpen_      = false; // suppress every auto-close path
+    std::wstring savedSearch_;    // live copy of the search text (raw, un-normalized)
+    std::wstring persistedSearch_; // last query flushed to FlowState.cfg
 };
 
 // ── Internal helpers for unified config (accessible from Exported API below) ──
