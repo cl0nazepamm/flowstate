@@ -3049,12 +3049,16 @@ static void CancelHookDrags() {
     HideDragTip();
 }
 
-// ── Keyboard hook — Tab opens PowerShader when SME focused ──────
+// ── Keyboard hook — Tab toggles PowerShader from SME or the palette ──
 static LRESULT CALLBACK KbHookProc(int nCode, WPARAM wp, LPARAM lp) {
     if (nCode >= 0 && g_enablePowerShader && g_tabShader && g_panel &&
         wp == VK_TAB && !(lp & (1u << 31))) {
-        // Key-down only (bit 31 = 0), ignore repeats (bit 30)
-        if (!(lp & (1u << 30)) && IsMaterialEditorFocused()) {
+        // Key-down only (bit 31 = 0), ignore repeats (bit 30).
+        // The palette answers Tab too, so the same key that opened it also
+        // closes it once it has focus — nothing else in Max can see the key
+        // while the palette is up.
+        if (!(lp & (1u << 30)) &&
+            (IsMaterialEditorFocused() || PowerShader::OwnsFocus())) {
             PostMessage(g_panel, WM_PP_SHADER, 0, 0);
             return 1; // eat the Tab
         }

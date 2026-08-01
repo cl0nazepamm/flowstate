@@ -1717,6 +1717,18 @@ public:
 
     bool IsOpen() const { return wnd_ && IsWindowVisible(wnd_); }
 
+    // True while the palette or any of its controls holds keyboard focus, so
+    // the Tab binding can close what it opened. Without this the hook only
+    // sees SME focus and Tab does nothing once the palette has taken over —
+    // most obvious with Keep panel open, which never yields focus on its own.
+    // A live brick rename keeps Tab inert rather than losing the typed name.
+    bool OwnsFocus() const
+    {
+        if (!IsOpen() || renameEdit_) return false;
+        HWND f = GetFocus();
+        return f && (f == wnd_ || GetAncestor(f, GA_ROOT) == wnd_);
+    }
+
     void ReloadTheme(bool light)
     {
         Theme::Update(light);
@@ -4020,6 +4032,7 @@ bool Init(HINSTANCE, bool lightTheme) { return Palette::Get().Init(lightTheme); 
 void Shutdown()      { Palette::Get().Shutdown(); }
 void Toggle()        { Palette::Get().Toggle(); }
 bool IsOpen()        { return Palette::Get().IsOpen(); }
+bool OwnsFocus()     { return Palette::Get().OwnsFocus(); }
 void ReloadTheme(bool lightTheme) { Palette::Get().ReloadTheme(lightTheme); }
 
 void WritePinsSection(FILE* f)                  { WritePinsSectionImpl(f); }

@@ -10,6 +10,7 @@ namespace PowerShader {
     void Shutdown();
     void Toggle();
     bool IsOpen();
+    bool OwnsFocus();   // palette or one of its controls has keyboard focus
     void ReloadTheme(bool lightTheme);
 
     // Unified config persistence (FlowState.cfg sections)

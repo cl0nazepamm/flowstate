@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.4.1 - 2026-08-01
+
+### Added
+
+- Added a Persistent search toggle to the header menu. The palette reopens with the last query intact and restores it after a 3ds Max restart, with the text pre-selected so typing still replaces it in one keystroke.
+- Added a Keep panel open toggle to the header menu. The palette no longer closes when it loses focus or after assigning a material or map, so you can drop several shaders in a row.
+
+### Changed
+
+- The palette hands 3ds Max its keyboard shortcuts back whenever Max takes focus, and reclaims them on reactivation, so Keep panel open never swallows viewport hotkeys.
+- Both toggles persist through `PSPersistSearch`, `PSKeepOpen`, and `PSSearch` in `FlowState.cfg`. The query is flushed on close rather than on every keystroke.
+
+### Fixed
+
+- Tab now closes the shader palette while the palette itself has focus, instead of only toggling from the Slate Material Editor. Keep panel open made this obvious, since the palette never gives focus back on its own. Renaming a brick still leaves Tab inert so a half-typed name is not lost.
+
+### Compatibility
+
+- Verified Release builds against the 3ds Max 2024, 2025, 2026, and 2027 SDKs.
+
 ## 1.4.0 - 2026-07-31
 
 ### Added
