@@ -36,6 +36,7 @@
 #include <Materials/MtlLib.h>
 #include <stdmat.h>
 #include <bitmap.h>
+#include <IMaterialBrowserEntryInfo.h>
 
 #define POWER_SHADER_NAME _T("Power Shader")
 
@@ -598,6 +599,7 @@ constexpr int kShllRes512Id  = 1014;
 constexpr int kShllRes1024Id = 1015;
 constexpr int kPersistSearchId = 1016;
 constexpr int kKeepOpenId      = 1017;
+constexpr int kForceReloadId   = 1018;
 constexpr int kWindowWidth  = 380;
 constexpr int kWindowHeight = 540;   // maximum height; Favorites view shrinks to fit
 constexpr int kHeaderH      = 34;
@@ -1252,6 +1254,127 @@ std::wstring StripOSLVersionSuffix(const std::wstring& value)
     size_t end = value.size();
     while (end > 0 && iswdigit(value[end - 1])) --end;
     return end == value.size() ? value : value.substr(0, end);
+}
+
+// The Slate material/map browser groups entries by the category path each
+// ClassDesc publishes through IMaterialBrowserEntryInfo ("Maps\V-Ray\Utility").
+// Read the same source so the palette shows exactly what the browser shows.
+// Returns the group level after the "Maps"/"Materials" base, or empty when
+// the class doesn't implement the interface.
+std::wstring BrowserEntryCategory(ClassDesc* cd)
+{
+    if (!cd) return {};
+    IMaterialBrowserEntryInfo* info = static_cast<IMaterialBrowserEntryInfo*>(
+        cd->GetInterface(IMATERIAL_BROWSER_ENTRY_INFO_INTERFACE));
+    if (!info) return {};
+    const MCHAR* raw = info->GetEntryCategory();
+    if (!raw || !raw[0]) return {};
+
+    std::vector<std::wstring> segs;
+    std::wstring cur;
+    for (const wchar_t* p = raw; ; ++p) {
+        if (*p == L'\\' || *p == L'\0') {
+            const size_t b = cur.find_first_not_of(L" \t");
+            if (b != std::wstring::npos) {
+                const size_t e = cur.find_last_not_of(L" \t");
+                segs.push_back(cur.substr(b, e - b + 1));
+            }
+            cur.clear();
+            if (*p == L'\0') break;
+        } else {
+            cur.push_back(*p);
+        }
+    }
+    if (segs.empty()) return {};
+    size_t idx = 0;
+    if (segs.size() > 1 && (_wcsicmp(segs[0].c_str(), L"Maps") == 0 ||
+                            _wcsicmp(segs[0].c_str(), L"Materials") == 0))
+        idx = 1;
+    return segs[idx];
+}
+
+// Stock maps predate IMaterialBrowserEntryInfo and still report 1990s
+// category tokens. Translate them to the group names the current material
+// browser shows. ENV without entry info is exactly the legacy scanline
+// reflection quartet (Raytrace, Flat Mirror, Reflect/Refract, Thin Wall) —
+// the browser files those under Scanline. Everything else legacy is General.
+std::wstring LegacyTokenGroup(const std::wstring& cat)
+{
+    if (cat == L"2D" || cat == L"3D" || cat == L"COMP" ||
+        cat == L"COLMOD" || cat == L"Other" || cat == L"TEXMAP_CAT_2D" ||
+        cat == L"CameraMapTexture")
+        return L"General";
+    if (cat == L"ENV") return L"Scanline";
+    return cat;
+}
+
+// The OSL plugin registers every shader class with an "OSL_" internal name
+// (OSL_Composite, OSL_uberBitmap2b). Only these may receive folder-scan
+// categories — matching by display name cross-contaminates native classes
+// (standard Composite vs Composite.osl).
+bool IsOSLShaderClass(const std::wstring& internalName)
+{
+    return internalName.size() > 4 &&
+           _wcsnicmp(internalName.c_str(), L"OSL_", 4) == 0;
+}
+
+// Registered OSL class names come from the shader declaration inside the
+// file, not the filename (ColorCorrect.osl declares "shader
+// UberColorCorrect" → class OSL_UberColorCorrect). Pull the declared name
+// from the file head, skipping comments and string literals.
+std::wstring ParseOSLShaderName(const std::wstring& path)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+    if (h == INVALID_HANDLE_VALUE) return {};
+    char buf[8192];
+    DWORD read = 0;
+    BOOL ok = ReadFile(h, buf, sizeof(buf) - 1, &read, nullptr);
+    CloseHandle(h);
+    if (!ok || read == 0) return {};
+
+    auto isIdentStart = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+    };
+    auto isIdentChar = [&](char c) {
+        return isIdentStart(c) || (c >= '0' && c <= '9');
+    };
+
+    const char* p = buf;
+    const char* end = buf + read;
+    bool wantName = false;
+    while (p < end) {
+        if (*p == '/' && p + 1 < end && p[1] == '/') {
+            while (p < end && *p != '\n') ++p;
+        } else if (*p == '/' && p + 1 < end && p[1] == '*') {
+            p += 2;
+            while (p + 1 < end && !(p[0] == '*' && p[1] == '/')) ++p;
+            if (p + 1 < end) p += 2;
+        } else if (*p == '"') {
+            ++p;
+            while (p < end && *p != '"') {
+                if (*p == '\\' && p + 1 < end) ++p;
+                ++p;
+            }
+            if (p < end) ++p;
+        } else if (isIdentStart(*p)) {
+            const char* s = p;
+            while (p < end && isIdentChar(*p)) ++p;
+            if (wantName) {
+                std::wstring out;
+                out.reserve(static_cast<size_t>(p - s));
+                for (const char* c = s; c < p; ++c)
+                    out.push_back(static_cast<wchar_t>(*c));
+                return out;
+            }
+            if (p - s == 6 && memcmp(s, "shader", 6) == 0)
+                wantName = true;
+        } else {
+            ++p;
+        }
+    }
+    return {};
 }
 
 std::vector<std::wstring> TokenizeQuery(const std::wstring& query)
@@ -2765,6 +2888,8 @@ private:
             kPersistSearchId, L"Persistent search");
         AppendMenuW(popup, MF_STRING | (keepOpen_ ? MF_CHECKED : MF_UNCHECKED),
             kKeepOpenId, L"Keep panel open");
+        AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(popup, MF_STRING, kForceReloadId, L"Force reload list");
 
         const UINT checkedId =
             shllRes_ == 128 ? kShllRes128Id :
@@ -2803,6 +2928,8 @@ private:
             SetStatus(keepOpen_ ? L"Keep panel open on."
                                 : L"Keep panel open off.");
             FlowState_SaveSettings();
+        } else if (command == kForceReloadId) {
+            ForceReloadCaches();
         }
     }
 
@@ -2966,13 +3093,19 @@ private:
                 std::wstring filename(fd.cFileName);
                 size_t dot = filename.rfind(L'.');
                 std::wstring name = (dot != std::wstring::npos) ? filename.substr(0, dot) : filename;
-                std::wstring norm = Normalize(name, false);
-                if (!norm.empty()) {
+
+                auto addKeys = [&](const std::wstring& raw) {
+                    std::wstring norm = Normalize(raw, false);
+                    if (norm.empty()) return;
                     nameToCategory[norm] = category;
                     std::wstring versionless = StripOSLVersionSuffix(norm);
                     if (versionless != norm && nameToCategory.find(versionless) == nameToCategory.end())
                         nameToCategory.emplace(std::move(versionless), category);
-                }
+                };
+                addKeys(name);
+                // Class registration uses the declared shader name, which
+                // differs from the filename for ~15% of stock shaders.
+                addKeys(ParseOSLShaderName(dir + L"\\" + fd.cFileName));
             } while (FindNextFileW(hFind, &fd));
             FindClose(hFind);
         }
@@ -3051,12 +3184,25 @@ private:
 
         if (!oslCategories.empty()) {
             for (auto& item : classItems_) {
-                auto it = oslCategories.find(item.key);
+                if (!IsOSLShaderClass(item.scriptName)) continue;
+
+                // Internal name minus the OSL_ prefix is the .osl filename
+                // stem — a reliable join key where the display label is not
+                // ("Color Correction" vs ColorCorrect.osl).
+                const std::wstring shaderKey =
+                    Normalize(item.scriptName.substr(4), false);
+                auto it = oslCategories.find(shaderKey);
+                if (it == oslCategories.end())
+                    it = oslCategories.find(StripOSLVersionSuffix(shaderKey));
+                if (it == oslCategories.end())
+                    it = oslCategories.find(item.key);
                 if (it == oslCategories.end())
                     it = oslCategories.find(StripOSLVersionSuffix(item.key));
-                if (it == oslCategories.end()) continue;
-                item.category = it->second;
-                item.search = Normalize(item.label + L" " + it->second + L" OSL", true);
+
+                item.category = (it != oslCategories.end()) ? it->second
+                                                            : L"OSL";
+                item.search = Normalize(item.label + L" " + item.scriptName +
+                                        L" " + item.category + L" OSL", true);
             }
             std::sort(classItems_.begin(), classItems_.end(),
                 [](const Item& a, const Item& b) {
@@ -3071,6 +3217,24 @@ private:
         if (wnd_ && IsWindowVisible(wnd_) && !IsSceneOnly()) {
             Rebuild(true);
         }
+    }
+
+    // Header-menu "Force reload list": drop every cache and re-parse the
+    // class directory, OSL folders, and scene materials without a Max
+    // restart. Note: Max itself only registers new OSL shader classes at
+    // startup — this picks up newly loaded plugins, category/folder changes,
+    // and edited metadata of already-registered classes.
+    void ForceReloadCaches()
+    {
+        classCacheReady_ = classCacheBuilding_ = false;
+        oslCategoryReady_ = oslCategoryBuilding_ = false;
+        sceneCacheReady_ = false;
+        EnsureClassCache();
+        EnsureOSLCategories();
+        if (IsSceneOnly()) RefreshSceneCache();
+        Rebuild(true);
+        SetStatus(L"Reloaded " + std::to_wstring(classItems_.size()) +
+                  L" shaders & maps.");
     }
 
     void CollectSceneItem(MtlBase* m, std::set<MtlBase*>& visited)
@@ -3152,11 +3316,107 @@ private:
             const MCHAR* className    = cd->ClassName();
             const MCHAR* internalName = cd->InternalName();
             const MCHAR* categoryName = cd->Category();
-            std::wstring name = (nonLocalized && nonLocalized[0])
-                ? std::wstring(nonLocalized)
-                : std::wstring(className ? className : L"");
-            if (name.empty() && internalName && internalName[0])
-                name = std::wstring(internalName);
+
+            // The SME "None" slot placeholders (NoMaterial / NoTexture)
+            // register as public classes named "None" but are not creatable
+            // — hide them like the browser does.
+            if (internalName &&
+                (_wcsicmp(internalName, L"NoMaterial") == 0 ||
+                 _wcsicmp(internalName, L"NoTexture") == 0))
+                continue;
+
+            // Category priority: what the material browser shows, then the
+            // raw ClassDesc category, then the class directory's category —
+            // stock compound materials return an empty string from the live
+            // ClassDesc while the directory still says "standard".
+            std::wstring category = BrowserEntryCategory(cd);
+            if (category.empty() && categoryName && categoryName[0])
+                category = categoryName;
+            if (category.empty())
+                category = std::wstring(ce.Category().data());
+            category = LegacyTokenGroup(category);
+
+            // Identity keys for the special-case rules below. Old core
+            // classes may have an empty InternalName, so vet every name
+            // the class publishes.
+            const std::wstring idKeys[] = {
+                Normalize(internalName ? internalName : L"", false),
+                Normalize(nonLocalized ? nonLocalized : L"", false),
+                Normalize(className ? className : L"", false),
+            };
+            auto hasId = [&](const wchar_t* id) {
+                for (const std::wstring& k : idKeys)
+                    if (!k.empty() && k == id) return true;
+                return false;
+            };
+            auto hasIdPrefix = [&](const wchar_t* prefix, size_t n) {
+                for (const std::wstring& k : idKeys)
+                    if (k.size() >= n && k.compare(0, n, prefix) == 0)
+                        return true;
+                return false;
+            };
+
+            if (sid == MATERIAL_CLASS_ID) {
+                // Stock materials predate IMaterialBrowserEntryInfo and
+                // carry meaningless tokens ("standard", "Material",
+                // "Physical"). File them where the browser does: the legacy
+                // scanline quartet under Scanline, the rest under General.
+                if (hasId(L"standardmaterial") || hasId(L"standard") ||
+                    hasId(L"raytracematerial") || hasId(L"raytrace") ||
+                    hasId(L"architectural") ||
+                    hasId(L"advancedlightingoverride") ||
+                    hasId(L"advlightingoverride")) {
+                    category = L"Scanline";
+                } else {
+                    const std::wstring catKey = Normalize(category, false);
+                    if (catKey.empty() || catKey == L"standard" ||
+                        catKey == L"material" || catKey == L"materials" ||
+                        catKey == L"physical" || catKey == L"openpbr")
+                        category = L"General";
+                }
+            }
+
+            // V-Ray publishes no browser grouping and its ClassDesc tokens
+            // are junk ("standard") — group by vendor like the browser's
+            // V-Ray rollout does.
+            if (hasIdPrefix(L"vray", 4))
+                category = L"V-Ray";
+
+            // The generic OSL Map host belongs with the OSL shaders, not in
+            // its native "Autodesk" bucket.
+            if (internalName && _wcsicmp(internalName, L"OSLMap") == 0)
+                category = L"OSL";
+
+            // A class's display name is never its category string. iToo's
+            // live ClassDesc returns "Itoo Software" from BOTH name virtuals
+            // once the DLL is loaded, while the class directory still holds
+            // the real registration-time names ("Forest Color") — walk the
+            // candidates and take the first that isn't a category.
+            const std::wstring catKeys[] = {
+                Normalize(categoryName ? categoryName : L"", false),
+                Normalize(ce.Category().data(), false),
+                Normalize(category, false),
+            };
+            auto looksLikeCategory = [&](const std::wstring& normed) {
+                if (normed.empty()) return true;
+                for (const std::wstring& ck : catKeys)
+                    if (!ck.empty() && normed == ck) return true;
+                return false;
+            };
+            const MCHAR* candidates[] = {
+                nonLocalized, className,
+                ce.NonLocalizedClassName().data(), ce.ClassName().data(),
+                internalName,
+            };
+            std::wstring name;
+            for (const MCHAR* cand : candidates)
+                if (cand && cand[0] && !looksLikeCategory(Normalize(cand, false)))
+                    { name = cand; break; }
+            if (name.empty())
+                name = (nonLocalized && nonLocalized[0]) ? nonLocalized
+                     : (className && className[0])       ? className
+                     : (internalName ? internalName : L"");
+
             std::wstring key = Normalize(name, false);
             if (key.empty()) continue;
             Item item;
@@ -3166,15 +3426,14 @@ private:
                 name + L" " +
                 std::wstring(className ? className : L"") + L" " +
                 std::wstring(internalName ? internalName : L"") + L" " +
-                std::wstring(categoryName ? categoryName : L""), true);
+                category, true);
             item.key        = key;
             item.favoriteKey = MakeClassFavoriteKey(sid, classId);
             item.scriptName = (internalName && internalName[0])
                 ? std::wstring(internalName) : L"";
             item.scriptKey  = Normalize(item.scriptName, false);
             item.kind       = kind;
-            item.category   = (categoryName && categoryName[0])
-                ? std::wstring(categoryName) : L"";
+            item.category   = category;
             item.classDesc  = cd;
             out.push_back(std::move(item));
         }
