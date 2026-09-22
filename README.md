@@ -2,7 +2,7 @@
 
 <img src="images/flowstate_logo.png" alt="flowstate" width="360">
 
-flowstate 1.3 is a collection of 3ds Max tools for faster parameter editing, shader creation, modifier access, modeling, and mouse-driven viewport workflows.
+flowstate 1.5.1 is a collection of 3ds Max tools for faster parameter editing, shader creation, modifier access, modeling, and mouse-driven viewport workflows.
 
 ## Install
 
@@ -38,6 +38,7 @@ Release packages require both `FlowState.gup` and `flowstate_config.ms`.
 - Right Click on a parameter to pin it
 - Esc cancels and closes
 - Hit the O button in the panel to hide parameters completely
+- Click the percentage button for 75–250% UI scale, scroll over it to adjust, or right-click to reset to 100%. The setting is saved and capped to fit your screen; text and controls redraw at your monitor's DPI.
 
 
 ### Auto Orbit

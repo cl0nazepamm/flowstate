@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.5.1 - Unreleased
+
+### Changed
+
+- Replaced the floating panel's Macro Search button with saved, DPI-aware UI scaling.
+
+### Fixed
+
+- Fixed duplicate-modifier parameter targeting, repeated edits on shared instances, invalid numeric input, and modifier reordering.
+
 ## 1.5.0 - 2026-08-04
 
 ### Added

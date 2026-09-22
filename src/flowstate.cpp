@@ -1,3 +1,11 @@
+// The supported Max versions run on Windows 10+. The SDK still defaults these
+// to Windows 7, which hides the per-monitor DPI APIs from Windows headers.
+#ifndef WINVER
+#define WINVER 0x0A00
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
 #include <max.h>
 #include <gup.h>
 #include <iparamb2.h>
@@ -25,6 +33,9 @@
 #include "normalize_edges/normalize_poly.h"
 #include "modifiers/loop_subdivision/loop_subdivision.h"
 #include <cmath>
+#include <cerrno>
+#include <climits>
+#include <cfloat>
 #include <atomic>
 #include <string>
 #include <vector>
@@ -58,23 +69,52 @@ static const int             kMacroSearchId     = 14;
 
 // ── Config ──────────────────────────────────────────────────────
 static const TCHAR* kWndClass = _T("PowerParamsPanel");
-static const int kPad       = 10;
-static const int kFontPx    = 13;
-static const int kFontHdr   = 15;
-static const int kLineH     = 24;
-static const int kHeaderH   = 42;
-static const int kGroupGap  = 6;
-static const int kEditW     = 96;
-static const int kEditH     = 22;
+static int g_panelScalePercent = 100;
+static int g_uiScalePercent = 100;
+static UINT g_panelDpi = USER_DEFAULT_SCREEN_DPI;
+static const int kMinPanelScale = 75;
+static const int kMaxPanelScale = 250;
+
+static int UiPx(int dip) {
+    return MulDiv(dip, (int)g_panelDpi * g_uiScalePercent, 9600);
+}
+
+// Only our windows opt into per-monitor DPI. Never change Max's process DPI mode.
+class PanelDpiScope {
+    DPI_AWARENESS_CONTEXT previous_;
+public:
+    PanelDpiScope() : previous_(SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {}
+    ~PanelDpiScope() { if (previous_) SetThreadDpiAwarenessContext(previous_); }
+};
+
+static int kPad       = 10;
+static int kLineH     = 24;
+static int kGroupGap  = 6;
+static int kEditW     = 96;
+static int kEditH     = 22;
 static const int kMaxParams = 50;
-static const int kMinW      = 320;
+static int kMinW      = 320;
 static const UINT_PTR kPB1FallbackTimerId = 0x4653;
 static const UINT kPB1FallbackMs = 2000;
-static const int kBtnW      = 30;    // side button width
-static const int kBtnH      = 20;    // side button height
-static const int kBtnGap    = 2;     // gap between side buttons
-static const int kSideGap   = 4;     // gap between button strip and panel
-static const int kMaxPanelH = 700;
+static int kBtnW      = 30;    // side button width
+static int kBtnH      = 20;    // side button height
+static int kBtnGap    = 2;     // gap between side buttons
+static int kSideGap   = 4;     // gap between button strip and panel
+static int kMaxPanelH = 700;
+static int kFavLabelH = 11;
+static int kFavCellW  = 72;
+static int kFavCellH  = 37;
+static int kFavGap    = 3;
+
+static void UpdatePanelMetrics() {
+    kPad = UiPx(10);
+    kLineH = UiPx(24); kGroupGap = UiPx(6);
+    kEditW = UiPx(96); kEditH = UiPx(22); kMinW = UiPx(320);
+    kBtnW = UiPx(30); kBtnH = UiPx(20); kBtnGap = UiPx(2);
+    kSideGap = UiPx(4); kMaxPanelH = UiPx(700);
+    kFavLabelH = UiPx(11); kFavCellW = UiPx(72); kFavGap = UiPx(3);
+    kFavCellH = kFavLabelH + kEditH + UiPx(4);
+}
 
 // Theme colors
 static COLORREF kBg        = RGB(215, 218, 222);
@@ -759,6 +799,26 @@ struct EditField {
     int          logY = 0;   // logical Y before scroll
 };
 
+// Old saved keys continue to address the first occurrence. Repeated modifiers
+// need a distinct key for favorites and Mouse4 assignments as well as edits.
+static std::wstring FieldKey(const EditField& ef) {
+    return ef.keyOrdinal > 0 ? ef.key + L"@" + std::to_wstring(ef.keyOrdinal) : ef.key;
+}
+
+static std::wstring DecodeFieldKey(const std::wstring& savedKey, int& ordinal) {
+    ordinal = 0;
+    const size_t at = savedKey.rfind(L'@');
+    if (at == std::wstring::npos || at + 1 == savedKey.size()) return savedKey;
+    const std::wstring suffix = savedKey.substr(at + 1);
+    if (suffix.find_first_not_of(L"0123456789") != std::wstring::npos) return savedKey;
+    wchar_t* end = nullptr;
+    errno = 0;
+    const long value = wcstol(suffix.c_str(), &end, 10);
+    if (errno == ERANGE || *end || value <= 0 || value > INT_MAX) return savedKey;
+    ordinal = (int)value;
+    return savedKey.substr(0, at);
+}
+
 struct ActionBtn {
     std::wstring label;
     FPInterface* iface = nullptr;
@@ -800,8 +860,10 @@ static int      g_modSearchScrollY = 0;
 static bool     g_open       = false;
 static bool     g_hoverClose    = false;
 static RECT     g_closeRect     = {};
-static bool     g_hoverModStack = false;
-static RECT     g_modStackRect  = {};
+static bool     g_hoverScale    = false;
+static RECT     g_scaleRect     = {};
+static bool     g_scaleMenuOpen = false;
+static bool     g_scalingPanel  = false;
 static bool     g_hoverVisBtn   = false;
 static RECT     g_visBtnRect    = {};
 static bool     g_visEditMode   = false;  // visibility edit mode — shows hidden params, click to toggle
@@ -825,6 +887,18 @@ static std::atomic<bool>     g_panelObserversActive { false };
 static LRESULT CALLBACK ModSearchEditProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 static void KillActiveEdit(bool apply);
 static void QueuePanelRefresh(unsigned flags);
+static void BuildLayout(bool preserveEdit = false);
+static bool RefreshPanelScale(UINT dpi);
+
+static void LayoutPanelHeader(int width) {
+    const int h = kEditH, gap = UiPx(4);
+    g_closeRect = { width - kPad - h, kPad, width - kPad, kPad + h };
+    g_scaleRect = { g_closeRect.left - gap - UiPx(54), kPad, g_closeRect.left - gap, kPad + h };
+    g_visBtnRect = { g_scaleRect.left - gap - h, kPad, g_scaleRect.left - gap, kPad + h };
+    if (g_modSearchEdit)
+        SetWindowPos(g_modSearchEdit, nullptr, kPad, kPad,
+            std::max(1, (int)g_visBtnRect.left - gap - kPad), h, SWP_NOZORDER | SWP_NOACTIVATE);
+}
 
 // Modifier search cache
 struct ModCacheEntry { std::wstring label; std::wstring normLabel; std::wstring search; std::wstring internalName; ClassDesc* cd = nullptr; SClass_ID sid = 0; };
@@ -952,21 +1026,7 @@ static void UpdateModSearch() {
         KillActiveEdit(false);
         g_hoverParam = -1;
         g_modSearchScrollY = 0;
-        // Expand panel if too narrow/short for search results
-        RECT wr; GetWindowRect(g_panel, &wr);
-        int pw = wr.right - wr.left;
-        int ph = wr.bottom - wr.top;
-        int needW = std::max(pw, 360);
-        int needH = std::max(ph, 400);
-        if (needW != pw || needH != ph) {
-            SetWindowPos(g_panel, nullptr, 0, 0, needW, needH,
-                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-            if (g_modSearchEdit) {
-                RECT rc2; GetClientRect(g_panel, &rc2);
-                SetWindowPos(g_modSearchEdit, nullptr, kPad, kPad - 1,
-                    rc2.right - kPad * 2 - 62, kFontHdr + 2, SWP_NOZORDER | SWP_NOACTIVATE);
-            }
-        }
+        BuildLayout();
     }
     if (g_modSearch) {
         EnsureModCache();
@@ -1840,12 +1900,14 @@ static void StashXB1() {
 
 // Load slots for the current selection's base class (keys only — resolve at drag time)
 static std::wstring PrettyLabel(const std::wstring& raw, const std::wstring& groupTitle); // forward decl
-static std::wstring LabelFromKey(const std::wstring& key) {
+static std::wstring LabelFromKey(const std::wstring& savedKey) {
+    int ordinal = 0;
+    const std::wstring key = DecodeFieldKey(savedKey, ordinal);
     size_t sep = key.find(L':');
     if (sep == std::wstring::npos) return key;
     std::wstring cls = key.substr(0, sep);
     std::wstring raw = key.substr(sep + 1);
-    return PrettyLabel(raw, cls);
+    return PrettyLabel(raw, cls) + (ordinal > 0 ? L" [" + std::to_wstring(ordinal + 1) + L"]" : L"");
 }
 
 static void SyncXB1ToSelection() {
@@ -1996,6 +2058,12 @@ static std::wstring PropFromKey(const EditField& ef);
 static bool FindParam(INode* node, const std::wstring& key,
                       IParamBlock2*& outPB, ParamID& outID, ParamType2& outType);
 
+// Several selected nodes can share the very same parameter block.
+struct PB2VisitSet {
+    std::map<IParamBlock2*, std::set<ParamID>> visited;
+    bool First(IParamBlock2* pb, ParamID id) { return visited[pb].insert(id).second; }
+};
+
 // PB1 objects (including Rectangle and the other SimpleShape primitives) are
 // reflected through MAXScript.  `$` is a node for one selected object but an
 // ObjectSet for multiple objects, so never use it as the read/schema anchor.
@@ -2025,6 +2093,12 @@ static std::wstring MsPerSelectedPath(const std::wstring& path) {
 static std::wstring MsSameClassFilter(const std::wstring& path) {
     return L" where (try((classof " + MsPerSelectedPath(path) +
         L") == (classof " + MsFirstSelectedPath(path) + L"))catch(false))";
+}
+
+static std::wstring MsUniqueSelectedNodes(const std::wstring& path) {
+    return L"(local nodes=#();local seen=#();for obj in selection" +
+        MsSameClassFilter(path) + L" do (local target=" + MsPerSelectedPath(path) +
+        L";if (findItem seen target)==0 do (append seen target;append nodes obj));nodes)";
 }
 
 static std::wstring MsPB1DragScale(bool coarse, bool fine) {
@@ -2122,7 +2196,8 @@ static HFONT g_tipFont = nullptr;
 static HBRUSH g_tipBg  = nullptr;
 
 static void ShowDragTip(const POINT& pt, const std::wstring& text) {
-    if (!g_tipFont) g_tipFont = CreateFont(-12, 0,0,0, FW_NORMAL, 0,0,0, DEFAULT_CHARSET,
+    PanelDpiScope dpiScope;
+    if (!g_tipFont) g_tipFont = CreateFont(-UiPx(12), 0,0,0, FW_NORMAL, 0,0,0, DEFAULT_CHARSET,
         0,0,CLEARTYPE_QUALITY,0, _T("Segoe UI"));
     if (!g_tipBg) g_tipBg = CreateSolidBrush(RGB(30, 30, 30));
 
@@ -2165,9 +2240,9 @@ static void ShowDragTip(const POINT& pt, const std::wstring& text) {
     SelectObject(hdc, old);
     ReleaseDC(g_dragTip, hdc);
 
-    int w = sz.cx + 8, h = sz.cy + 4;
+    int w = sz.cx + UiPx(8), h = sz.cy + UiPx(4);
     SetWindowTextW(g_dragTip, text.c_str());
-    SetWindowPos(g_dragTip, HWND_TOPMOST, pt.x + 16, pt.y + 16, w, h,
+    SetWindowPos(g_dragTip, HWND_TOPMOST, pt.x + UiPx(16), pt.y + UiPx(16), w, h,
         SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(g_dragTip, nullptr, TRUE);
 }
@@ -2226,6 +2301,7 @@ static void SaveSettings() {
     if (g_showSubObj)         fwprintf(f, L"SubObjToggles=1\n");
     if (!g_tabShader)         fwprintf(f, L"TabShader=0\n");
     if (g_lightTheme)         fwprintf(f, L"LightTheme=1\n");
+    fwprintf(f, L"PanelScale=%d\n", g_panelScalePercent);
     for (auto& [cls, pair] : g_xb1Map) {
         if (pair.vKey.empty() && pair.hKey.empty()) continue;
         fwprintf(f, L"XB1:%s=%s|%s\n", cls.c_str(), pair.vKey.c_str(), pair.hKey.c_str());
@@ -2278,6 +2354,7 @@ static void NormalizeKeymap() {
 }
 
 static void LoadSettings() {
+    g_panelScalePercent = 100;
     g_enablePowerParams = true;
     g_enablePowerShader = true;
     g_enableSideKeys = true;
@@ -2348,6 +2425,14 @@ static void LoadSettings() {
             if (l == L"SubObjToggles=1") g_showSubObj = true;
             if (l == L"TabShader=0")     g_tabShader = false;
             if (l == L"LightTheme=1")    g_lightTheme = true;
+            if (l.compare(0, 11, L"PanelScale=") == 0) {
+                const wchar_t* start = l.c_str() + 11;
+                wchar_t* end = nullptr;
+                errno = 0;
+                long scale = wcstol(start, &end, 10);
+                if (end != start && *end == 0 && errno != ERANGE)
+                    g_panelScalePercent = (int)std::clamp(scale, (long)kMinPanelScale, (long)kMaxPanelScale);
+            }
             if (l.compare(0, 4, L"XB1:") == 0) {
                 size_t eq = l.find(L'=', 4);
                 if (eq != std::wstring::npos) {
@@ -2430,7 +2515,6 @@ static void KillActiveEdit(bool apply);
 static void SpawnEditAt(int paramIdx);
 static int  FindParamAtY(int clickY);
 static LRESULT CALLBACK ModSearchEditProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
-static void BuildLayout();
 static void RefreshPB1ValueCache();
 
 // ── Mouse hook — Mouse5=panel, Mouse4=pin ───────────────────────
@@ -2461,7 +2545,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     MOUSEHOOKSTRUCT* ms = (MOUSEHOOKSTRUCT*)lp;
 
     // Click outside panel = instant close
-    if (g_open && !g_epolyPreview &&
+    if (g_open && !g_epolyPreview && !g_scaleMenuOpen &&
         (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN)) {
         if (ms->hwnd != g_panel && !IsChild(g_panel, ms->hwnd) &&
             ms->hwnd != g_btnLeft && ms->hwnd != g_btnRight &&
@@ -2584,11 +2668,12 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
             if (slot.pb) {
                 // PB2 — resolve and adjust on ALL selected nodes
                 int selCount = ip ? ip->GetSelNodeCount() : 0;
+                PB2VisitSet visited;
                 for (int ni = 0; ni < selCount; ni++) {
                     INode* nd = ip->GetSelNode(ni);
                     if (!nd) continue;
                     IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt = (ParamType2)0;
-                    if (!FindParam(nd, slot.key, pb, pid, pt)) continue;
+                    if (!FindParam(nd, slot.key, pb, pid, pt) || !visited.First(pb, pid)) continue;
                     if (!IsWritableParam(pb, pid)) continue;
                     if (IsFloat(pt)) {
                         float cur = pb->GetFloat(pid, t);
@@ -2618,22 +2703,24 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                 changed = true;
             } else {
                 // PB1 — loop all selected objects via MaxScript
-                size_t sep = slot.key.find(L':');
+                int ordinal = 0;
+                const std::wstring key = DecodeFieldKey(slot.key, ordinal);
+                size_t sep = key.find(L':');
                 if (sep != std::wstring::npos) {
-                    std::wstring prop = slot.key.substr(sep + 1);
+                    std::wstring prop = key.substr(sep + 1);
                     std::wstring objPath = MsPerSelectedPath(slot.msPath);
                     std::wstring script;
                     float displayDelta = 0.0f;
                     if (slot.type == (ParamType2)TYPE_BOOL) {
                         if (!boolToggled) {
-                            script = L"for obj in selection" + MsSameClassFilter(slot.msPath) +
+                            script = L"for obj in " + MsUniqueSelectedNodes(slot.msPath) +
                                 L" do try(local o=" + objPath +
                                 L";setProperty o #" + prop + L" (not (getProperty o #" + prop + L")))catch()";
                             boolToggled = true;
                             displayDelta = slot.displayVal != 0.0f ? -1.0f : 1.0f;
                         }
                     } else if (IsFloat(slot.type)) {
-                        script = L"for obj in selection" + MsSameClassFilter(slot.msPath) +
+                        script = L"for obj in " + MsUniqueSelectedNodes(slot.msPath) +
                             L" do try(local o=" + objPath +
                             L";local v=getProperty o #" + prop +
                             L";setProperty o #" + prop + L" (v+" + std::to_wstring(step) +
@@ -2647,7 +2734,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                         int intStep = delta / 3;
                         if (intStep == 0) intStep = delta > 0 ? 1 : -1;
                         if (shift) intStep *= 10;
-                        script = L"for obj in selection" + MsSameClassFilter(slot.msPath) +
+                        script = L"for obj in " + MsUniqueSelectedNodes(slot.msPath) +
                             L" do try(local o=" + objPath +
                             L";local v=getProperty o #" + prop +
                             L";setProperty o #" + prop + L" (v+" + std::to_wstring(intStep) + L"))catch()";
@@ -2800,9 +2887,9 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                         for (int fi = 0; fi < (int)g_favEdits.size(); fi++) {
                             if (!g_favEdits[fi].hwnd) continue;
                             RECT fr; GetWindowRect(g_favEdits[fi].hwnd, &fr);
-                            fr.top -= 11; // kFavLabelH
+                            fr.top -= kFavLabelH;
                             if (PtInRect(&fr, cp)) {
-                                const std::wstring& fkey = g_favEdits[fi].key;
+                                const std::wstring fkey = FieldKey(g_favEdits[fi]);
                                 const std::wstring& flbl = g_favEdits[fi].label;
                                 SyncXB1ToSelection();
                                 if (g_xb1V.key == fkey) {
@@ -2834,7 +2921,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                             slot.pb = nullptr; slot.spIdx = -1;
                             slot.msPath.clear(); slot.type = (ParamType2)TYPE_FLOAT;
                             for (auto& ge : g_edits) {
-                                if (ge.key == slot.key) {
+                                if (FieldKey(ge) == slot.key) {
                                     slot.pb = ge.pb; slot.pid = ge.id;
                                     slot.type = ge.type; slot.msPath = ge.msPath;
                                     if (!ge.pb && (int)ge.id >= kSpSentinel && (int)ge.id < kSpSentinel + kSpCount)
@@ -2849,10 +2936,13 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                             if (FindParam(nd, slot.key, pb, pid, pt)) {
                                 slot.pb = pb; slot.pid = pid; slot.type = pt;
                             } else {
-                                size_t sep = slot.key.find(L':');
+                                int ordinal = 0;
+                                const std::wstring key = DecodeFieldKey(slot.key, ordinal);
+                                size_t sep = key.find(L':');
                                 if (sep == std::wstring::npos) { slot.Clear(); return; }
-                                std::wstring cls = slot.key.substr(0, sep);
+                                std::wstring cls = key.substr(0, sep);
                                 Object* walk = nd->GetObjectRef();
+                                int stackOffset = 0;
                                 while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
                                     IDerivedObject* dv = static_cast<IDerivedObject*>(walk);
                                     for (int mi = 0; mi < dv->NumModifiers(); mi++) {
@@ -2860,11 +2950,18 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                                         if (!mod) continue;
                                         MSTR mcn; mod->GetClassName(mcn, false);
                                         if (mcn.data() && _wcsicmp(mcn.data(), cls.c_str()) == 0) {
-                                            slot.msPath = L".modifiers[" + std::to_wstring(mi+1) + L"]";
+                                            if (ordinal-- > 0) continue;
+                                            slot.msPath = L".modifiers[" + std::to_wstring(stackOffset + mi + 1) + L"]";
                                             return;
                                         }
                                     }
+                                    stackOffset += dv->NumModifiers();
                                     walk = dv->GetObjRef();
+                                }
+                                MSTR baseClass;
+                                if (walk) walk->GetClassName(baseClass, false);
+                                if (!walk || !baseClass.data() || cls != baseClass.data() || ordinal != 0) {
+                                    slot.Clear(); return;
                                 }
                                 slot.msPath = L".baseObject";
                             }
@@ -2880,9 +2977,11 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
                             } else if (slot.spIdx >= 0) {
                                 slot.displayVal = g_splineVals[slot.spIdx];
                             } else {
-                                size_t sep = slot.key.find(L':');
+                                int ordinal = 0;
+                                const std::wstring key = DecodeFieldKey(slot.key, ordinal);
+                                size_t sep = key.find(L':');
                                 if (sep != std::wstring::npos) {
-                                    std::wstring prop = slot.key.substr(sep + 1);
+                                    std::wstring prop = key.substr(sep + 1);
                                     std::wstring path = MsFirstSelectedPath(slot.msPath);
                                     std::wstring s = L"try((getProperty " + path + L" #" + prop + L") as string)catch(\"0\")";
                                     FPValue r; ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic, TRUE, &r);
@@ -3145,6 +3244,60 @@ static bool TogglePB2BoolSafe(IParamBlock2* pb, ParamID pid, TimeValue t) {
     return true;
 }
 
+struct ParsedParamValue {
+    float real = 0.0f;
+    int integer = 0;
+    std::wstring scriptLiteral;
+};
+
+// Validate the entire entry before opening an undo hold or touching a value.
+// In particular, wcstof/_wtoi alone accept a numeric prefix or turn junk into 0.
+static bool ParseParamText(const TCHAR* text, ParamType2 type, ParsedParamValue& value) {
+    if (!text) return false;
+    std::wstring input(text);
+    const size_t first = input.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring::npos) return false;
+    input = input.substr(first, input.find_last_not_of(L" \t\r\n") - first + 1);
+    if (type == TYPE_BOOL) {
+        if (_wcsicmp(input.c_str(), L"on") == 0 || _wcsicmp(input.c_str(), L"true") == 0 || input == L"1")
+            value.integer = 1;
+        else if (_wcsicmp(input.c_str(), L"off") == 0 || _wcsicmp(input.c_str(), L"false") == 0 || input == L"0")
+            value.integer = 0;
+        else return false;
+        value.scriptLiteral = value.integer ? L"true" : L"false";
+        return true;
+    }
+
+    wchar_t* end = nullptr;
+    errno = 0;
+    if (IsFloat(type)) {
+        // Limit entries to decimal notation, including scientific notation.
+        if (input.find_first_not_of(L"0123456789+-.eE") != std::wstring::npos) return false;
+        const double parsed = wcstod(input.c_str(), &end);
+        if (end == input.c_str() || *end || errno == ERANGE ||
+            !_finite(parsed) || parsed < -FLT_MAX || parsed > FLT_MAX) return false;
+        value.real = (float)parsed;
+        if (parsed != 0.0 && value.real == 0.0f) return false;
+        wchar_t literal[64];
+        swprintf(literal, 64, L"%.9g", value.real);
+        value.scriptLiteral = literal;
+    } else if (IsInt(type)) {
+        const long long parsed = wcstoll(input.c_str(), &end, 10);
+        if (end == input.c_str() || *end || errno == ERANGE || parsed < INT_MIN || parsed > INT_MAX)
+            return false;
+        value.integer = (int)parsed;
+        value.scriptLiteral = std::to_wstring(value.integer);
+    } else return false;
+    return true;
+}
+
+static bool SetPB2ParsedValue(IParamBlock2* pb, ParamID pid, ParamType2 type,
+                              TimeValue t, const ParsedParamValue& value) {
+    if (IsFloat(type)) return SetPB2FloatSafe(pb, pid, type, t, value.real);
+    if (type == TYPE_BOOL) return SetPB2BoolSafe(pb, pid, t, value.integer);
+    return IsInt(type) && SetPB2IntSafe(pb, pid, type, t, value.integer);
+}
+
 static int GetNextKeyOrdinal(const std::wstring& key) {
     int ord = 0;
     for (const auto& ef : g_edits)
@@ -3187,9 +3340,12 @@ static void AddSplineShapeExtraParams(ReferenceTarget* obj,
     AddScriptedIntParam(groupTitle, L"steps", L"Interpolation", L".baseObject", total);
 }
 
-// Find a param on the current node by its persistent key (ClassName:ParamName)
-static bool FindParam(INode* node, const std::wstring& key,
+// Resolve ClassName:ParamName with an optional @occurrence suffix.
+static bool FindParam(INode* node, const std::wstring& savedKey,
                       IParamBlock2*& outPB, ParamID& outID, ParamType2& outType) {
+    if (!node) return false;
+    int ordinal = 0;
+    const std::wstring key = DecodeFieldKey(savedKey, ordinal);
     size_t sep = key.find(L':');
     if (sep == std::wstring::npos) return false;
     std::wstring wantClass = key.substr(0, sep);
@@ -3199,9 +3355,30 @@ static bool FindParam(INode* node, const std::wstring& key,
         for (int i = 0; i < pb->NumParams(); i++) {
             ParamID pid = pb->IndextoID(i);
             const ParamDef& d = pb->GetParamDef(pid);
+            if ((d.type & TYPE_TAB) || (!IsFloat(d.type) && !IsInt(d.type) && d.type != TYPE_BOOL)) continue;
             if (d.int_name && std::wstring(d.int_name) == wantParam) {
+                if (ordinal-- > 0) continue;
                 outPB = pb; outID = pid; outType = d.type;
                 return true;
+            }
+        }
+        return false;
+    };
+    // Use the same PB2 enumeration order as CollectAllParams, without counting
+    // a block twice when it is exposed through both APIs.
+    auto searchObject = [&](ReferenceTarget* target) -> bool {
+        int blocks = 0;
+        for (int b = 0; b < target->NumParamBlocks(); ++b) {
+            IParamBlock2* pb = target->GetParamBlock(b);
+            if (!pb) continue;
+            ++blocks;
+            if (search(pb)) return true;
+        }
+        if (blocks == 0) {
+            for (int r = 0; r < target->NumRefs(); ++r) {
+                RefTargetHandle ref = target->GetReference(r);
+                if (ref && ref->SuperClassID() == PARAMETER_BLOCK2_CLASS_ID &&
+                    search(static_cast<IParamBlock2*>(ref))) return true;
             }
         }
         return false;
@@ -3214,22 +3391,14 @@ static bool FindParam(INode* node, const std::wstring& key,
             if (!mod) continue;
             MSTR cn; mod->GetClassName(cn, false);
             if (std::wstring(cn.data()) != wantClass) continue;
-            for (int b = 0; b < mod->NumParamBlocks(); b++)
-                if (search(mod->GetParamBlock(b))) return true;
+            if (searchObject(mod)) return true;
         }
         obj = d->GetObjRef();
     }
     if (obj) {
         MSTR cn; obj->GetClassName(cn, false);
         if (std::wstring(cn.data()) == wantClass) {
-            for (int b = 0; b < obj->NumParamBlocks(); b++)
-                if (search(obj->GetParamBlock(b))) return true;
-            // Fallback: scan references for PB2
-            for (int r = 0; r < obj->NumRefs(); r++) {
-                RefTargetHandle ref = obj->GetReference(r);
-                if (ref && ref->SuperClassID() == PARAMETER_BLOCK2_CLASS_ID)
-                    if (search(static_cast<IParamBlock2*>(ref))) return true;
-            }
+            if (searchObject(obj)) return true;
         }
     }
     return false;
@@ -3239,28 +3408,20 @@ static bool FindParam(INode* node, const std::wstring& key,
 // parameter panel.  The EditField stores the first selected node's PB only for
 // display; writing through that cached pointer would otherwise skip the rest
 // of a multi-object selection.
-static bool SetSelectedPB2FromText(const EditField& ef, TimeValue t, const TCHAR* txt) {
+static bool SetSelectedPB2Value(const EditField& ef, TimeValue t, const ParsedParamValue& value) {
     Interface* ip = GetCOREInterface();
     if (!ip) return false;
 
     bool changed = false;
+    PB2VisitSet visited;
     for (int ni = 0; ni < ip->GetSelNodeCount(); ++ni) {
         INode* node = ip->GetSelNode(ni);
         if (!node) continue;
         IParamBlock2* pb = nullptr;
         ParamID pid = 0;
         ParamType2 type = (ParamType2)0;
-        if (!FindParam(node, ef.key, pb, pid, type)) continue;
-
-        if (IsFloat(type))
-            changed |= SetPB2FloatSafe(pb, pid, type, t, (float)_wtof(txt));
-        else if (type == TYPE_BOOL)
-            changed |= SetPB2BoolSafe(pb, pid, t,
-                (_wcsicmp(txt, _T("On")) == 0 ||
-                 _wcsicmp(txt, _T("1")) == 0 ||
-                 _wcsicmp(txt, _T("true")) == 0));
-        else
-            changed |= SetPB2IntSafe(pb, pid, type, t, _wtoi(txt));
+        if (!FindParam(node, FieldKey(ef), pb, pid, type) || !visited.First(pb, pid)) continue;
+        if (type == ef.type) changed |= SetPB2ParsedValue(pb, pid, type, t, value);
     }
     return changed;
 }
@@ -3276,13 +3437,14 @@ static bool AdjustSelectedPB2ByWheel(const EditField& ef, TimeValue t, float ste
     if (intStep == 0) intStep = step > 0 ? 1 : -1;
 
     bool changed = false;
+    PB2VisitSet visited;
     for (int ni = 0; ni < ip->GetSelNodeCount(); ++ni) {
         INode* node = ip->GetSelNode(ni);
         if (!node) continue;
         IParamBlock2* pb = nullptr;
         ParamID pid = 0;
         ParamType2 type = (ParamType2)0;
-        if (!FindParam(node, ef.key, pb, pid, type)) continue;
+        if (!FindParam(node, FieldKey(ef), pb, pid, type) || !visited.First(pb, pid)) continue;
 
         if (IsFloat(type)) {
             float cur = pb->GetFloat(pid, t);
@@ -3317,13 +3479,14 @@ static bool ScrubSelectedPB2(const EditField& ef, TimeValue t, int dx,
     }
 
     bool changed = false;
+    PB2VisitSet visited;
     for (int ni = 0; ni < ip->GetSelNodeCount(); ++ni) {
         INode* node = ip->GetSelNode(ni);
         if (!node) continue;
         IParamBlock2* pb = nullptr;
         ParamID pid = 0;
         ParamType2 type = (ParamType2)0;
-        if (!FindParam(node, ef.key, pb, pid, type)) continue;
+        if (!FindParam(node, FieldKey(ef), pb, pid, type) || !visited.First(pb, pid)) continue;
 
         if (IsFloat(type)) {
             float cur = pb->GetFloat(pid, t);
@@ -3441,14 +3604,16 @@ static void CollectAllParams(ReferenceTarget* obj, const std::wstring& groupTitl
             if (ipM && ipM->GetSelNodeCount() > 0) {
                 INode* nd = ipM->GetSelNode(0);
                 Object* walk = nd ? nd->GetObjectRef() : nullptr;
+                int stackOffset = 0;
                 while (walk && walk->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
                     IDerivedObject* d = static_cast<IDerivedObject*>(walk);
                     for (int mi = 0; mi < d->NumModifiers(); mi++)
                         if (d->GetModifier(mi) == (Modifier*)obj) {
-                            msPath = L".modifiers[" + std::to_wstring(mi + 1) + L"]";
+                            msPath = L".modifiers[" + std::to_wstring(stackOffset + mi + 1) + L"]";
                             break;
                         }
                     if (!msPath.empty()) break;
+                    stackOffset += d->NumModifiers();
                     walk = d->GetObjRef();
                 }
             }
@@ -4047,6 +4212,10 @@ static void NotifyParamChanged() {
 // ── Mod search edit subclass ─────────────────────────────────────
 static LRESULT CALLBACK ModSearchEditProc(HWND h, UINT m, WPARAM w, LPARAM l,
                                           UINT_PTR, DWORD_PTR) {
+    if (m == WM_MOUSEWHEEL) {
+        PostMessage(g_panel, m, w, l);
+        return 0;
+    }
     if (m == WM_KEYDOWN) {
         if (w == VK_RETURN) {
             ApplyModSearchResult();
@@ -4110,10 +4279,16 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN:
         if (wp == VK_RETURN && ef) {
             TCHAR txt[256]; GetWindowText(h, txt, 256);
+            ParsedParamValue value;
+            if (!ParseParamText(txt, ef->type, value)) {
+                MessageBeep(MB_ICONWARNING);
+                SendMessage(h, EM_SETSEL, 0, -1);
+                return 0;
+            }
             if (!ef->pb && (int)ef->id >= kSpSentinel && (int)ef->id < kSpSentinel + kSpCount) {
                 // Spline op favorite — apply via Begin/Move/End
                 int idx = (int)ef->id - kSpSentinel;
-                g_splineVals[idx] = (float)_wtof(txt);
+                g_splineVals[idx] = value.real;
                 Interface* ip = GetCOREInterface();
                 if (ip && ip->GetSelNodeCount() > 0 && g_splineForButtons &&
                     IsSplineShapeActiveForOps(ip->GetSelNode(0), g_splineForButtons) &&
@@ -4136,18 +4311,16 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 TimeValue t = ip ? ip->GetTime() : 0;
                 const bool ownHold = !theHold.Holding();
                 if (ownHold) theHold.Begin();
-                bool changed = SetSelectedPB2FromText(*ef, t, txt);
+                bool changed = SetSelectedPB2Value(*ef, t, value);
                 if (ownHold) {
                     if (changed) theHold.Accept(_T("Set Pinned Parameter"));
                     else theHold.Cancel();
                 }
             } else {
                 std::wstring prop = PropFromKey(*ef);
-                std::wstring val(txt);
-                if (ef->type == (ParamType2)TYPE_BOOL)
-                    val = (_wcsicmp(txt,L"On")==0||_wcsicmp(txt,L"1")==0||_wcsicmp(txt,L"true")==0) ? L"true" : L"false";
+                const std::wstring& val = value.scriptLiteral;
                 std::wstring objPath = MsPerSelectedPath(ef->msPath);
-                std::wstring s = L"for obj in selection" + MsSameClassFilter(ef->msPath) +
+                std::wstring s = L"for obj in " + MsUniqueSelectedNodes(ef->msPath) +
                     L" do try(setProperty (" + objPath +
                     L") #" + prop + L" " + val + L")catch()";
                 const bool ownHold = !theHold.Holding();
@@ -4196,11 +4369,11 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             std::wstring objPath = MsPerSelectedPath(ef->msPath);
             std::wstring script;
             if (ef->type == (ParamType2)TYPE_BOOL) {
-                script = L"for obj in selection" + MsSameClassFilter(ef->msPath) +
+                script = L"for obj in " + MsUniqueSelectedNodes(ef->msPath) +
                     L" do try(local o=" + objPath +
                     L";setProperty o #" + prop + L" (not (getProperty o #" + prop + L")))catch()";
             } else if (IsFloat(ef->type)) {
-                script = L"for obj in selection" + MsSameClassFilter(ef->msPath) +
+                script = L"for obj in " + MsUniqueSelectedNodes(ef->msPath) +
                     L" do try(local o=" + objPath +
                     L";local v=getProperty o #" + prop +
                     L";setProperty o #" + prop + L" (v+" +
@@ -4210,7 +4383,7 @@ static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 int s = (int)step;
                 if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
                 if (s == 0) s = step>0?1:-1;
-                script = L"for obj in selection" + MsSameClassFilter(ef->msPath) +
+                script = L"for obj in " + MsUniqueSelectedNodes(ef->msPath) +
                     L" do try(local o=" + objPath +
                     L";local v=getProperty o #" + prop +
                     L";setProperty o #" + prop + L" (v+" + std::to_wstring(s) + L"))catch()";
@@ -4274,7 +4447,7 @@ static LRESULT CALLBACK ToolTipProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, kAccent);
         HFONT oldF = (HFONT)SelectObject(hdc, g_fontBold);
         TCHAR txt[64]; GetWindowText(hwnd, txt, 64);
-        RECT tr = { 6, 3, rc.right - 6, rc.bottom };
+        RECT tr = { UiPx(6), UiPx(3), rc.right - UiPx(6), rc.bottom };
         DrawText(hdc, txt, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         SelectObject(hdc, oldF);
         SelectObject(hdc, oldB);
@@ -4305,18 +4478,31 @@ static void UpdateToolTip() {
 
     SetWindowText(g_toolTip, name);
     HDC hdc = GetDC(g_toolTip);
-    SelectObject(hdc, g_fontBold);
+    HFONT oldFont = (HFONT)SelectObject(hdc, g_fontBold);
     SIZE sz; GetTextExtentPoint32(hdc, name, (int)_tcslen(name), &sz);
+    SelectObject(hdc, oldFont);
     ReleaseDC(g_toolTip, hdc);
 
     POINT pt; GetCursorPos(&pt);
-    int w = sz.cx + 16, h = sz.cy + 8;
-    SetWindowPos(g_toolTip, HWND_TOPMOST, pt.x + 18, pt.y - 8, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    int w = sz.cx + UiPx(16), h = sz.cy + UiPx(8);
+    SetWindowPos(g_toolTip, HWND_TOPMOST, pt.x + UiPx(18), pt.y - UiPx(8), w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(g_toolTip, nullptr, FALSE);
 }
 
 // ── Paint helper: draw a vertical button column ─────────────────
 // Draw a horizontal button strip
+static int BtnStripColumns(int count, int width) {
+    return std::max(1, std::min(count, (width - UiPx(4) + kBtnGap) / (kBtnW + kBtnGap)));
+}
+
+static RECT BtnStripRect(int index, int count, int width) {
+    const int cols = BtnStripColumns(count, width);
+    const int bw = (width - UiPx(4) - (cols - 1) * kBtnGap) / cols;
+    const int x = UiPx(2) + (index % cols) * (bw + kBtnGap);
+    const int y = UiPx(2) + (index / cols) * (kBtnH + kBtnGap);
+    return { x, y, x + bw, y + kBtnH };
+}
+
 static void DrawBtnStrip(HDC mem, const BtnDef* btns, int count,
                          int activeID, HFONT font, int w, int h) {
     RECT rc = {0, 0, w, h};
@@ -4330,10 +4516,8 @@ static void DrawBtnStrip(HDC mem, const BtnDef* btns, int count,
 
     SetBkMode(mem, TRANSPARENT);
     SelectObject(mem, font);
-    int bw = (w - 4 - (count - 1) * kBtnGap) / count;
     for (int i = 0; i < count; i++) {
-        int bx = 2 + i * (bw + kBtnGap);
-        RECT br = { bx, 2, bx + bw, h - 2 };
+        RECT br = BtnStripRect(i, count, w);
         bool active = (btns[i].id == activeID);
         bool hover  = (btns[i].id == g_hoverBtn);
         COLORREF bg = active ? kBtnAct : hover ? kBtnHov : kBtnBg;
@@ -4345,50 +4529,62 @@ static void DrawBtnStrip(HDC mem, const BtnDef* btns, int count,
 
 // Hit test for horizontal button strip (local coords)
 static int HitBtnStrip(const BtnDef* btns, int count, int stripW, POINT pt) {
-    if (pt.y < 2 || pt.y >= kBtnH + 2) return -1;
-    int bw = (stripW - 4 - (count - 1) * kBtnGap) / count;
     for (int i = 0; i < count; i++) {
-        int bx = 2 + i * (bw + kBtnGap);
-        if (pt.x >= bx && pt.x < bx + bw) return btns[i].id;
+        RECT br = BtnStripRect(i, count, stripW);
+        if (PtInRect(&br, pt)) return btns[i].id;
     }
     return -1;
 }
 
-// Strip dimensions for horizontal layout
-static int BtnStripW(int count) { return 4 + count * (kBtnW + kBtnGap) - kBtnGap; }
-static int BtnStripH() { return kBtnH + 4; }
+static int BtnStripW(int count) { return UiPx(4) + count * (kBtnW + kBtnGap) - kBtnGap; }
+static int BtnStripH(int count, int width) {
+    const int cols = BtnStripColumns(count, width);
+    const int rows = (count + cols - 1) / cols;
+    return UiPx(4) + rows * kBtnH + (rows - 1) * kBtnGap;
+}
 
-// Position button strips relative to the panel
 static bool IsModifyMode() {
     Interface* ip = GetCOREInterface();
     return ip && ip->GetCommandPanelTaskMode() == TASK_MODE_MODIFY;
 }
 
+struct PanelButtonLayout {
+    int leftW = 0, leftH = 0, rightW = 0, rightH = 0, height = 0;
+};
+
+static PanelButtonLayout PanelButtons(int panelW) {
+    PanelButtonLayout layout;
+    if (g_ctx != CTX_NONE && g_showSubObj && IsModifyMode()) {
+        const int count = g_ctx == CTX_EPOLY ? 5 : 3;
+        layout.leftW = std::min(panelW, BtnStripW(count));
+        layout.leftH = BtnStripH(count, layout.leftW);
+    }
+    if (!g_quickMods.empty()) {
+        const int count = (int)g_quickMods.size();
+        layout.rightW = std::min(panelW, BtnStripW(count));
+        layout.rightH = BtnStripH(count, layout.rightW);
+    }
+    layout.height = std::max(layout.leftH, layout.rightH);
+    if (layout.leftW && layout.rightW && layout.leftW + layout.rightW + kSideGap > panelW)
+        layout.height = layout.leftH + kSideGap + layout.rightH;
+    return layout;
+}
+
 static void PositionBtnStrips() {
+    if (!g_panel || !g_open) return;
     RECT pr; GetWindowRect(g_panel, &pr);
-    int sh = BtnStripH();
-    // During fresh open, position only — FadeIn handles showing
-    UINT showFlag = g_freshOpen ? 0 : SWP_SHOWWINDOW;
-
-    // Quick Mods strip (right side)
-    if (!g_quickMods.empty() && g_open) {
-        int rw = BtnStripW((int)g_quickMods.size());
-        SetWindowPos(g_btnRight, HWND_TOPMOST, pr.right - rw, pr.top - sh - kSideGap, rw, sh, SWP_NOACTIVATE | showFlag);
-        if (!g_freshOpen) InvalidateRect(g_btnRight, nullptr, FALSE);
-    } else {
-        if (g_btnRight) ShowWindow(g_btnRight, SW_HIDE);
-    }
-
-    if (!g_panel || !g_open || g_ctx == CTX_NONE || !g_showSubObj || !IsModifyMode()) {
-        if (g_btnLeft) ShowWindow(g_btnLeft, SW_HIDE);
-        return;
-    }
-    int leftCount = (g_ctx == CTX_EPOLY) ? 5 : 3;
-    int lw = BtnStripW(leftCount);
-    int topY = pr.top - sh - kSideGap;
-
-    SetWindowPos(g_btnLeft, HWND_TOPMOST, pr.left, topY, lw, sh, SWP_NOACTIVATE | showFlag);
-    if (!g_freshOpen) InvalidateRect(g_btnLeft, nullptr, FALSE);
+    const auto layout = PanelButtons(pr.right - pr.left);
+    UINT flags = SWP_NOACTIVATE | (g_freshOpen ? 0 : SWP_SHOWWINDOW);
+    if (layout.rightW) {
+        SetWindowPos(g_btnRight, HWND_TOPMOST, pr.right - layout.rightW,
+            pr.top - layout.height - kSideGap, layout.rightW, layout.rightH, flags);
+        InvalidateRect(g_btnRight, nullptr, FALSE);
+    } else if (g_btnRight) ShowWindow(g_btnRight, SW_HIDE);
+    if (layout.leftW) {
+        SetWindowPos(g_btnLeft, HWND_TOPMOST, pr.left, pr.top - layout.leftH - kSideGap,
+            layout.leftW, layout.leftH, flags);
+        InvalidateRect(g_btnLeft, nullptr, FALSE);
+    } else if (g_btnLeft) ShowWindow(g_btnLeft, SW_HIDE);
 }
 
 // ── Paint helper: draw a button row ─────────────────────────────
@@ -4406,12 +4602,12 @@ static void DrawBtnRow(HDC mem, const BtnDef* btns, int count, int x, int y, int
 }
 
 static RECT GroupActionRect(const GroupHeader& gh, int actionIdx, int headerY, int rightEdge) {
-    const int bw = 34;
-    const int gap = 2;
+    const int bw = UiPx(34);
+    const int gap = UiPx(2);
     int totalW = gh.actionCount * bw + std::max(0, gh.actionCount - 1) * gap;
     int left = rightEdge - totalW;
     int x = left + actionIdx * (bw + gap);
-    return { x, headerY + 2, x + bw, headerY + kLineH - 3 };
+    return { x, headerY + UiPx(2), x + bw, headerY + kLineH - UiPx(3) };
 }
 
 static void DrawGroupActions(HDC mem, const GroupHeader& gh, int headerY, int rightEdge) {
@@ -4511,22 +4707,22 @@ static void PaintPanel(HWND hwnd) {
     int x = kPad, rEdge = rc.right - kPad;
 
     // Header
-    int y = kPad + 2;
+    int y = kPad + UiPx(2);
     // Header text is replaced by the search bar EDIT control
 
-    // ModStack button
+    // UI scale selector
     {
-        bool msOpen = ModStack::IsOpen();
-        COLORREF mbg = msOpen ? kAccent : (g_hoverModStack ? kBtnHov : kBtnBg);
-        HBRUSH mb = CreateSolidBrush(mbg); FillRect(mem, &g_modStackRect, mb); DeleteObject(mb);
+        COLORREF mbg = g_hoverScale ? kBtnHov : kBtnBg;
+        HBRUSH mb = CreateSolidBrush(mbg); FillRect(mem, &g_scaleRect, mb); DeleteObject(mb);
         HPEN mp = CreatePen(PS_SOLID, 1, kBorder);
         HPEN mpo = (HPEN)SelectObject(mem, mp);
         SelectObject(mem, GetStockObject(NULL_BRUSH));
-        Rectangle(mem, g_modStackRect.left, g_modStackRect.top, g_modStackRect.right, g_modStackRect.bottom);
+        Rectangle(mem, g_scaleRect.left, g_scaleRect.top, g_scaleRect.right, g_scaleRect.bottom);
         SelectObject(mem, mpo); DeleteObject(mp);
-        SetTextColor(mem, msOpen ? RGB(255,255,255) : kValueClr);
-        RECT mr = g_modStackRect;
-        DrawText(mem, _T("M"), 1, &mr, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        SetTextColor(mem, kValueClr);
+        RECT mr = g_scaleRect;
+        const std::wstring label = std::to_wstring(g_uiScalePercent) + L"%";
+        DrawText(mem, label.c_str(), -1, &mr, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
 
     // Visibility edit button (eye icon)
@@ -4553,9 +4749,9 @@ static void PaintPanel(HWND hwnd) {
     RECT cr = g_closeRect;
     DrawText(mem, _T("\u00D7"), 1, &cr, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 
-    y += kFontHdr + 4;
+    y = g_contentStartY - UiPx(5);
     MoveToEx(mem, x, y, nullptr); LineTo(mem, rEdge, y);
-    y += 4;
+    y += UiPx(4);
 
 
     // Clip to content area
@@ -4577,7 +4773,8 @@ static void PaintPanel(HWND hwnd) {
                 FillRect(mem, &sr, selBr); DeleteObject(selBr);
             }
             SetTextColor(mem, sel ? RGB(255,255,255) : kLabelClr);
-            TextOut(mem, x + 8, sy + 3, mc.label.c_str(), (int)mc.label.size());
+            RECT labelRect = { x + UiPx(8), sy, rEdge, sy + kLineH };
+            DrawText(mem, mc.label.c_str(), -1, &labelRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
             sy += kLineH;
         }
         // Skip normal content
@@ -4606,17 +4803,21 @@ static void PaintPanel(HWND hwnd) {
         std::wstring hdr = (collapsed ? L"\x25B8 " : L"\x25BE ") + gh.title;
         if (isOpGroup) hdr += L"  [\x2717 CANCEL]";
         if (!modEnabled) hdr += L"  [OFF]";
-        TextOut(mem, x, y, hdr.c_str(), (int)hdr.length());
+        int titleRight = rEdge;
+        if (gh.mod) titleRight -= UiPx(16) * 4 + UiPx(1) * 3 + UiPx(4);
+        else if (gh.actionCount > 0) titleRight = GroupActionRect(gh, 0, y, rEdge).left - UiPx(4);
+        RECT titleRect = { x, y, titleRight, y + kLineH };
+        DrawText(mem, hdr.c_str(), -1, &titleRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         DrawGroupActions(mem, gh, y, rEdge);
 
         // Draw [●][▲][▼][×] buttons for modifier groups
         if (gh.mod) {
-            int bw = 16, bh = kLineH - 4;
-            int bx = rEdge - bw * 4 - 3;
-            RECT enR   = { bx,            y + 2, bx + bw,       y + 2 + bh };
-            RECT upR   = { bx + bw + 1,   y + 2, bx + bw*2+1,  y + 2 + bh };
-            RECT dnR   = { bx + bw*2 + 2, y + 2, bx + bw*3+2,  y + 2 + bh };
-            RECT delR  = { bx + bw*3 + 3, y + 2, bx + bw*4+3,  y + 2 + bh };
+            int bw = UiPx(16), gap = UiPx(1), bh = kLineH - UiPx(4);
+            int bx = rEdge - bw * 4 - gap * 3;
+            RECT enR   = { bx,            y + UiPx(2), bx + bw,       y + UiPx(2) + bh };
+            RECT upR   = { bx + bw + gap,   y + UiPx(2), bx + bw*2+gap,  y + UiPx(2) + bh };
+            RECT dnR   = { bx + bw*2 + gap*2, y + UiPx(2), bx + bw*3+gap*2,  y + UiPx(2) + bh };
+            RECT delR  = { bx + bw*3 + gap*3, y + UiPx(2), bx + bw*4+gap*3,  y + UiPx(2) + bh };
 
             HBRUSH bbg = CreateSolidBrush(kBtnBg);
             FillRect(mem, &enR, bbg); FillRect(mem, &upR, bbg); FillRect(mem, &dnR, bbg);
@@ -4642,7 +4843,7 @@ static void PaintPanel(HWND hwnd) {
             int editX = rEdge - kEditW;
             for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++) {
                 auto& ef = g_edits[fi];
-                bool isFav = g_favorites.count(ef.key) > 0;
+                bool isFav = g_favorites.count(FieldKey(ef)) > 0;
                 bool isHover = (fi == g_hoverParam);
                 bool isEditing = (fi == g_editParam && g_editHwnd);
                 bool isHidden = g_visEditMode && g_hidden.count(ef.key) > 0;
@@ -4656,15 +4857,17 @@ static void PaintPanel(HWND hwnd) {
                 if (g_visEditMode) {
                     // Eye icon: open for visible, closed for hidden
                     SetTextColor(mem, isHidden ? RGB(100, 50, 50) : RGB(50, 100, 50));
-                    TextOut(mem, x, y + 3, isHidden ? _T("\u25CB") : _T("\u25C9"), 1);
+                    TextOut(mem, x, y + UiPx(3), isHidden ? _T("\u25CB") : _T("\u25C9"), 1);
                 } else if (isFav) {
-                    SetTextColor(mem, kAccent); TextOut(mem, x, y + 3, _T("\u2605"), 1);
+                    SetTextColor(mem, kAccent); TextOut(mem, x, y + UiPx(3), _T("\u2605"), 1);
                 }
                 SetTextColor(mem, lblClr);
-                TextOut(mem, x + ((g_visEditMode || isFav) ? 14 : 8), y + 3, ef.label.c_str(), (int)ef.label.length());
+                RECT labelRect = { x + UiPx((g_visEditMode || isFav) ? 14 : 8), y,
+                    editX - UiPx(6), y + kLineH };
+                DrawText(mem, ef.label.c_str(), -1, &labelRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
                 // Value box (painted, not a child window)
-                RECT vr = { editX, y + 1, rEdge, y + kEditH + 1 };
+                RECT vr = { editX, y + UiPx(1), rEdge, y + kEditH + UiPx(1) };
                 COLORREF vbg = isHidden ? kBg : (isEditing ? kEditFocus : isHover ? kEditFocus : kEditBg);
                 HBRUSH vb = CreateSolidBrush(vbg); FillRect(mem, &vr, vb); DeleteObject(vb);
                 SelectObject(mem, isHover || isEditing ? penAccent : penBorder);
@@ -4692,11 +4895,11 @@ paint_done:
 
     // Scroll indicator (thin bar on right if scrollable)
     if (g_contentH > g_viewH && g_viewH > 0) {
-        int trackH = rc.bottom - g_contentStartY - 2;
+        int trackH = rc.bottom - g_contentStartY - UiPx(2);
         int thumbH = (g_viewH * trackH) / g_contentH;
-        if (thumbH < 20) thumbH = 20;
+        thumbH = std::min(trackH, std::max(thumbH, UiPx(20)));
         int thumbY = g_contentStartY + (g_scrollY * (trackH - thumbH)) / (g_contentH - g_viewH);
-        RECT thumb = { rc.right - 4, thumbY, rc.right - 1, thumbY + thumbH };
+        RECT thumb = { rc.right - UiPx(4), thumbY, rc.right - 1, thumbY + thumbH };
         HBRUSH tb = CreateSolidBrush(kAccent); FillRect(mem, &thumb, tb); DeleteObject(tb);
     }
 
@@ -4727,11 +4930,18 @@ static void KillActiveEdit(bool apply) {
     if (apply && editParam >= 0 && editParam < (int)g_edits.size()) {
         TCHAR txt[256]; GetWindowText(editHwnd, txt, 256);
         auto& ef = g_edits[editParam];
+        ParsedParamValue value;
+        if (!ParseParamText(txt, ef.type, value)) {
+            MessageBeep(MB_ICONWARNING);
+            DestroyWindow(editHwnd);
+            EnableAccelerators();
+            return;
+        }
         // Spline op values (sentinel-marked IDs)
         if (!ef.pb && (int)ef.id >= kSpSentinel && (int)ef.id < kSpSentinel + kSpCount) {
             int idx = (int)ef.id - kSpSentinel;
             {
-                g_splineVals[idx] = (float)_wtof(txt);
+                g_splineVals[idx] = value.real;
                 // Apply fillet/chamfer/outline
                 Interface* ip = GetCOREInterface();
                 if (ip && ip->GetSelNodeCount() > 0 && g_splineVals[idx] != 0.0f) {
@@ -4760,28 +4970,9 @@ static void KillActiveEdit(bool apply) {
             bool changed = false;
             if (g_epolyOp >= 0) {
                 // EPoly takeover — use cached PB directly (FindParam can't resolve op params)
-                if (IsFloat(ef.type))
-                    changed = SetPB2FloatSafe(ef.pb, ef.id, ef.type, t, (float)_wtof(txt));
-                else if (ef.type == TYPE_BOOL)
-                    changed = SetPB2BoolSafe(ef.pb, ef.id, t,
-                        (_wcsicmp(txt,_T("On"))==0||_wcsicmp(txt,_T("1"))==0||_wcsicmp(txt,_T("true"))==0));
-                else
-                    changed = SetPB2IntSafe(ef.pb, ef.id, ef.type, t, _wtoi(txt));
+                changed = SetPB2ParsedValue(ef.pb, ef.id, ef.type, t, value);
             } else {
-                // Normal params — apply to all selected nodes
-                for (int ni = 0; ni < (ip ? ip->GetSelNodeCount() : 0); ni++) {
-                    INode* nd = ip->GetSelNode(ni);
-                    if (!nd) continue;
-                    IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
-                    if (!FindParam(nd, ef.key, pb, pid, pt2)) continue;
-                    if (IsFloat(pt2))
-                        changed |= SetPB2FloatSafe(pb, pid, pt2, t, (float)_wtof(txt));
-                    else if (pt2 == TYPE_BOOL)
-                        changed |= SetPB2BoolSafe(pb, pid, t,
-                            (_wcsicmp(txt,_T("On"))==0||_wcsicmp(txt,_T("1"))==0||_wcsicmp(txt,_T("true"))==0));
-                    else
-                        changed |= SetPB2IntSafe(pb, pid, pt2, t, _wtoi(txt));
-                }
+                changed = SetSelectedPB2Value(ef, t, value);
             }
             if (ownHold) {
                 if (changed) theHold.Accept(_T("Set Parameter"));
@@ -4792,10 +4983,9 @@ static void KillActiveEdit(bool apply) {
         } else {
             // MaxScript-based params — apply to all selected
             std::wstring prop = PropFromKey(ef);
-            std::wstring val(txt);
-            if (ef.type == (ParamType2)TYPE_BOOL) val = (_wcsicmp(txt,L"On")==0||_wcsicmp(txt,L"1")==0||_wcsicmp(txt,L"true")==0) ? L"true" : L"false";
+            const std::wstring& val = value.scriptLiteral;
             std::wstring objPath = MsPerSelectedPath(ef.msPath);
-            std::wstring script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+            std::wstring script = L"for obj in " + MsUniqueSelectedNodes(ef.msPath) +
                 L" do try(setProperty (" + objPath + L") #" + prop + L" " + val + L")catch()";
             const bool ownHold = !theHold.Holding();
             if (ownHold) theHold.Begin();
@@ -4825,7 +5015,7 @@ static void SpawnEditAt(int paramIdx) {
 
     DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_CENTER;
     g_editHwnd = CreateWindowEx(0, _T("EDIT"), _T(""),
-        style, editX, screenY + 1, kEditW, kEditH,
+        style, editX, screenY + UiPx(1), kEditW, kEditH,
         g_panel, nullptr, hInstance, nullptr);
     SendMessage(g_editHwnd, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
     if (!g_origEdit) g_origEdit = (WNDPROC)GetWindowLongPtr(g_editHwnd, GWLP_WNDPROC);
@@ -4853,99 +5043,141 @@ static int FindParamAtY(int clickY) {
     return -1;
 }
 
-static void BuildLayout() {
+// The same grid calculation is used for edit windows, labels and hit testing.
+static int FavColumns(int width) {
+    return std::max(1, (width - UiPx(8) + kFavGap) / (kFavCellW + kFavGap));
+}
+
+static int FavStripHeight(int width) {
+    if (g_favEdits.empty()) return 0;
+    const int cols = FavColumns(width);
+    const int rows = ((int)g_favEdits.size() + cols - 1) / cols;
+    return UiPx(8) + rows * kFavCellH + (rows - 1) * kFavGap;
+}
+
+// Keep the header, two content rows and the active companions reachable.
+// Use conservative font bounds here; actual rows are measured when fonts change.
+static int MaxPanelScaleForMonitor(UINT dpi) {
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfo(MonitorFromWindow(g_panel, MONITOR_DEFAULTTONEAREST), &mi);
+    const int screenW = mi.rcWork.right - mi.rcWork.left;
+    const int screenH = mi.rcWork.bottom - mi.rcWork.top;
+    for (int scale = kMaxPanelScale; scale > kMinPanelScale; scale -= 25) {
+        auto px = [dpi, scale](int dip) { return (dip * (int)dpi * scale + 9599) / 9600; };
+        const int width = px(320);
+        if (width > screenW) continue;
+        const int favCount = (int)g_favEdits.size();
+        const int favCols = std::max(1, (width - px(8) + px(3)) / (px(72) + px(3)));
+        const int favRows = (favCount + favCols - 1) / favCols;
+        const int favH = favRows ? px(12) + favRows * px(42) + (favRows - 1) * px(3) : 0;
+        const int quickCount = (int)g_quickMods.size();
+        const int quickCols = std::max(1, (width - px(4) + px(2)) / (px(30) + px(2)));
+        const int quickRows = (quickCount + quickCols - 1) / quickCols;
+        int buttonH = quickRows ? px(8) + quickRows * px(22) + (quickRows - 1) * px(2) : 0;
+        if (g_showSubObj && g_ctx != CTX_NONE && IsModifyMode()) buttonH += px(30);
+        if (px(116) + favH + buttonH <= screenH) return scale;
+    }
+    return kMinPanelScale;
+}
+
+static void BuildLayout(bool preserveEdit) {
+    PanelDpiScope dpiScope;
+    const int scaleLimit = MaxPanelScaleForMonitor(g_panelDpi);
+    if (!g_scalingPanel && g_panelScalePercent > scaleLimit) {
+        g_panelScalePercent = scaleLimit;
+        if (RefreshPanelScale(g_panelDpi)) { SaveSettings(); return; }
+    }
     bool isVisible = IsWindowVisible(g_panel) && !g_freshOpen;
     if (isVisible) SendMessage(g_panel, WM_SETREDRAW, FALSE, 0);
+    if (!g_freshOpen) {
+        RECT cur; GetWindowRect(g_panel, &cur);
+        if (cur.right - cur.left > 1) g_panelPos = { cur.left, cur.top };
+    }
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfo(g_freshOpen ? MonitorFromPoint(g_panelPos, MONITOR_DEFAULTTONEAREST) :
+        MonitorFromWindow(g_panel, MONITOR_DEFAULTTONEAREST), &mi);
+    const int screenW = mi.rcWork.right - mi.rcWork.left;
+    const int screenH = mi.rcWork.bottom - mi.rcWork.top;
 
     HDC hdc = GetDC(g_panel);
-    SelectObject(hdc, g_font);
+    HFONT oldFont = (HFONT)SelectObject(hdc, g_font);
     int maxLbl = 0;
     for (auto& ef : g_edits) {
         SIZE sz; GetTextExtentPoint32(hdc, ef.label.c_str(), (int)ef.label.length(), &sz);
-        if (sz.cx > maxLbl) maxLbl = sz.cx;
+        maxLbl = std::max(maxLbl, (int)sz.cx);
     }
     SelectObject(hdc, g_fontBold);
     int maxTitle = 0;
     for (auto& gh : g_groups) {
         std::wstring hdr = L"\u25BE " + gh.title;
         SIZE sz; GetTextExtentPoint32(hdc, hdr.c_str(), (int)hdr.length(), &sz);
-        if (sz.cx > maxTitle) maxTitle = sz.cx;
+        const int buttons = gh.mod ? UiPx(16) * 4 + UiPx(1) * 3 :
+            gh.actionCount * UiPx(36);
+        maxTitle = std::max(maxTitle, (int)sz.cx + buttons + UiPx(8));
     }
-    SIZE hdrSz; GetTextExtentPoint32(hdc, g_nodeName.c_str(), (int)g_nodeName.length(), &hdrSz);
-    if (hdrSz.cx + 30 > maxTitle) maxTitle = hdrSz.cx + 30;
+    SelectObject(hdc, oldFont);
     ReleaseDC(g_panel, hdc);
 
-    int contentW = maxLbl + 36 + kEditW;
-    if (contentW < maxTitle) contentW = maxTitle;
-    int panelW = contentW + kPad * 2 + 8;
-    if (panelW < kMinW) panelW = kMinW;
-    if (panelW > 500) panelW = 500;  // cap to prevent layout breakage
-    int editX = panelW - kPad - kEditW;
+    const int contentW = std::max(maxLbl + UiPx(36) + kEditW, maxTitle);
+    int panelW = std::clamp(contentW + kPad * 2 + UiPx(8), kMinW, UiPx(500));
+    if (g_modSearch) panelW = std::max(panelW, UiPx(360));
+    panelW = std::min(panelW, screenW);
+    LayoutPanelHeader(panelW);
+    g_contentStartY = kPad + kEditH + UiPx(10);
 
-    g_closeRect    = { panelW - kPad - 18, kPad, panelW - kPad, kPad + 18 };
-    g_modStackRect = { panelW - kPad - 18 - 2 - 18, kPad, panelW - kPad - 18 - 2, kPad + 18 };
-    g_visBtnRect   = { panelW - kPad - 18 - 2 - 18 - 2 - 18, kPad, panelW - kPad - 18 - 2 - 18 - 2, kPad + 18 };
-
-    // Fixed header area
-    int y = 2 + kPad + kFontHdr + 4 + 1 + 4;
-    g_contentStartY = y;
-
-    // Content (logical Y, before scroll)
-    int contentY = y;
+    int contentY = g_contentStartY;
     for (size_t gi = 0; gi < g_groups.size(); gi++) {
         contentY += kLineH;
         auto& gh = g_groups[gi];
         bool collapsed = g_collapsed.count(gh.title) > 0;
-        if (!collapsed) {
-            for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++) {
-                g_edits[fi].logY = contentY;
-                contentY += kLineH;
-            }
-        } else {
-            // Mark collapsed params as off-screen so they never hit-test
-            for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++)
-                g_edits[fi].logY = -99999;
+        for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++) {
+            // Collapsed fields must never hit-test.
+            g_edits[fi].logY = collapsed ? -99999 : contentY;
+            if (!collapsed) contentY += kLineH;
         }
         if (gi + 1 < g_groups.size()) contentY += kGroupGap;
     }
     g_contentH = contentY - g_contentStartY;
 
-    // Panel height = header + min(content, max)
-    HMONITOR hMon = MonitorFromWindow(g_panel, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi = { sizeof(mi) }; GetMonitorInfo(hMon, &mi);
-    int screenH = mi.rcWork.bottom - mi.rcWork.top;
-    int maxH = screenH - 40;
-    if (maxH > kMaxPanelH) maxH = kMaxPanelH;
-
-    int panelH = g_contentStartY + g_contentH + kPad;
-    // Clamp to screen — account for panel Y position
-    int availH = mi.rcWork.bottom - g_panelPos.y;
-    if (availH < 120) availH = 120;
-    if (maxH > availH) maxH = availH;
-    if (panelH > maxH) panelH = maxH;
-    if (panelH < 60) panelH = 60;
-    g_viewH = panelH - g_contentStartY - kPad;
-
-    // Clamp scroll
-    int maxScroll = g_contentH - g_viewH;
-    if (maxScroll < 0) maxScroll = 0;
-    if (g_scrollY > maxScroll) g_scrollY = maxScroll;
-    if (g_scrollY < 0) g_scrollY = 0;
-
-    // No child EDIT windows — values are painted in PaintPanel.
-    // A single EDIT spawns on click via SpawnEditAt().
-    KillActiveEdit(false);
-    g_hoverParam = -1;
-
-    // Keep current position if panel was dragged (but not on fresh open)
-    if (!g_freshOpen) {
-        RECT cur; GetWindowRect(g_panel, &cur);
-        if (cur.right - cur.left > 1) { g_panelPos.x = cur.left; g_panelPos.y = cur.top; }
+    // Reserve room for companions, then move the whole panel onto the monitor.
+    const int buttonH = PanelButtons(panelW).height;
+    const int topSpace = buttonH > 0 ? buttonH + kSideGap : 0;
+    const int favH = FavStripHeight(panelW);
+    const int bottomSpace = favH > 0 ? favH + kSideGap : 0;
+    const int maxH = std::max(1, std::min(kMaxPanelH, screenH - topSpace - bottomSpace));
+    int panelH = std::max(UiPx(60), g_contentStartY + g_contentH + kPad);
+    if (g_modSearch) panelH = std::max(panelH, UiPx(400));
+    panelH = std::min(panelH, maxH);
+    g_viewH = std::max(0, panelH - g_contentStartY - kPad);
+    g_scrollY = std::clamp(g_scrollY, 0, std::max(0, g_contentH - g_viewH));
+    if (preserveEdit && g_editHwnd && g_editParam >= 0 && g_editParam < (int)g_edits.size() &&
+        g_viewH >= kLineH) {
+        const int editTop = g_edits[g_editParam].logY - g_contentStartY;
+        if (editTop >= 0) {
+            if (editTop < g_scrollY) g_scrollY = editTop;
+            else if (editTop + kLineH > g_scrollY + g_viewH)
+                g_scrollY = editTop + kLineH - g_viewH;
+        }
     }
+    g_modSearchScrollY = std::clamp(g_modSearchScrollY, 0,
+        std::max(0, std::min(200, (int)g_modSearchResults.size()) * kLineH - g_viewH));
+
+    if (!preserveEdit) KillActiveEdit(false);
+    g_hoverParam = -1;
+    g_panelPos.x = std::clamp((int)g_panelPos.x, (int)mi.rcWork.left, (int)mi.rcWork.right - panelW);
+    const int minY = mi.rcWork.top + topSpace;
+    const int maxY = std::max(minY, (int)mi.rcWork.bottom - panelH - bottomSpace);
+    g_panelPos.y = std::clamp((int)g_panelPos.y, minY, maxY);
 
     UINT swpFlags = SWP_NOACTIVATE;
-    if (!isVisible) swpFlags |= SWP_NOREDRAW;  // don't paint yet — fade handles it
+    if (!isVisible) swpFlags |= SWP_NOREDRAW;
     SetWindowPos(g_panel, HWND_TOPMOST, g_panelPos.x, g_panelPos.y, panelW, panelH, swpFlags);
+    if (g_editHwnd && g_editParam >= 0 && g_editParam < (int)g_edits.size()) {
+        const int y = g_edits[g_editParam].logY - g_scrollY;
+        SetWindowPos(g_editHwnd, nullptr, panelW - kPad - kEditW, y + UiPx(1),
+            kEditW, kEditH, SWP_NOZORDER | SWP_NOACTIVATE);
+        ShowWindow(g_editHwnd, y >= g_contentStartY && y + kEditH <= panelH - kPad ? SW_SHOWNA : SW_HIDE);
+    }
     if (isVisible) {
         SendMessage(g_panel, WM_SETREDRAW, TRUE, 0);
         InvalidateRect(g_panel, nullptr, FALSE);
@@ -4984,6 +5216,7 @@ static int FindGroupAtY(int clickY) {
 // ── Button strip window proc ────────────────────────────────────
 static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     bool isLeft = (hwnd == g_btnLeft);
+    RECT client; GetClientRect(hwnd, &client);
     switch (msg) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -5023,8 +5256,8 @@ static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         if (isLeft) {
             int hit = -1;
-            if (g_ctx == CTX_EPOLY)  hit = HitBtnStrip(kEPolySubObj, 5, BtnStripW(5), pt);
-            if (g_ctx == CTX_SPLINE) hit = HitBtnStrip(kSplineSubObj, 3, BtnStripW(3), pt);
+            if (g_ctx == CTX_EPOLY)  hit = HitBtnStrip(kEPolySubObj, 5, client.right, pt);
+            if (g_ctx == CTX_SPLINE) hit = HitBtnStrip(kSplineSubObj, 3, client.right, pt);
             if (hit >= 0 && IsModifyMode()) {
                 Interface* ip = GetCOREInterface();
                 if (ip) ip->SetSubObjectLevel(ip->GetSubObjectLevel() == hit ? 0 : hit);
@@ -5037,7 +5270,7 @@ static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 int hit = -1;
                 std::vector<BtnDef> qBtns;
                 for (int i = 0; i < count; ++i) qBtns.push_back({g_quickMods[i].shortLabel.c_str(), i});
-                hit = HitBtnStrip(qBtns.data(), count, BtnStripW(count), pt);
+                hit = HitBtnStrip(qBtns.data(), count, client.right, pt);
                 if (hit >= 0 && hit < count) {
                     bool added = AddModifierViaModPanelScript(g_quickMods[hit].internalName, g_quickMods[hit].label);
                     if (added) { GatherParams(); BuildLayout(); }
@@ -5052,14 +5285,14 @@ static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         int hit = -1;
         if (isLeft) {
-            if (g_ctx == CTX_EPOLY)  hit = HitBtnStrip(kEPolySubObj, 5, BtnStripW(5), pt);
-            if (g_ctx == CTX_SPLINE) hit = HitBtnStrip(kSplineSubObj, 3, BtnStripW(3), pt);
+            if (g_ctx == CTX_EPOLY)  hit = HitBtnStrip(kEPolySubObj, 5, client.right, pt);
+            if (g_ctx == CTX_SPLINE) hit = HitBtnStrip(kSplineSubObj, 3, client.right, pt);
         } else {
             int count = (int)g_quickMods.size();
             if (count > 0) {
                 std::vector<BtnDef> qBtns;
                 for (int i = 0; i < count; ++i) qBtns.push_back({g_quickMods[i].shortLabel.c_str(), i});
-                hit = HitBtnStrip(qBtns.data(), count, BtnStripW(count), pt);
+                hit = HitBtnStrip(qBtns.data(), count, client.right, pt);
             }
         }
         if (hit != g_hoverBtn) { g_hoverBtn = hit; InvalidateRect(hwnd, nullptr, FALSE); }
@@ -5081,10 +5314,27 @@ static void DestroyFavEdits() {
     g_favEdits.clear();
 }
 
-static const int kFavLabelH = 11;  // tiny label height
-static const int kFavCellW = 72;   // brick cell width
-static const int kFavCellH = kFavLabelH + kEditH + 4;  // label + edit + gap
-static const int kFavGap   = 3;    // gap between bricks
+static void LayoutFavoriteEdits() {
+    if (!g_favWnd || !g_panel) return;
+    RECT pr; GetWindowRect(g_panel, &pr);
+    const int cols = FavColumns(pr.right - pr.left);
+    for (int i = 0; i < (int)g_favEdits.size(); i++) {
+        auto& ef = g_favEdits[i];
+        const int x = UiPx(4) + (i % cols) * (kFavCellW + kFavGap);
+        const int y = UiPx(4) + (i / cols) * (kFavCellH + kFavGap) + kFavLabelH;
+        if (!ef.hwnd) {
+            ef.hwnd = CreateWindowEx(0, _T("EDIT"), _T(""),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_CENTER,
+                x, y, kFavCellW, kEditH, g_favWnd, nullptr, hInstance, nullptr);
+            if (!g_origEdit) g_origEdit = (WNDPROC)GetWindowLongPtr(ef.hwnd, GWLP_WNDPROC);
+            SetWindowLongPtr(ef.hwnd, GWLP_WNDPROC, (LONG_PTR)FavEditProc);
+            SetProp(ef.hwnd, _T("WF"), (HANDLE)&ef);
+        } else {
+            SetWindowPos(ef.hwnd, nullptr, x, y, kFavCellW, kEditH, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        SendMessage(ef.hwnd, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
+    }
+}
 
 static void BuildFavorites() {
     DestroyFavEdits();
@@ -5096,10 +5346,12 @@ static void BuildFavorites() {
     if (!node) return;
 
     // First pass: collect valid favorites into the vector (no HWND yet)
-    for (auto& key : g_favorites) {
+    for (const auto& savedKey : g_favorites) {
+        int ordinal = 0;
+        const std::wstring key = DecodeFieldKey(savedKey, ordinal);
         if ((int)g_favEdits.size() >= kFavMaxParams) break;
         IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 ptype = (ParamType2)0;
-        if (FindParam(node, key, pb, pid, ptype)) {
+        if (FindParam(node, savedKey, pb, pid, ptype)) {
             if (ptype & TYPE_TAB) continue;
             if (!IsFloat(ptype) && !IsInt(ptype) && ptype != TYPE_BOOL) continue;
             size_t sep = key.find(L':');
@@ -5108,12 +5360,12 @@ static void BuildFavorites() {
             // Try to find a pretty label from g_edits first (already formatted)
             std::wstring label;
             for (auto& ge : g_edits) {
-                if (ge.key == key) { label = ge.label; break; }
+                if (FieldKey(ge) == savedKey) { label = ge.label; break; }
             }
             if (label.empty()) label = PrettyLabel(raw, cls);
             EditField ef;
-            ef.label = label;
-            ef.key = key; ef.pb = pb; ef.id = pid; ef.type = ptype; ef.hwnd = nullptr;
+            ef.label = label + (ordinal > 0 ? L" [" + std::to_wstring(ordinal + 1) + L"]" : L"");
+            ef.key = key; ef.keyOrdinal = ordinal; ef.pb = pb; ef.id = pid; ef.type = ptype; ef.hwnd = nullptr;
             g_favEdits.push_back(std::move(ef));
         } else {
             // Spline op fallback: keys like "SplineShape:Weld"
@@ -5127,7 +5379,7 @@ static void BuildFavorites() {
                         if (prp == kSpLabels[si]) {
                             EditField ef;
                             ef.label = kSpLabels[si];
-                            ef.key = key; ef.pb = nullptr;
+                            ef.key = key; ef.keyOrdinal = ordinal; ef.pb = nullptr;
                             ef.id = (ParamID)(kSpSentinel + si);
                             ef.type = (ParamType2)TYPE_FLOAT; ef.hwnd = nullptr;
                             g_favEdits.push_back(std::move(ef));
@@ -5142,10 +5394,10 @@ static void BuildFavorites() {
             {
                 bool found = false;
                 for (auto& ge : g_edits) {
-                    if (ge.key == key && !ge.pb) {
+                    if (FieldKey(ge) == savedKey && !ge.pb) {
                         EditField ef;
-                        ef.label = ge.label;
-                        ef.key = key; ef.pb = nullptr; ef.id = ge.id;
+                        ef.label = ge.label + (ordinal > 0 ? L" [" + std::to_wstring(ordinal + 1) + L"]" : L"");
+                        ef.key = key; ef.keyOrdinal = ordinal; ef.pb = nullptr; ef.id = ge.id;
                         ef.type = ge.type; ef.hwnd = nullptr;
                         ef.msPath = MsPathSuffix(ge.msPath);
                         g_favEdits.push_back(std::move(ef));
@@ -5169,27 +5421,7 @@ static void BuildFavorites() {
         }
     }
 
-    // Second pass: create edit controls in brick layout (left→right, wrapping)
-    // Compute strip width from panel
-    RECT pr2; GetWindowRect(g_panel, &pr2);
-    int stripW = (int)(pr2.right - pr2.left);
-    if (stripW < 200) stripW = 400;
-    int cols = std::max(1, (stripW - 8) / (kFavCellW + kFavGap));
-
-    for (int i = 0; i < (int)g_favEdits.size(); i++) {
-        auto& ef = g_favEdits[i];
-        int col = i % cols;
-        int row = i / cols;
-        int cx = 4 + col * (kFavCellW + kFavGap);
-        int cy = 4 + row * (kFavCellH + kFavGap) + kFavLabelH;
-        DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_CENTER;
-            ef.hwnd = CreateWindowEx(0, _T("EDIT"), _T(""),
-            style, cx, cy, kFavCellW, kEditH, g_favWnd, nullptr, hInstance, nullptr);
-        SendMessage(ef.hwnd, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
-        if (!g_origEdit) g_origEdit = (WNDPROC)GetWindowLongPtr(ef.hwnd, GWLP_WNDPROC);
-        SetWindowLongPtr(ef.hwnd, GWLP_WNDPROC, (LONG_PTR)FavEditProc);
-        SetProp(ef.hwnd, _T("WF"), (HANDLE)&ef);
-    }
+    LayoutFavoriteEdits();
 
     // Refresh values
     TimeValue t = ip->GetTime();
@@ -5223,11 +5455,9 @@ static void PositionFavStrip() {
 
     RECT pr; GetWindowRect(g_panel, &pr);
     int panelW = (int)(pr.right - pr.left);
-    if (panelW < 200) panelW = 400;
-    int cols = std::max(1, (panelW - 8) / (kFavCellW + kFavGap));
-    int rows = ((int)g_favEdits.size() + cols - 1) / cols;
-    int w = 8 + cols * (kFavCellW + kFavGap);
-    int h = 8 + rows * (kFavCellH + kFavGap);
+    const int w = panelW;
+    const int h = FavStripHeight(panelW);
+    LayoutFavoriteEdits();
     UINT showFlag = g_freshOpen ? 0 : SWP_SHOWWINDOW;
     SetWindowPos(g_favWnd, HWND_TOPMOST,
         pr.left + (panelW - w) / 2, pr.bottom + kSideGap,
@@ -5237,6 +5467,7 @@ static void PositionFavStrip() {
 
 static void RefreshFavoritesStrip() {
     BuildFavorites();
+    if (g_open) BuildLayout(true);
     PositionFavStrip();
     UpdatePB1FallbackTimer();
     if (!g_favWnd) return;
@@ -5287,6 +5518,139 @@ static void CancelPanelValueDrag() {
 
 static HFONT g_fontTiny = nullptr;
 
+static bool RefreshPanelScale(UINT dpi) {
+    if (!g_panel || g_scalingPanel) return false;
+    if (!dpi) dpi = USER_DEFAULT_SCREEN_DPI;
+    PanelDpiScope dpiScope;
+    const int requestedScale = g_panelScalePercent;
+    g_panelScalePercent = std::min(g_panelScalePercent, MaxPanelScaleForMonitor(dpi));
+    if (g_font && g_fontBold && g_fontTiny && g_tipFont &&
+        g_panelDpi == dpi && g_uiScalePercent == g_panelScalePercent) return true;
+    const UINT oldDpi = g_panelDpi;
+    const int oldPercent = g_uiScalePercent;
+    const int oldLineH = kLineH;
+    g_panelDpi = dpi;
+    g_uiScalePercent = g_panelScalePercent;
+
+    // Rasterize TrueType outlines at the final pixel size; never stretch text
+    // or the paint buffer. Negative heights specify the actual character size.
+    auto makeFont = [](int dip, int weight) {
+        return CreateFont(-UiPx(dip), 0, 0, 0, weight, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH, _T("Segoe UI"));
+    };
+    HFONT fonts[] = { makeFont(13, FW_NORMAL), makeFont(15, FW_SEMIBOLD),
+        makeFont(9, FW_NORMAL), makeFont(12, FW_NORMAL) };
+    for (HFONT font : fonts) {
+        if (!font) {
+            for (HFONT created : fonts) if (created) DeleteObject(created);
+            g_panelDpi = oldDpi;
+            g_uiScalePercent = oldPercent;
+            return false;
+        }
+    }
+
+    g_scalingPanel = true;
+    CancelPanelValueDrag();
+    CancelFavDrag();
+    if (g_fade.hwnd == g_panel && (g_fade.fadingIn || g_fade.fadingOut)) {
+        KillTimer(g_panel, kFadeTimerId);
+        g_fade.fadingIn = g_fade.fadingOut = false;
+        FadeSetAlpha(255);
+        if (!g_open) ShowWindow(g_panel, SW_HIDE);
+    }
+    HFONT oldFonts[] = { g_font, g_fontBold, g_fontTiny, g_tipFont };
+    g_font = fonts[0]; g_fontBold = fonts[1]; g_fontTiny = fonts[2]; g_tipFont = fonts[3];
+    UpdatePanelMetrics();
+    // Font hinting rounds ascent/descent independently at fractional scales.
+    // Measure the realized font instead of assuming the requested height fits.
+    HDC fontDC = GetDC(g_panel);
+    HFONT oldFont = (HFONT)SelectObject(fontDC, g_fontBold);
+    TEXTMETRIC tm = {};
+    if (GetTextMetrics(fontDC, &tm)) {
+        kEditH = std::max(kEditH, (int)tm.tmHeight + UiPx(4));
+        kBtnH = std::max(kBtnH, (int)tm.tmHeight + UiPx(2));
+    }
+    SelectObject(fontDC, g_fontTiny);
+    if (GetTextMetrics(fontDC, &tm))
+        kFavLabelH = std::max(kFavLabelH, (int)tm.tmHeight + UiPx(1));
+    SelectObject(fontDC, oldFont);
+    ReleaseDC(g_panel, fontDC);
+    kLineH = std::max(kLineH, kEditH + UiPx(2));
+    kFavCellH = kFavLabelH + kEditH + UiPx(4);
+    g_scrollY = MulDiv(g_scrollY, kLineH, oldLineH);
+    g_modSearchScrollY = MulDiv(g_modSearchScrollY, kLineH, oldLineH);
+    if (g_modSearchEdit) SendMessage(g_modSearchEdit, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
+    if (g_editHwnd) SendMessage(g_editHwnd, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
+    for (auto& ef : g_favEdits)
+        if (ef.hwnd) SendMessage(ef.hwnd, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
+    for (HFONT font : oldFonts) if (font) DeleteObject(font);
+
+    if (g_open) {
+        BuildLayout(true);
+        PositionFavStrip();
+        HWND windows[] = { g_panel, g_btnLeft, g_btnRight, g_favWnd, g_toolTip, g_dragTip };
+        for (HWND window : windows)
+            if (window) RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    }
+    g_scalingPanel = false;
+    if (requestedScale != g_panelScalePercent) SaveSettings();
+    return true;
+}
+
+static void SetPanelScale(int percent) {
+    PanelDpiScope dpiScope;
+    percent = std::clamp(percent, kMinPanelScale, kMaxPanelScale);
+    if (percent == g_panelScalePercent) return;
+    POINT anchor = { (g_scaleRect.left + g_scaleRect.right) / 2, g_scaleRect.top };
+    ClientToScreen(g_panel, &anchor);
+    const int previous = g_panelScalePercent;
+    g_panelScalePercent = percent;
+    if (!RefreshPanelScale(GetDpiForWindow(g_panel))) {
+        g_panelScalePercent = previous;
+        return;
+    }
+    // Keep the control under the pointer for successive wheel adjustments.
+    RECT panel; GetWindowRect(g_panel, &panel);
+    POINT newAnchor = { (g_scaleRect.left + g_scaleRect.right) / 2, g_scaleRect.top };
+    ClientToScreen(g_panel, &newAnchor);
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfo(MonitorFromWindow(g_panel, MONITOR_DEFAULTTONEAREST), &mi);
+    const int x = std::clamp((int)(panel.left + anchor.x - newAnchor.x),
+        (int)mi.rcWork.left, (int)mi.rcWork.right - (int)(panel.right - panel.left));
+    const int y = std::clamp((int)(panel.top + anchor.y - newAnchor.y),
+        (int)mi.rcWork.top, (int)mi.rcWork.bottom - (int)(panel.bottom - panel.top));
+    SetWindowPos(g_panel, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    BuildLayout(true);
+    SaveSettings();
+}
+
+static void ShowScaleMenu() {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenu(menu, MF_STRING | MF_GRAYED, 0, _T("UI scale"));
+    AppendMenu(menu, MF_SEPARATOR, 0, nullptr);
+    const int scaleLimit = MaxPanelScaleForMonitor(g_panelDpi);
+    for (int percent = kMinPanelScale; percent <= kMaxPanelScale; percent += 25) {
+        std::wstring label = std::to_wstring(percent) + L"%";
+        if (percent == 100) label += L" (default)";
+        if (percent > scaleLimit) label += L" (exceeds screen)";
+        AppendMenu(menu, MF_STRING | (percent == g_panelScalePercent ? MF_CHECKED : 0),
+            percent, label.c_str());
+        if (percent > scaleLimit) EnableMenuItem(menu, percent, MF_BYCOMMAND | MF_GRAYED);
+    }
+    POINT pt = { g_scaleRect.left, g_scaleRect.bottom + UiPx(4) };
+    ClientToScreen(g_panel, &pt);
+    g_scaleMenuOpen = true;
+    const int selected = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN,
+        pt.x, pt.y, 0, g_panel, nullptr);
+    g_scaleMenuOpen = false;
+    DestroyMenu(menu);
+    if (selected) SetPanelScale(selected);
+    g_hoverScale = false;
+    InvalidateRect(g_panel, nullptr, FALSE);
+}
+
 static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_PAINT: {
@@ -5308,17 +5672,17 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 
         // Tiny labels — brick layout
         if (!g_fontTiny)
-            g_fontTiny = CreateFont(-9, 0,0,0, FW_NORMAL, 0,0,0, DEFAULT_CHARSET,
+            g_fontTiny = CreateFont(-UiPx(9), 0,0,0, FW_NORMAL, 0,0,0, DEFAULT_CHARSET,
                 0,0, CLEARTYPE_QUALITY, 0, _T("Segoe UI"));
         SetBkMode(mem, TRANSPARENT);
         SelectObject(mem, g_fontTiny);
         SetTextColor(mem, kAccent);
-        int cols = std::max(1, ((int)rc.right - 8) / (kFavCellW + kFavGap));
+        int cols = FavColumns((int)rc.right);
         for (int i = 0; i < (int)g_favEdits.size(); i++) {
             int col = i % cols;
             int row = i / cols;
-            int cx = 4 + col * (kFavCellW + kFavGap);
-            int cy = 4 + row * (kFavCellH + kFavGap);
+            int cx = UiPx(4) + col * (kFavCellW + kFavGap);
+            int cy = UiPx(4) + row * (kFavCellH + kFavGap);
             RECT lr = { cx, cy, cx + kFavCellW, cy + kFavLabelH };
             DrawText(mem, g_favEdits[i].label.c_str(), -1, &lr,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -5349,11 +5713,11 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     case WM_LBUTTONDOWN: {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         RECT rc; GetClientRect(hwnd, &rc);
-        int cols = std::max(1, ((int)rc.right - 8) / (kFavCellW + kFavGap));
+        int cols = FavColumns((int)rc.right);
         for (int i = 0; i < (int)g_favEdits.size(); i++) {
             int col = i % cols, row = i / cols;
-            int cx = 4 + col * (kFavCellW + kFavGap);
-            int cy = 4 + row * (kFavCellH + kFavGap);
+            int cx = UiPx(4) + col * (kFavCellW + kFavGap);
+            int cy = UiPx(4) + row * (kFavCellH + kFavGap);
             RECT lr = { cx, cy, cx + kFavCellW, cy + kFavLabelH };
             if (PtInRect(&lr, pt)) {
                 g_favDragging = true;
@@ -5395,13 +5759,13 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             std::wstring script;
             if (ef.type == (ParamType2)TYPE_BOOL) {
                 if (!g_favBoolToggled) {
-                    script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                    script = L"for obj in " + MsUniqueSelectedNodes(ef.msPath) +
                         L" do try(local o=" + objPath +
                         L";setProperty o #" + prop + L" (not (getProperty o #" + prop + L")))catch()";
                     g_favBoolToggled = true;
                 }
             } else if (IsFloat(ef.type)) {
-                script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                script = L"for obj in " + MsUniqueSelectedNodes(ef.msPath) +
                     L" do try(local o=" + objPath +
                     L";local v=getProperty o #" + prop +
                     L";setProperty o #" + prop + L" (v+" + std::to_wstring((float)dx) +
@@ -5412,7 +5776,7 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 if (intStep != 0) {
                     g_favDragAccum -= intStep * 3;
                     if (shift) intStep *= 10;
-                    script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                    script = L"for obj in " + MsUniqueSelectedNodes(ef.msPath) +
                         L" do try(local o=" + objPath +
                         L";local v=getProperty o #" + prop +
                         L";setProperty o #" + prop + L" (v+" + std::to_wstring(intStep) + L"))catch()";
@@ -5468,11 +5832,11 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         if (!g_favDragging) {
             POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd, &pt);
             RECT rc; GetClientRect(hwnd, &rc);
-            int cols = std::max(1, ((int)rc.right - 8) / (kFavCellW + kFavGap));
+            int cols = FavColumns((int)rc.right);
             for (int i = 0; i < (int)g_favEdits.size(); i++) {
                 int col = i % cols, row = i / cols;
-                int cx = 4 + col * (kFavCellW + kFavGap);
-                int cy = 4 + row * (kFavCellH + kFavGap);
+                int cx = UiPx(4) + col * (kFavCellW + kFavGap);
+                int cy = UiPx(4) + row * (kFavCellH + kFavGap);
                 RECT lr = { cx, cy, cx + kFavCellW, cy + kFavLabelH };
                 if (PtInRect(&lr, pt)) { SetCursor(LoadCursor(nullptr, IDC_SIZEWE)); return TRUE; }
             }
@@ -5518,6 +5882,24 @@ static void ProcessPanelRefresh() {
     if (pending) QueuePanelRefresh(pending);
 }
 
+static void MovePanelModifier(int index, int direction) {
+    if (index < 1 || (direction != -1 && direction != 1)) return;
+    // before: is zero-based from the TOP, unlike the one-based modifiers array.
+    // Insert before removing the old occurrence so its local data can be copied.
+    const int insertBefore = direction < 0 ? index - 2 : index + 1;
+    const int removeIndex = direction < 0 ? index + 1 : index;
+    const std::wstring source = std::to_wstring(index);
+    const std::wstring target = std::to_wstring(index + direction);
+    const std::wstring script =
+        L"undo \"Move Modifier\" on (if selection.count>0 do (local n=selection[1];"
+        L"local count=n.modifiers.count;if " + target + L">=1 and " + target + L"<=count do ("
+        L"local m=n.modifiers[" + source + L"];"
+        L"if (superClassOf m)==(superClassOf n.modifiers[" + target + L"]) do ("
+        L"addModifierWithLocalData n m n " + source + L" before:" + std::to_wstring(insertBefore) + L";"
+        L"if n.modifiers.count==count+1 do deleteModifier n " + std::to_wstring(removeIndex) + L"))))";
+    ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
+}
+
 // ── Window proc ─────────────────────────────────────────────────
 static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -5543,16 +5925,36 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         EndScreenGrab(true);
         return 0;
 
+    case WM_DPICHANGED: {
+        if (!g_panel || g_scalingPanel) return 0;
+        const RECT& suggested = *(const RECT*)lp;
+        g_scalingPanel = true;
+        SetWindowPos(hwnd, nullptr, suggested.left, suggested.top,
+            suggested.right - suggested.left, suggested.bottom - suggested.top,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        g_scalingPanel = false;
+        RefreshPanelScale(HIWORD(wp));
+        if (g_mmDragging) {
+            GetCursorPos(&g_mmStart);
+            GetWindowRect(hwnd, &g_mmPanelRect);
+        }
+        return 0;
+    }
+
     case WM_WINDOWPOSCHANGED: {
         if (g_open) {
+            RECT rc; GetClientRect(hwnd, &rc);
+            LayoutPanelHeader(rc.right);
             PositionBtnStrips(); PositionFavStrip();
-            // Resize search bar to match panel width
-            if (g_modSearchEdit) {
-                RECT rc2; GetClientRect(hwnd, &rc2);
-                SetWindowPos(g_modSearchEdit, nullptr, kPad, kPad - 1,
-                    rc2.right - kPad * 2 - 62, kFontHdr + 2,
-                    SWP_NOZORDER | SWP_NOACTIVATE);
-            }
+        }
+        break;
+    }
+
+    case WM_SETCURSOR: {
+        POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd, &pt);
+        if (PtInRect(&g_scaleRect, pt)) {
+            SetCursor(LoadCursor(nullptr, IDC_HAND));
+            return TRUE;
         }
         break;
     }
@@ -5573,7 +5975,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RefreshFavoritesStrip();
             return 0;
         }
-        if (PtInRect(&g_modStackRect, pt)) { ModStack::Toggle(); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+        if (PtInRect(&g_scaleRect, pt)) { ShowScaleMenu(); return 0; }
 
         // Mod search: click on result = apply
         if (g_modSearch && pt.y >= g_contentStartY) {
@@ -5649,18 +6051,20 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // [●][▲][▼][×] buttons for modifier groups
             if (g_groups[gIdx].mod) {
                 int rEdge2 = pw - kPad;
-                int bw = 16;
-                int bx = rEdge2 - bw * 4 - 3;
+                int bw = UiPx(16), gap = UiPx(1);
+                int bx = rEdge2 - bw * 4 - gap * 3;
                 // Find this modifier's 1-based stack index
                 auto findModIdx = [&](Modifier* mod) -> int {
                     Interface* ip2 = GetCOREInterface();
                     if (!ip2 || ip2->GetSelNodeCount() == 0) return -1;
                     INode* nd = ip2->GetSelNode(0);
                     Object* ob = nd ? nd->GetObjectRef() : nullptr;
+                    int stackOffset = 0;
                     while (ob && ob->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
                         IDerivedObject* dv = static_cast<IDerivedObject*>(ob);
                         for (int mi = 0; mi < dv->NumModifiers(); mi++)
-                            if (dv->GetModifier(mi) == mod) return mi + 1;
+                            if (dv->GetModifier(mi) == mod) return stackOffset + mi + 1;
+                        stackOffset += dv->NumModifiers();
                         ob = dv->GetObjRef();
                     }
                     return -1;
@@ -5679,28 +6083,19 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
-                if (pt.x >= bx + bw + 1 && pt.x < bx + bw*2 + 1) {
+                if (pt.x >= bx + bw + gap && pt.x < bx + bw*2 + gap) {
                     // ▲ Move up
                     int mi = findModIdx(g_groups[gIdx].mod);
                     if (mi > 1) {
-                        // after delete, remaining = cnt-1. target = mi-1 from top.
-                        // before: = remaining - target + 1. If target=1, no before (top).
-                        std::wstring s;
-                        if (mi == 2)
-                            s = L"undo \"Move Up\" on (local m=$.modifiers[2];deleteModifier $ 2;addModifier $ m)";
-                        else
-                            s = L"undo \"Move Up\" on (local m=$.modifiers[" + std::to_wstring(mi) +
-                                L"];deleteModifier $ " + std::to_wstring(mi) +
-                                L";addModifier $ m before:($.modifiers.count-" + std::to_wstring(mi - 2) + L"))";
                         EPolyAccept();
-                        ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
+                        MovePanelModifier(mi, -1);
                         GatherParams(); BuildLayout();
                         RefreshFavoritesStrip();
                         if (auto* ip2 = GetCOREInterface()) ip2->RedrawViews(ip2->GetTime());
                     }
                     return 0;
                 }
-                if (pt.x >= bx + bw*2 + 2 && pt.x < bx + bw*3 + 2) {
+                if (pt.x >= bx + bw*2 + gap*2 && pt.x < bx + bw*3 + gap*2) {
                     // ▼ Move down
                     int mi = findModIdx(g_groups[gIdx].mod);
                     Interface* ip2 = GetCOREInterface();
@@ -5715,20 +6110,15 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         }
                     }
                     if (mi > 0 && mi < total) {
-                        // after delete, add before:remaining_count to go to bottom-relative position
-                        std::wstring s = L"undo \"Move Down\" on (local m=$.modifiers[" +
-                            std::to_wstring(mi) + L"];deleteModifier $ " +
-                            std::to_wstring(mi) + L";addModifier $ m before:($.modifiers.count-" +
-                            std::to_wstring(mi - 1) + L"))";
                         EPolyAccept();
-                        ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
+                        MovePanelModifier(mi, 1);
                         GatherParams(); BuildLayout();
                         RefreshFavoritesStrip();
                         if (ip2) ip2->RedrawViews(ip2->GetTime());
                     }
                     return 0;
                 }
-                if (pt.x >= bx + bw*3 + 3) {
+                if (pt.x >= bx + bw*3 + gap*3) {
                     // × Delete
                     int mi = findModIdx(g_groups[gIdx].mod);
                     if (mi > 0) {
@@ -5771,7 +6161,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SIZE sz; GetTextExtentPoint32(hdc2, hdr.c_str(), (int)hdr.length(), &sz);
                 SelectObject(hdc2, oldF2);
                 ReleaseDC(hwnd, hdc2);
-                if (pt.x <= kPad + sz.cx + 4) {
+                if (pt.x <= kPad + sz.cx + UiPx(4)) {
                     if (collapsed2) g_collapsed.erase(title);
                     else g_collapsed.insert(title);
                     SaveSettings();
@@ -5805,13 +6195,14 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_RBUTTONDOWN: {
-        if (g_modSearch) return 0;
         POINT rpt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        if (PtInRect(&g_scaleRect, rpt)) { SetPanelScale(100); return 0; }
+        if (g_modSearch) return 0;
 
         // Right-click on param → toggle favorite
         int idx = FindParamAtY(rpt.y);
         if (idx >= 0 && idx < (int)g_edits.size()) {
-            const std::wstring& key = g_edits[idx].key;
+            const std::wstring key = FieldKey(g_edits[idx]);
             // Skip keys with empty class prefix (broken)
             if (key.empty() || key[0] == L':') break;
             if (g_favorites.count(key)) g_favorites.erase(key);
@@ -5880,36 +6271,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_lmbDragChanged |= UpdateSplineFakeDrag(
                         ef, dx, shift, ctrl);
                 } else if (ef.pb) {
-                    // PB2 — adjust on all selected nodes
-                    int intStep = 0;
-                    if (IsInt(ef.type)) {
-                        g_lmbDragAccum += dx;
-                        intStep = g_lmbDragAccum / 3;
-                        if (intStep != 0) {
-                            g_lmbDragAccum -= intStep * 3;
-                            if (shift) intStep *= 10;
-                        }
-                    }
-                    for (int ni = 0; ni < selCount; ni++) {
-                        INode* nd = ip->GetSelNode(ni);
-                        if (!nd) continue;
-                        IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
-                        if (!FindParam(nd, ef.key, pb, pid, pt2)) continue;
-                        if (!IsWritableParam(pb, pid)) continue;
-                        if (IsFloat(pt2)) {
-                            float cur = pb->GetFloat(pid, t);
-                            float a = cur < 0 ? -cur : cur;
-                            float sc = a > 0.001f ? a * 0.01f : 0.001f;
-                            if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
-                            g_lmbDragChanged |= SetPB2FloatSafe(pb, pid, pt2, t, cur + (float)dx * sc);
-                        } else if (pt2 == TYPE_BOOL && !g_lmbBoolToggled) {
-                            g_lmbDragChanged |= TogglePB2BoolSafe(pb, pid, t);
-                        } else if (IsInt(pt2) && intStep != 0) {
-                            g_lmbDragChanged |= SetPB2IntSafe(
-                                pb, pid, pt2, t, pb->GetInt(pid, t) + intStep);
-                        }
-                    }
-                    if (ef.type == TYPE_BOOL) g_lmbBoolToggled = true;
+                    g_lmbDragChanged |= ScrubSelectedPB2(
+                        ef, t, dx, g_lmbDragAccum, g_lmbBoolToggled, shift, ctrl);
                 } else if (!ef.msPath.empty()) {
                     // PB1 fallback via MaxScript
                     size_t sep = ef.key.find(L':');
@@ -5919,13 +6282,13 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         std::wstring script;
                         if (ef.type == (ParamType2)TYPE_BOOL) {
                             if (!g_lmbBoolToggled) {
-                                script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                                script = L"for obj in " + MsUniqueSelectedNodes(ef.msPath) +
                                     L" do try(local o=" + objPath +
                                     L";setProperty o #" + prop + L" (not (getProperty o #" + prop + L")))catch()";
                                 g_lmbBoolToggled = true;
                             }
                         } else if (IsFloat(ef.type)) {
-                            script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                            script = L"for obj in " + MsUniqueSelectedNodes(ef.msPath) +
                                 L" do try(local o=" + objPath +
                                 L";local v=getProperty o #" + prop +
                                 L";setProperty o #" + prop + L" (v+" + std::to_wstring((float)dx) +
@@ -5936,7 +6299,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             if (intStep != 0) {
                                 g_lmbDragAccum -= intStep * 3;
                                 if (shift) intStep *= 10;
-                                script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                                script = L"for obj in " + MsUniqueSelectedNodes(ef.msPath) +
                                     L" do try(local o=" + objPath +
                                     L";local v=getProperty o #" + prop +
                                     L";setProperty o #" + prop + L" (v+" + std::to_wstring(intStep) + L"))catch()";
@@ -5968,7 +6331,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     tip += buf;
                 } else if (ef.pb) {
                     IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
-                    if (selCount > 0 && FindParam(ip->GetSelNode(0), ef.key, pb, pid, pt2)) {
+                    if (selCount > 0 && FindParam(ip->GetSelNode(0), FieldKey(ef), pb, pid, pt2)) {
                         if (IsFloat(pt2)) {
                             wchar_t buf[64]; swprintf(buf, 64, L"%.3f", pb->GetFloat(pid, t));
                             tip += buf;
@@ -6001,8 +6364,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         bool over = PtInRect(&g_closeRect, pt) != 0;
         if (over != g_hoverClose) { g_hoverClose = over; InvalidateRect(hwnd, &g_closeRect, FALSE); }
-        bool overMs = PtInRect(&g_modStackRect, pt) != 0;
-        if (overMs != g_hoverModStack) { g_hoverModStack = overMs; InvalidateRect(hwnd, &g_modStackRect, FALSE); }
+        bool overScale = PtInRect(&g_scaleRect, pt) != 0;
+        if (overScale != g_hoverScale) { g_hoverScale = overScale; InvalidateRect(hwnd, &g_scaleRect, FALSE); }
         bool overVis = PtInRect(&g_visBtnRect, pt) != 0;
         if (overVis != g_hoverVisBtn) { g_hoverVisBtn = overVis; InvalidateRect(hwnd, &g_visBtnRect, FALSE); }
         // Track hovered param for highlight + wheel (not during search)
@@ -6017,7 +6380,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_MOUSELEAVE:
         if (g_hoverClose) { g_hoverClose = false; InvalidateRect(hwnd, &g_closeRect, FALSE); }
-        if (g_hoverModStack) { g_hoverModStack = false; InvalidateRect(hwnd, &g_modStackRect, FALSE); }
+        if (g_hoverScale) { g_hoverScale = false; InvalidateRect(hwnd, &g_scaleRect, FALSE); }
         if (g_hoverVisBtn) { g_hoverVisBtn = false; InvalidateRect(hwnd, &g_visBtnRect, FALSE); }
         if (g_hoverParam >= 0) { g_hoverParam = -1; InvalidateRect(hwnd, nullptr, FALSE); }
         return 0;
@@ -6046,6 +6409,16 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
 
     case WM_MOUSEWHEEL: {
+        POINT wheelPt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        ScreenToClient(hwnd, &wheelPt);
+        if (PtInRect(&g_scaleRect, wheelPt)) {
+            static int scaleWheelRemainder = 0;
+            scaleWheelRemainder += GET_WHEEL_DELTA_WPARAM(wp);
+            const int steps = scaleWheelRemainder / WHEEL_DELTA;
+            scaleWheelRemainder %= WHEEL_DELTA;
+            if (steps) SetPanelScale(g_panelScalePercent + steps * 25);
+            return 0;
+        }
         // In search mode, scroll results
         if (g_modSearch) {
             RECT rcS; GetClientRect(hwnd, &rcS);
@@ -6103,28 +6476,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         changed = SetPB2IntSafe(ef.pb, ef.id, ef.type, t, cur + s);
                     }
                 } else {
-                    // Normal params — apply to all selected nodes
-                    for (int ni = 0; ni < ip->GetSelNodeCount(); ni++) {
-                        INode* nd = ip->GetSelNode(ni);
-                        if (!nd) continue;
-                        IParamBlock2* pb = nullptr; ParamID pid = 0; ParamType2 pt2 = (ParamType2)0;
-                        if (!FindParam(nd, ef.key, pb, pid, pt2)) continue;
-                        if (IsFloat(pt2)) {
-                            float cur = pb->GetFloat(pid, t);
-                            float a = cur<0?-cur:cur;
-                            float sc = a>100.f?10.f:a>10.f?1.f:a>1.f?0.1f:0.01f;
-                            if (shift) sc *= 10.0f; if (ctrl) sc *= 0.1f;
-                            changed |= SetPB2FloatSafe(pb, pid, pt2, t, cur + step * sc);
-                        } else if (pt2 == TYPE_BOOL) {
-                            changed |= TogglePB2BoolSafe(pb, pid, t);
-                        } else {
-                            int cur = pb->GetInt(pid, t);
-                            int s = (int)step;
-                            if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
-                            if (s == 0) s = step>0?1:-1;
-                            changed |= SetPB2IntSafe(pb, pid, pt2, t, cur + s);
-                        }
-                    }
+                    changed = AdjustSelectedPB2ByWheel(ef, t, step, shift, ctrl);
                 }
                 if (ownHold) {
                     if (changed) theHold.Accept(_T("Adjust Parameter"));
@@ -6140,12 +6492,12 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (ownHold) theHold.Begin();
                 BOOL ok = FALSE;
                 if (ef.type == (ParamType2)TYPE_BOOL) {
-                    std::wstring script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                    std::wstring script = L"for obj in " + MsUniqueSelectedNodes(ef.msPath) +
                         L" do try(local o=" + objPath +
                         L";setProperty o #" + prop + L" (not (getProperty o #" + prop + L")))catch()";
                     ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
                 } else if (IsFloat(ef.type)) {
-                    std::wstring script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                    std::wstring script = L"for obj in " + MsUniqueSelectedNodes(ef.msPath) +
                         L" do try(local o=" + objPath +
                         L";local v=getProperty o #" + prop +
                         L";setProperty o #" + prop + L" (v+" +
@@ -6158,7 +6510,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     int s = (int)step;
                     if (shift) s *= 10; if (ctrl && s != 0) s = s>0?1:-1;
                     if (s == 0) s = step>0?1:-1;
-                    std::wstring script = L"for obj in selection" + MsSameClassFilter(ef.msPath) +
+                    std::wstring script = L"for obj in " + MsUniqueSelectedNodes(ef.msPath) +
                         L" do try(local o=" + objPath +
                         L";local v=getProperty o #" + prop +
                         L";setProperty o #" + prop + L" (v+" +
@@ -6227,6 +6579,15 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 // ── Open / Close ────────────────────────────────────────────────
 static void OpenPanel() {
+    PanelDpiScope dpiScope;
+    KillTimer(g_panel, kFadeTimerId);
+    g_fade.fadingIn = g_fade.fadingOut = false;
+    ShowWindow(g_panel, SW_HIDE);
+    POINT cursor; GetCursorPos(&cursor);
+    // Move the hidden per-monitor window first so fonts use the cursor monitor's DPI.
+    SetWindowPos(g_panel, nullptr, cursor.x, cursor.y, 1, 1,
+        SWP_NOZORDER | SWP_NOACTIVATE);
+    RefreshPanelScale(GetDpiForWindow(g_panel));
     GatherParams();
 
     // Auto-collapse groups with 10+ params on first encounter
@@ -6245,7 +6606,7 @@ static void OpenPanel() {
     // Offset panel away from cursor when takeover is active so model stays visible
     int ox, oy;
     if (g_epolyOp >= 0) {
-        ox = pt.x + 120;  oy = pt.y - 60;
+        ox = pt.x + UiPx(120);  oy = pt.y - UiPx(60);
     } else {
         ox = pt.x - kMinW / 2;  oy = pt.y;
     }
@@ -6279,10 +6640,10 @@ static void OpenPanel() {
     if (!g_modSearchEdit) {
         RECT rc; GetClientRect(g_panel, &rc);
         int searchX = kPad;
-        int searchW = rc.right - kPad * 2 - 62;
+        int searchW = std::max(1, (int)g_visBtnRect.left - UiPx(4) - kPad);
         g_modSearchEdit = CreateWindowEx(0, _T("EDIT"), _T(""),
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-            searchX, kPad - 1, searchW, kFontHdr + 2,
+            searchX, kPad, searchW, kEditH,
             g_panel, nullptr, hInstance, nullptr);
         SendMessage(g_modSearchEdit, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
         SendMessage(g_modSearchEdit, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search modifiers...");
@@ -6299,6 +6660,7 @@ static void OpenPanel() {
 
 static void ClosePanel() {
     if (!g_open) return;
+    if (g_scaleMenuOpen) EndMenu();
     StopPanelObservers();
     KillTimer(g_panel, kPB1FallbackTimerId);
     if (g_screenGrabState != SCREEN_GRAB_NONE)
@@ -6342,7 +6704,7 @@ static void ClosePanel() {
     if (g_toolTip) ShowWindow(g_toolTip, SW_HIDE);
     g_open = false;
     g_hoverClose = false;
-    g_hoverModStack = false;
+    g_hoverScale = false;
     g_nodeHandle = 0;
     g_nodeName.clear();
     EnableAccelerators();
@@ -6358,6 +6720,7 @@ static void TogglePanel() {
 static void ReloadSettingsLive() {
     const bool sideKeysWereEnabled = g_enableSideKeys;
     LoadSettings();
+    RefreshPanelScale(GetDpiForWindow(g_panel));
 
     if (sideKeysWereEnabled && !g_enableSideKeys) {
         // A live opt-out must not leave an in-progress drag or the currently
@@ -6550,66 +6913,69 @@ public:
     DWORD Start() override {
         LoadSettings();
 
-        WNDCLASSEX wc = {};
-        wc.cbSize = sizeof(wc);
-        wc.lpfnWndProc  = PanelProc;
-        wc.hInstance     = hInstance;
-        wc.lpszClassName = kWndClass;
-        wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
-        RegisterClassEx(&wc);
+        {
+            PanelDpiScope dpiScope;
+            WNDCLASSEX wc = {};
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc  = PanelProc;
+            wc.hInstance     = hInstance;
+            wc.lpszClassName = kWndClass;
+            wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+            RegisterClassEx(&wc);
 
-        g_font     = CreateFont(kFontPx,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,_T("Segoe UI"));
-        g_fontBold = CreateFont(kFontHdr,0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,_T("Segoe UI"));
-        g_brEdit    = CreateSolidBrush(kEditBg);
-        g_brEditFoc = CreateSolidBrush(kEditFocus);
+            g_brEdit    = CreateSolidBrush(kEditBg);
+            g_brEditFoc = CreateSolidBrush(kEditFocus);
 
-        g_panel = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_LAYERED,
-            kWndClass, nullptr, WS_POPUP|WS_CLIPCHILDREN, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
-        SetLayeredWindowAttributes(g_panel, 0, 255, LWA_ALPHA);
+            g_panel = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_LAYERED,
+                kWndClass, nullptr, WS_POPUP|WS_CLIPCHILDREN, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
+            SetLayeredWindowAttributes(g_panel, 0, 255, LWA_ALPHA);
 
-        // Button strip windows (separate floating windows for side buttons)
-        WNDCLASSEX wcB = {};
-        wcB.cbSize = sizeof(wcB);
-        wcB.lpfnWndProc = BtnStripProc;
-        wcB.hInstance = hInstance;
-        wcB.lpszClassName = kBtnStripClass;
-        wcB.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        RegisterClassEx(&wcB);
-        g_btnLeft  = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED,
-            kBtnStripClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
-        SetLayeredWindowAttributes(g_btnLeft, 0, 255, LWA_ALPHA);
-        g_btnRight = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED,
-            kBtnStripClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
-        SetLayeredWindowAttributes(g_btnRight, 0, 255, LWA_ALPHA);
+            // Button strip windows (separate floating windows for side buttons)
+            WNDCLASSEX wcB = {};
+            wcB.cbSize = sizeof(wcB);
+            wcB.lpfnWndProc = BtnStripProc;
+            wcB.hInstance = hInstance;
+            wcB.lpszClassName = kBtnStripClass;
+            wcB.hCursor = LoadCursor(nullptr, IDC_ARROW);
+            RegisterClassEx(&wcB);
+            g_btnLeft  = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED,
+                kBtnStripClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
+            SetLayeredWindowAttributes(g_btnLeft, 0, 255, LWA_ALPHA);
+            g_btnRight = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED,
+                kBtnStripClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
+            SetLayeredWindowAttributes(g_btnRight, 0, 255, LWA_ALPHA);
 
-        // Favorites strip window
-        WNDCLASSEX wcF = {};
-        wcF.cbSize = sizeof(wcF);
-        wcF.lpfnWndProc = FavStripProc;
-        wcF.hInstance = hInstance;
-        wcF.lpszClassName = kFavClass;
-        wcF.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        RegisterClassEx(&wcF);
-        g_favWnd = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED,
-            kFavClass, nullptr, WS_POPUP | WS_CLIPCHILDREN, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
-        SetLayeredWindowAttributes(g_favWnd, 0, 255, LWA_ALPHA);
+            // Favorites strip window
+            WNDCLASSEX wcF = {};
+            wcF.cbSize = sizeof(wcF);
+            wcF.lpfnWndProc = FavStripProc;
+            wcF.hInstance = hInstance;
+            wcF.lpszClassName = kFavClass;
+            wcF.hCursor = LoadCursor(nullptr, IDC_ARROW);
+            RegisterClassEx(&wcF);
+            g_favWnd = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED,
+                kFavClass, nullptr, WS_POPUP | WS_CLIPCHILDREN, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
+            SetLayeredWindowAttributes(g_favWnd, 0, 255, LWA_ALPHA);
 
-        // Tool name tooltip window
-        WNDCLASSEX wc2 = {};
-        wc2.cbSize = sizeof(wc2);
-        wc2.lpfnWndProc = ToolTipProc;
-        wc2.hInstance = hInstance;
-        wc2.lpszClassName = kToolTipClass;
-        wc2.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        RegisterClassEx(&wc2);
-        g_toolTip = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
-            kToolTipClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
+            // Tool name tooltip window
+            WNDCLASSEX wc2 = {};
+            wc2.cbSize = sizeof(wc2);
+            wc2.lpfnWndProc = ToolTipProc;
+            wc2.hInstance = hInstance;
+            wc2.lpszClassName = kToolTipClass;
+            wc2.hCursor = LoadCursor(nullptr, IDC_ARROW);
+            RegisterClassEx(&wc2);
+            g_toolTip = CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
+                kToolTipClass, nullptr, WS_POPUP, 0,0,1,1, nullptr, nullptr, hInstance, nullptr);
 
-        if (!g_panel || !g_btnLeft || !g_btnRight || !g_favWnd || !g_toolTip ||
-            !g_font || !g_fontBold || !g_brEdit || !g_brEditFoc) {
-            Stop();
-            return GUPRESULT_NOKEEP;
-        }
+            const bool fontsReady = RefreshPanelScale(GetDpiForWindow(g_panel));
+            if (!g_panel || !g_btnLeft || !g_btnRight || !g_favWnd || !g_toolTip ||
+                !fontsReady || !g_brEdit || !g_brEditFoc) {
+                Stop();
+                return GUPRESULT_NOKEEP;
+            }
+
+        } // Restore Max's thread DPI context before initializing other tools.
 
         // Constructing the table registers its context; ClassDesc exposes it
         // to Max and Start only binds the callback.
