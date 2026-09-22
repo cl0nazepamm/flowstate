@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.5.1 - Unreleased
+## 1.5.1 - 2026-09-22
 
 ### Changed
 
@@ -8,7 +8,14 @@
 
 ### Fixed
 
-- Fixed duplicate-modifier parameter targeting, repeated edits on shared instances, invalid numeric input, and modifier reordering.
+- Fixed crashes when moving modifiers up or down the stack while preserving modifier local data.
+- Fixed parameter targeting and expand/collapse state for duplicate modifiers.
+- Preserved list scroll position after parameter edits and refreshes.
+- Fixed repeated edits on shared instances and invalid numeric input.
+
+### Compatibility
+
+- Verified Release builds against the 3ds Max 2024, 2025, 2026, and 2027 SDKs.
 
 ## 1.5.0 - 2026-08-04
 

@@ -828,12 +828,17 @@ struct ActionBtn {
 
 struct GroupHeader {
     std::wstring title;
+    std::wstring collapseKey;
     int startIdx = 0;
     int count    = 0;
     int actionStart = 0;
     int actionCount = 0;
     Modifier* mod = nullptr;
 };
+
+static const std::wstring& GroupCollapseKey(const GroupHeader& group) {
+    return group.collapseKey.empty() ? group.title : group.collapseKey;
+}
 
 // ── Globals ─────────────────────────────────────────────────────
 static HWND     g_panel      = nullptr;
@@ -882,6 +887,7 @@ enum PanelRefreshFlags : unsigned {
 static std::atomic<unsigned> g_panelRefreshFlags { 0 };
 static std::atomic<bool>     g_panelRefreshPosted { false };
 static std::atomic<bool>     g_panelObserversActive { false };
+static std::atomic<bool>     g_panelStackEditing { false };
 
 // Forward declarations
 static LRESULT CALLBACK ModSearchEditProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
@@ -1073,6 +1079,7 @@ static std::wstring NormalizePB1DisplayValue(const std::wstring& raw, ParamType2
 static void QueuePanelRefresh(unsigned flags) {
     if (!g_panelObserversActive.load(std::memory_order_acquire) || !g_panel) return;
     g_panelRefreshFlags.fetch_or(flags, std::memory_order_relaxed);
+    if (g_panelStackEditing.load(std::memory_order_acquire)) return;
     bool expected = false;
     if (g_panelRefreshPosted.compare_exchange_strong(expected, true,
             std::memory_order_acq_rel, std::memory_order_relaxed)) {
@@ -2535,7 +2542,7 @@ static bool  s_opacityOwnHold = false;
 static bool  s_uvOwnHold = false;
 
 static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
-    if (nCode < 0) return CallNextHookEx(g_mouseHook, nCode, wp, lp);
+    if (nCode < 0 || g_panelStackEditing) return CallNextHookEx(g_mouseHook, nCode, wp, lp);
 
     // Master opt-out: never consume or act on Mouse4 or Mouse5.
     // The mouse hook remains installed for panel outside-click handling.
@@ -3880,6 +3887,8 @@ static void EPolyCancelDrop() {
 
 // ── Gather params ───────────────────────────────────────────────
 static void GatherParams() {
+    const ULONG previousNodeHandle = g_nodeHandle;
+    const int previousScrollY = g_scrollY;
     g_groups.clear();
     g_edits.clear();
     g_actions.clear();
@@ -3901,6 +3910,10 @@ static void GatherParams() {
     const MCHAR* nn = node->GetName();
     g_nodeName = nn ? nn : L"";
     g_nodeHandle = node->GetHandle();
+    // Parameter commits and notifications rebuild this list. Keep the current
+    // view on the same object; BuildLayout clamps it if the content shrinks.
+    if (g_open && g_nodeHandle == previousNodeHandle)
+        g_scrollY = previousScrollY;
 
     Object* obj = node->GetObjectRef();
     if (!obj) return;
@@ -4024,6 +4037,7 @@ static void GatherParams() {
 
     // ── Full modifier stack — everything, no skipping ───────────
     Object* walkObj = node->GetObjectRef();
+    std::map<std::wstring, int> modifierOccurrences;
     while (walkObj && walkObj->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
         IDerivedObject* d = static_cast<IDerivedObject*>(walkObj);
         for (int m = 0; m < d->NumModifiers(); m++) {
@@ -4033,6 +4047,11 @@ static void GatherParams() {
             MSTR cn; mod->GetClassName(cn, false);
             const MCHAR* p = cn.data();
             gh.title    = (p && p[0]) ? p : L"Modifier";
+            // Preserve the existing saved key for the first occurrence. Later
+            // copies need independent state; the display title stays unchanged.
+            const int occurrence = modifierOccurrences[gh.title]++;
+            gh.collapseKey = occurrence > 0
+                ? gh.title + L"@" + std::to_wstring(occurrence) : gh.title;
             gh.startIdx = (int)g_edits.size();
             gh.mod      = mod;
             int tot = 0;
@@ -4274,6 +4293,7 @@ static LRESULT CALLBACK EditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
 // ── Favorites edit subclass ──────────────────────────────────────
 static LRESULT CALLBACK FavEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_panelStackEditing) return CallWindowProc(g_origEdit, h, msg, wp, lp);
     EditField* ef = (EditField*)GetProp(h, _T("WF"));
     switch (msg) {
     case WM_KEYDOWN:
@@ -4648,7 +4668,7 @@ static int GroupHeaderY(int groupIdx) {
     for (int gi = 0; gi < (int)g_groups.size(); ++gi) {
         if (gi == groupIdx) return y;
         y += kLineH;
-        bool collapsed = g_collapsed.count(g_groups[gi].title) > 0;
+        bool collapsed = g_collapsed.count(GroupCollapseKey(g_groups[gi])) > 0;
         if (!collapsed) y += g_groups[gi].count * kLineH;
         if (gi + 1 < (int)g_groups.size()) y += kGroupGap;
     }
@@ -4786,7 +4806,7 @@ static void PaintPanel(HWND hwnd) {
     HWND focused = GetFocus();
     for (size_t gi = 0; gi < g_groups.size(); gi++) {
         const auto& gh = g_groups[gi];
-        bool collapsed = g_collapsed.count(gh.title) > 0;
+        bool collapsed = g_collapsed.count(GroupCollapseKey(gh)) > 0;
 
         SelectObject(mem, g_fontBold);
         bool isOpGroup = (gi == 0 && g_epolyOp >= 0);
@@ -5129,7 +5149,7 @@ static void BuildLayout(bool preserveEdit) {
     for (size_t gi = 0; gi < g_groups.size(); gi++) {
         contentY += kLineH;
         auto& gh = g_groups[gi];
-        bool collapsed = g_collapsed.count(gh.title) > 0;
+        bool collapsed = g_collapsed.count(GroupCollapseKey(gh)) > 0;
         for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++) {
             // Collapsed fields must never hit-test.
             g_edits[fi].logY = collapsed ? -99999 : contentY;
@@ -5206,7 +5226,7 @@ static int FindGroupAtY(int clickY) {
     for (size_t gi = 0; gi < g_groups.size(); gi++) {
         if (clickY >= y && clickY < y + kLineH) return (int)gi;
         y += kLineH;
-        bool collapsed = g_collapsed.count(g_groups[gi].title) > 0;
+        bool collapsed = g_collapsed.count(GroupCollapseKey(g_groups[gi])) > 0;
         if (!collapsed) y += g_groups[gi].count * kLineH;
         if (gi + 1 < g_groups.size()) y += kGroupGap;
     }
@@ -5215,6 +5235,7 @@ static int FindGroupAtY(int clickY) {
 
 // ── Button strip window proc ────────────────────────────────────
 static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_panelStackEditing) return DefWindowProc(hwnd, msg, wp, lp);
     bool isLeft = (hwnd == g_btnLeft);
     RECT client; GetClientRect(hwnd, &client);
     switch (msg) {
@@ -5652,6 +5673,7 @@ static void ShowScaleMenu() {
 }
 
 static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_panelStackEditing) return DefWindowProc(hwnd, msg, wp, lp);
     switch (msg) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -5848,8 +5870,11 @@ static LRESULT CALLBACK FavStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
 }
 
 static void ProcessPanelRefresh() {
-    const unsigned flags = g_panelRefreshFlags.exchange(0, std::memory_order_acq_rel);
     g_panelRefreshPosted.store(false, std::memory_order_release);
+    // SDK callbacks can pump messages during a stack edit. Keep the pending
+    // flags until the complete stack is ready; never inspect the intermediate one.
+    if (g_panelStackEditing) return;
+    const unsigned flags = g_panelRefreshFlags.exchange(0, std::memory_order_acq_rel);
     if (!flags || !g_open) return;
 
     Interface* ip = GetCOREInterface();
@@ -5882,26 +5907,92 @@ static void ProcessPanelRefresh() {
     if (pending) QueuePanelRefresh(pending);
 }
 
-static void MovePanelModifier(int index, int direction) {
-    if (index < 1 || (direction != -1 && direction != 1)) return;
-    // before: is zero-based from the TOP, unlike the one-based modifiers array.
-    // Insert before removing the old occurrence so its local data can be copied.
-    const int insertBefore = direction < 0 ? index - 2 : index + 1;
-    const int removeIndex = direction < 0 ? index + 1 : index;
-    const std::wstring source = std::to_wstring(index);
-    const std::wstring target = std::to_wstring(index + direction);
-    const std::wstring script =
-        L"undo \"Move Modifier\" on (if selection.count>0 do (local n=selection[1];"
-        L"local count=n.modifiers.count;if " + target + L">=1 and " + target + L"<=count do ("
-        L"local m=n.modifiers[" + source + L"];"
-        L"if (superClassOf m)==(superClassOf n.modifiers[" + target + L"]) do ("
-        L"addModifierWithLocalData n m n " + source + L" before:" + std::to_wstring(insertBefore) + L";"
-        L"if n.modifiers.count==count+1 do deleteModifier n " + std::to_wstring(removeIndex) + L"))))";
-    ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic);
+class PanelStackEditScope {
+    Interface7* ip_;
+    bool holding_ = false;
+public:
+    explicit PanelStackEditScope(Interface7* ip) : ip_(ip) {
+        g_panelStackEditing = true;
+        ip_->DisableSceneRedraw();
+        ip_->SuspendEditing(1 << TASK_MODE_MODIFY, TRUE);
+    }
+    ~PanelStackEditScope() {
+        // A rejected insertion must restore the original stack, in the same hold.
+        if (holding_) theHold.Cancel();
+        ip_->SelectedHistoryChanged();
+        ip_->ResumeEditing(1 << TASK_MODE_MODIFY, TRUE);
+        ip_->EnableSceneRedraw();
+        g_panelStackEditing = false;
+        QueuePanelRefresh(PANEL_REFRESH_SELECTION | PANEL_REFRESH_STRUCTURE);
+        ip_->RedrawViews(ip_->GetTime());
+    }
+    void Begin() { theHold.Begin(); holding_ = true; }
+    void Accept() { theHold.Accept(_T("Move Modifier")); holding_ = false; }
+};
+
+static void MovePanelModifier(int index, int direction, Modifier* expectedModifier) {
+    Interface7* ip = GetCOREInterface7();
+    if (!ip || !g_open || g_panelStackEditing || index < 1 ||
+        (direction != -1 && direction != 1) || ip->GetSelNodeCount() == 0) return;
+    // Do not take ownership of an in-progress scrub or another tool's undo hold.
+    if (theHold.Holding()) return;
+    INode* node = ip->GetSelNode(0);
+    if (!node || node->GetHandle() != g_nodeHandle) return;
+
+    // Real references keep the original objects alive across remove/insert and
+    // any rollback. They are released only after editing has resumed.
+    SingleRefMaker keepNode(node), keepStack, keepModifier;
+    PanelStackEditScope edit(ip);
+    EPolyAccept();
+    DestroyFavEdits();
+
+    Object* object = node->GetObjectRef();
+    int localIndex = index - 1;
+    while (object && object->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
+        auto* derived = static_cast<IDerivedObject*>(object);
+        const int count = derived->NumModifiers();
+        if (localIndex >= count) {
+            localIndex -= count;
+            object = derived->GetObjRef();
+            continue;
+        }
+        Modifier* modifier = derived->GetModifier(localIndex);
+        if (!modifier || modifier != expectedModifier) return;
+        const int target = localIndex + direction;
+        // Crossing a derived-object boundary can edit a shared reference stack
+        // on other nodes. Keep the move within this modifier's owning stack.
+        if (target < 0 || target >= count) {
+            ip->DisplayTempPrompt(_T("Cannot move past the end of this modifier stack or its reference boundary."), 3000);
+            return;
+        }
+        Modifier* adjacent = derived->GetModifier(target);
+        if (!adjacent || modifier->SuperClassID() != adjacent->SuperClassID()) return;
+        ModContext* context = derived->GetModContext(localIndex);
+        if (!context) return;
+
+        keepStack.SetRef(derived);
+        keepModifier.SetRef(modifier);
+        // The SDK copy constructor clones the gizmo transform, bounds and local
+        // data BEFORE removal. AddModifier makes its own copy of this context.
+        ModContext savedContext(*context);
+        edit.Begin();
+        derived->DeleteModifier(localIndex);
+        if (derived->NumModifiers() != count - 1) return;
+        // Never install the same modifier twice on the node, even temporarily.
+        // With the source removed, target is the zero-based insertion index.
+        derived->AddModifier(modifier, &savedContext, target);
+        if (derived->NumModifiers() != count || derived->GetModifier(target) != modifier) return;
+        derived->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
+        ip->InvalidateObCache(node);
+        edit.Accept();
+        return;
+    }
 }
 
 // ── Window proc ─────────────────────────────────────────────────
 static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_panelStackEditing && msg != WM_PP_REFRESH)
+        return DefWindowProc(hwnd, msg, wp, lp);
     switch (msg) {
     case WM_PAINT:      PaintPanel(hwnd); return 0;
     case WM_ERASEBKGND: return 1;
@@ -6087,35 +6178,14 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     // ▲ Move up
                     int mi = findModIdx(g_groups[gIdx].mod);
                     if (mi > 1) {
-                        EPolyAccept();
-                        MovePanelModifier(mi, -1);
-                        GatherParams(); BuildLayout();
-                        RefreshFavoritesStrip();
-                        if (auto* ip2 = GetCOREInterface()) ip2->RedrawViews(ip2->GetTime());
+                        MovePanelModifier(mi, -1, g_groups[gIdx].mod);
                     }
                     return 0;
                 }
                 if (pt.x >= bx + bw*2 + gap*2 && pt.x < bx + bw*3 + gap*2) {
                     // ▼ Move down
                     int mi = findModIdx(g_groups[gIdx].mod);
-                    Interface* ip2 = GetCOREInterface();
-                    int total = 0;
-                    if (ip2 && ip2->GetSelNodeCount() > 0) {
-                        INode* nd = ip2->GetSelNode(0);
-                        Object* ob = nd ? nd->GetObjectRef() : nullptr;
-                        while (ob && ob->SuperClassID() == GEN_DERIVOB_CLASS_ID) {
-                            IDerivedObject* dv = static_cast<IDerivedObject*>(ob);
-                            total += dv->NumModifiers();
-                            ob = dv->GetObjRef();
-                        }
-                    }
-                    if (mi > 0 && mi < total) {
-                        EPolyAccept();
-                        MovePanelModifier(mi, 1);
-                        GatherParams(); BuildLayout();
-                        RefreshFavoritesStrip();
-                        if (ip2) ip2->RedrawViews(ip2->GetTime());
-                    }
+                    if (mi > 0) MovePanelModifier(mi, 1, g_groups[gIdx].mod);
                     return 0;
                 }
                 if (pt.x >= bx + bw*3 + gap*3) {
@@ -6153,7 +6223,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // Normal collapse toggle — only if click is on the title text
             {
                 const auto& title = g_groups[gIdx].title;
-                bool collapsed2 = g_collapsed.count(title) > 0;
+                const auto& collapseKey = GroupCollapseKey(g_groups[gIdx]);
+                bool collapsed2 = g_collapsed.count(collapseKey) > 0;
                 std::wstring hdr = (collapsed2 ? L"\x25B8 " : L"\x25BE ") + title;
                 if (g_groups[gIdx].mod && !g_groups[gIdx].mod->IsEnabled()) hdr += L"  [OFF]";
                 HDC hdc2 = GetDC(hwnd);
@@ -6162,8 +6233,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SelectObject(hdc2, oldF2);
                 ReleaseDC(hwnd, hdc2);
                 if (pt.x <= kPad + sz.cx + UiPx(4)) {
-                    if (collapsed2) g_collapsed.erase(title);
-                    else g_collapsed.insert(title);
+                    if (collapsed2) g_collapsed.erase(collapseKey);
+                    else g_collapsed.insert(collapseKey);
                     SaveSettings();
                     BuildLayout();
                 }
@@ -6593,9 +6664,10 @@ static void OpenPanel() {
     // Auto-collapse groups with 10+ params on first encounter
     static std::set<std::wstring> g_autoCollapseSeen;
     for (auto& gh : g_groups) {
-        if (gh.count >= 10 && !g_autoCollapseSeen.count(gh.title)) {
-            g_autoCollapseSeen.insert(gh.title);
-            g_collapsed.insert(gh.title);
+        const auto& collapseKey = GroupCollapseKey(gh);
+        if (gh.count >= 10 && !g_autoCollapseSeen.count(collapseKey)) {
+            g_autoCollapseSeen.insert(collapseKey);
+            g_collapsed.insert(collapseKey);
         }
     }
 
