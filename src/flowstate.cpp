@@ -907,41 +907,38 @@ static void LayoutPanelHeader(int width) {
 }
 
 // Modifier search cache
-struct ModCacheEntry { std::wstring label; std::wstring normLabel; std::wstring search; std::wstring internalName; ClassDesc* cd = nullptr; SClass_ID sid = 0; };
+struct ModCacheEntry { std::wstring label; std::wstring normLabel; std::wstring search; std::wstring internalName; ClassDesc* cd = nullptr; SClass_ID sid = 0; Class_ID cid = Class_ID(0, 0); };
 static std::vector<ModCacheEntry> g_modCache;
 static bool g_modCacheReady = false;
 
-static std::wstring MxsStringLiteral(const std::wstring& s) {
-    std::wstring out = L"\"";
-    for (wchar_t c : s) {
-        if (c == L'\\' || c == L'"') out += L'\\';
-        out += c;
-    }
-    out += L"\"";
-    return out;
-}
-
-static bool AddModifierViaModPanelScript(const std::wstring& primaryName,
-                                         const std::wstring& fallbackName = L"") {
-    if (primaryName.empty() && fallbackName.empty()) return false;
+static bool AddModifierViaModPanelScript(SClass_ID sid, const Class_ID& cid) {
+    const wchar_t* classes = sid == OSM_CLASS_ID ? L"modifier"
+                           : sid == WSM_CLASS_ID ? L"spacewarpModifier" : nullptr;
+    if (!classes) return false;
 
     // This follows the same command-panel route as Max's modifier UI. It is
     // safer for stack/selection setup than passing a raw C++ modifier pointer
     // into AddModToSelection from this modeless panel.
+    // The MAXScript class is resolved by class ID because display and internal
+    // names are not constructors ("Face Extrude" is Face_Extrude). Negative
+    // halves are normalized so signed and unsigned classid readbacks both match.
     std::wstring script =
         L"try("
+        L"local cls = undefined;"
+        L"for c in " + std::wstring(classes) + L".classes while cls == undefined do ("
+        L"local a = c.classid[1]; local b = c.classid[2];"
+        L"if a < 0 do a += 4294967296L; if b < 0 do b += 4294967296L;"
+        L"if a == " + std::to_wstring(cid.PartA()) + L"L and b == " + std::to_wstring(cid.PartB()) + L"L do cls = c);"
+        L"if cls == undefined then \"0\" else ("
         L"local before = if selection.count > 0 then selection[1].modifiers.count else -1;"
         L"max modify mode;"
         L"try(subObjectLevel = 0)catch();"
-        L"local names = #(" + MxsStringLiteral(primaryName) + L"," + MxsStringLiteral(fallbackName) + L");"
-        L"local m = undefined;"
-        L"for n in names while m == undefined do if n != \"\" do try(m = execute (n + \"()\"))catch();"
-        L"if m != undefined do "
-        L"(try(if modPanel.validModifier m then modPanel.addModToSelection m)catch();"
+        L"local m = createInstance cls;"
+        L"try(if modPanel.validModifier m then modPanel.addModToSelection m)catch();"
         L"local mid = if selection.count > 0 then selection[1].modifiers.count else -1;"
-        L"if mid <= before do try(addModifier $ m)catch());"
+        L"if mid <= before do try(addModifier $ m)catch();"
         L"local after = if selection.count > 0 then selection[1].modifiers.count else -1;"
-        L"if after > before then \"1\" else \"0\""
+        L"if after > before then \"1\" else \"0\")"
         L")catch(\"0\")";
     FPValue result;
     BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic,
@@ -975,7 +972,7 @@ static void EnsureModCache() {
             ModCacheEntry e;
             e.label = name; e.normLabel = norm; e.search = norm;
             e.internalName = (intN && intN[0]) ? intN : L"";
-            e.cd = cd; e.sid = sid;
+            e.cd = cd; e.sid = sid; e.cid = cid;
             g_modCache.push_back(std::move(e));
         }
     };
@@ -985,15 +982,48 @@ static void EnsureModCache() {
     g_modCacheReady = true;
 }
 
+// Mirrors Max's modifier list: only classes the modify panel can insert at its
+// current stack item for the current selection (an Extrude above a Shell is not).
+static std::vector<char> ModValidityForSelection() {
+    std::vector<char> valid(g_modCache.size(), 0);
+    Interface7* ip = GetCOREInterface7();
+    if (!ip || ip->GetSelNodeCount() == 0) return valid;
+    // Validity is only defined in the modify panel, and the add switches there
+    // anyway. Keep typing focus in the search field across the switch.
+    if (ip->GetCommandPanelTaskMode() != TASK_MODE_MODIFY) {
+        HWND focus = GetFocus();
+        ip->SetCommandPanelTaskMode(TASK_MODE_MODIFY);
+        if (focus && GetFocus() != focus) SetFocus(focus);
+    }
+    ClassDirectory& dir = ClassDirectory::GetInstance();
+    for (size_t i = 0; i < g_modCache.size(); i++) {
+        ClassEntry* ce = dir.FindClassEntry(g_modCache[i].sid, g_modCache[i].cid);
+        valid[i] = (ce && ip->IsValidModForSelection(ce)) ? 1 : 0;
+    }
+    return valid;
+}
+
+static const ModCacheEntry* FindModCacheEntry(const std::wstring& name) {
+    EnsureModCache();
+    const ModCacheEntry* labelMatch = nullptr;
+    for (const auto& e : g_modCache) {
+        if (!e.internalName.empty() && e.internalName == name) return &e;
+        if (!labelMatch && e.label == name) labelMatch = &e;
+    }
+    return labelMatch;
+}
+
 static void FilterModSearch(const std::wstring& query) {
     g_modSearchResults.clear();
-    if (query.empty()) { for (int i = 0; i < (int)g_modCache.size(); i++) g_modSearchResults.push_back(i); return; }
+    const std::vector<char> valid = ModValidityForSelection();
+    if (query.empty()) { for (int i = 0; i < (int)g_modCache.size(); i++) if (valid[i]) g_modSearchResults.push_back(i); return; }
     std::wstring norm; for (auto c : query) { wchar_t lc = towlower(c); if (iswalnum(lc)) norm += lc; else if (!norm.empty() && norm.back() != L' ') norm += L' '; }
     std::vector<std::wstring> tokens; size_t s = 0;
     while (s < norm.size()) { while (s < norm.size() && norm[s] == L' ') s++; size_t e = norm.find(L' ', s); if (e == std::wstring::npos) e = norm.size(); if (e > s) tokens.push_back(norm.substr(s, e - s)); s = e + 1; }
     struct Scored { int idx; int score; };
     std::vector<Scored> scored;
     for (int i = 0; i < (int)g_modCache.size(); i++) {
+        if (!valid[i]) continue;
         auto& mc = g_modCache[i]; int score = 100;
         for (auto& tok : tokens) { size_t pos = mc.search.find(tok); if (pos == std::wstring::npos) { score = 0; break; } if (pos == 0 || mc.search[pos-1] == L' ') score += 10; }
         if (score > 0) { if (!tokens.empty() && mc.normLabel.find(tokens[0]) == 0) score += 50; score += std::max(0, 40 - (int)mc.label.size()); scored.push_back({i, score}); }
@@ -1009,16 +1039,9 @@ static void ApplyModSearchResult() {
     Interface* ip = GetCOREInterface();
     if (!ip || ip->GetSelNodeCount() == 0) return;
 
-    std::wstring name = mc.internalName.empty() ? mc.label : mc.internalName;
-    if (AddModifierViaModPanelScript(name, mc.label)) {
-        ip->RedrawViews(ip->GetTime());
-        return;
-    }
-
-    // Fail closed through script-only add. Do not fall back to a raw C++
-    // Modifier* here; that path can crash Max for spline modifiers.
-    std::wstring s = L"try(addModifier $ (" + name + L"()))catch()";
-    ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
+    // Script-only add. Do not fall back to a raw C++ Modifier* here; that
+    // path can crash Max for spline modifiers.
+    AddModifierViaModPanelScript(mc.sid, mc.cid);
     ip->RedrawViews(ip->GetTime());
 }
 
@@ -5293,7 +5316,9 @@ static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                 for (int i = 0; i < count; ++i) qBtns.push_back({g_quickMods[i].shortLabel.c_str(), i});
                 hit = HitBtnStrip(qBtns.data(), count, client.right, pt);
                 if (hit >= 0 && hit < count) {
-                    bool added = AddModifierViaModPanelScript(g_quickMods[hit].internalName, g_quickMods[hit].label);
+                    const ModCacheEntry* mc = FindModCacheEntry(g_quickMods[hit].internalName);
+                    if (!mc) mc = FindModCacheEntry(g_quickMods[hit].label);
+                    bool added = mc && AddModifierViaModPanelScript(mc->sid, mc->cid);
                     if (added) { GatherParams(); BuildLayout(); }
                     if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
                     return 0;

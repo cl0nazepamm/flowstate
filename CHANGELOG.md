@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The floating panel's modifier search now lists only modifiers Max can insert at the current stack item, matching the native modifier list (no Extrude above a Shell).
+- Modifiers whose names contain spaces, such as Face Extrude, can be added from the search list and quick buttons. Classes are now resolved by class ID instead of by name.
+
 ## 1.5.1 - 2026-09-22
 
 ### Changed
