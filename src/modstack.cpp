@@ -175,44 +175,6 @@ std::vector<std::wstring> TokenizeQuery(const std::wstring& query)
     return tokens;
 }
 
-std::wstring MxsStringLiteral(const std::wstring& s)
-{
-    std::wstring out = L"\"";
-    for (wchar_t c : s)
-    {
-        if (c == L'\\' || c == L'"') out += L'\\';
-        out += c;
-    }
-    out += L"\"";
-    return out;
-}
-
-bool AddModifierViaModPanelScript(const std::wstring& primaryName,
-                                  const std::wstring& fallbackName = L"")
-{
-    if (primaryName.empty() && fallbackName.empty()) return false;
-
-    std::wstring script =
-        L"try("
-        L"local names = #(" + MxsStringLiteral(primaryName) + L"," + MxsStringLiteral(fallbackName) + L");"
-        L"local m = undefined;"
-        L"for n in names while m == undefined do if n != \"\" do try(m = execute (n + \"()\"))catch();"
-        L"if m == undefined then \"0\" else "
-        L"(undo \"Add Modifier\" on ("
-        L"local before=0;for o in selection do try(before+=o.modifiers.count)catch();"
-        L"max modify mode;try(subObjectLevel = 0)catch();"
-        L"try(if modPanel.validModifier m then modPanel.addModToSelection m)catch();"
-        L"local mid=0;for o in selection do try(mid+=o.modifiers.count)catch();"
-        L"if mid <= before do (for o in selection do try(addModifier o m)catch());"
-        L"local after=0;for o in selection do try(after+=o.modifiers.count)catch();"
-        L"if after > before then \"1\" else \"0\"))"
-        L")catch(\"0\")";
-    FPValue result;
-    BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic,
-        TRUE, &result);
-    return ok && result.type == TYPE_STRING && result.s && wcscmp(result.s, L"1") == 0;
-}
-
 int ScoreMatch(const std::wstring& search, const std::wstring& normLabel,
                const std::vector<std::wstring>& tokens)
 {
@@ -864,10 +826,10 @@ private:
 
         // Modifier — prefer Max's command-panel route so stack context and
         // modifier gizmos are initialized the same way as the native UI.
-        // Resolve/load only the class the user chose. Deferred entries do not
-        // always expose their MAXScript constructor through cached display data.
-        std::wstring ctorName = ResolveConstructorName(item);
-        bool added = AddModifierViaModPanelScript(ctorName, item.label);
+        // Resolve/load only the class the user chose, by class ID: display
+        // and internal names are not always MAXScript constructors.
+        extern bool AddModifierViaModPanelScript(SClass_ID, const Class_ID&);
+        bool added = AddModifierViaModPanelScript(item.superClassId, item.classId);
 
         if (ip) ip->RedrawViews(ip->GetTime());
         SetStatus((added ? L"Added: " : L"Could not add: ") + item.label);

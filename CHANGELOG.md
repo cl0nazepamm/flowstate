@@ -4,8 +4,11 @@
 
 ### Fixed
 
-- The floating panel's modifier search now lists only modifiers Max can insert at the current stack item, matching the native modifier list (no Extrude above a Shell).
-- Modifiers whose names contain spaces, such as Face Extrude, can be added from the search list and quick buttons. Classes are now resolved by class ID instead of by name.
+- The floating panel's modifier search now lists only modifiers Max can insert at the current stack item, matching the native modifier list (no Extrude above a Shell). The list updates when you pick another stack item while searching.
+- Modifiers whose names contain spaces, such as Face Extrude, can be added from the search list, quick buttons and Macro Search. Classes are now resolved by class ID instead of by name.
+- Typing in the modifier search switches the command panel to Modify once, and switches it back if you cancel the search with Esc or by clearing the text.
+- A modifier the modify panel rejects at a stack item below the top is no longer added to the top of the stack instead. The search and quick buttons show a message when an add fails.
+- Adding a modifier from the floating panel is a single "Add Modifier" undo step and counts every selected object, as Macro Search already did.
 
 ## 1.5.1 - 2026-09-22
 

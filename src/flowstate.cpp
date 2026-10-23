@@ -882,6 +882,7 @@ enum PanelRefreshFlags : unsigned {
     PANEL_REFRESH_VALUES    = 1u << 0,
     PANEL_REFRESH_SELECTION = 1u << 1,
     PANEL_REFRESH_STRUCTURE = 1u << 2,
+    PANEL_REFRESH_STACK     = 1u << 3,  // modify panel stack item or level
 };
 
 static std::atomic<unsigned> g_panelRefreshFlags { 0 };
@@ -910,8 +911,15 @@ static void LayoutPanelHeader(int width) {
 struct ModCacheEntry { std::wstring label; std::wstring normLabel; std::wstring search; std::wstring internalName; ClassDesc* cd = nullptr; SClass_ID sid = 0; Class_ID cid = Class_ID(0, 0); };
 static std::vector<ModCacheEntry> g_modCache;
 static bool g_modCacheReady = false;
+// Per g_modCache entry: whether the modify panel can insert it at its current
+// stack item. It depends on the selection and stack, not the query, so it is
+// computed when a search starts and when the stack changes.
+static std::vector<char> g_modSearchValid;
+// Command panel mode a search switched away from, or -1.
+static int g_modSearchPrevTaskMode = -1;
 
-static bool AddModifierViaModPanelScript(SClass_ID sid, const Class_ID& cid) {
+// Shared with the ModStack palette.
+bool AddModifierViaModPanelScript(SClass_ID sid, const Class_ID& cid) {
     const wchar_t* classes = sid == OSM_CLASS_ID ? L"modifier"
                            : sid == WSM_CLASS_ID ? L"spacewarpModifier" : nullptr;
     if (!classes) return false;
@@ -922,6 +930,10 @@ static bool AddModifierViaModPanelScript(SClass_ID sid, const Class_ID& cid) {
     // The MAXScript class is resolved by class ID because display and internal
     // names are not constructors ("Face Extrude" is Face_Extrude). Negative
     // halves are normalized so signed and unsigned classid readbacks both match.
+    // addModifier inserts at the top of each stack and skips objects that do
+    // not accept the class. It covers a panel add that did not happen and mixed
+    // selections the panel rejects as a whole, but never a class the panel
+    // rejects at a stack item below the top.
     std::wstring script =
         L"try("
         L"local cls = undefined;"
@@ -929,16 +941,21 @@ static bool AddModifierViaModPanelScript(SClass_ID sid, const Class_ID& cid) {
         L"local a = c.classid[1]; local b = c.classid[2];"
         L"if a < 0 do a += 4294967296L; if b < 0 do b += 4294967296L;"
         L"if a == " + std::to_wstring(cid.PartA()) + L"L and b == " + std::to_wstring(cid.PartB()) + L"L do cls = c);"
-        L"if cls == undefined then \"0\" else ("
-        L"local before = if selection.count > 0 then selection[1].modifiers.count else -1;"
-        L"max modify mode;"
-        L"try(subObjectLevel = 0)catch();"
+        L"if cls == undefined then \"0\" else "
+        L"(undo \"Add Modifier\" on ("
+        L"local before=0;for o in selection do try(before+=o.modifiers.count)catch();"
+        L"max modify mode;try(subObjectLevel = 0)catch();"
         L"local m = createInstance cls;"
-        L"try(if modPanel.validModifier m then modPanel.addModToSelection m)catch();"
-        L"local mid = if selection.count > 0 then selection[1].modifiers.count else -1;"
-        L"if mid <= before do try(addModifier $ m)catch();"
-        L"local after = if selection.count > 0 then selection[1].modifiers.count else -1;"
-        L"if after > before then \"1\" else \"0\")"
+        L"local panelValid = try(modPanel.validModifier m)catch(undefined);"
+        L"local cur = try(modPanel.getCurrentObject())catch(undefined);"
+        L"local belowTop = false;"
+        L"if cur != undefined do for o in selection do "
+        L"(local topObj = if o.modifiers.count > 0 then o.modifiers[1] else o.baseObject; if topObj != cur do belowTop = true);"
+        L"if panelValid == true do try(modPanel.addModToSelection m)catch();"
+        L"local mid=0;for o in selection do try(mid+=o.modifiers.count)catch();"
+        L"if mid <= before and not (panelValid == false and belowTop) do (for o in selection do try(addModifier o m)catch());"
+        L"local after=0;for o in selection do try(after+=o.modifiers.count)catch();"
+        L"if after > before then \"1\" else \"0\"))"
         L")catch(\"0\")";
     FPValue result;
     BOOL ok = ExecuteMAXScriptScript(script.c_str(), MAXScript::ScriptSource::Dynamic,
@@ -982,25 +999,51 @@ static void EnsureModCache() {
     g_modCacheReady = true;
 }
 
+// Switching modes can move keyboard focus out of the search field.
+static void SetCommandPanelModeKeepFocus(Interface* ip, int mode) {
+    HWND focus = GetFocus();
+    ip->SetCommandPanelTaskMode(mode);
+    if (focus && GetFocus() != focus) SetFocus(focus);
+}
+
+// Validity is only defined in the modify panel, and an add switches there
+// anyway, so a search opens it once when it starts. EndModSearchPanel puts the
+// previous mode back when the search is cancelled. A panel closed by a click
+// elsewhere keeps Modify, since that click may be in the modify panel.
+static void BeginModSearchPanel() {
+    Interface* ip = GetCOREInterface();
+    if (!ip || ip->GetSelNodeCount() == 0) return;
+    const int mode = ip->GetCommandPanelTaskMode();
+    if (mode == TASK_MODE_MODIFY) return;
+    g_modSearchPrevTaskMode = mode;
+    SetCommandPanelModeKeepFocus(ip, TASK_MODE_MODIFY);
+}
+
+static void EndModSearchPanel(bool restore) {
+    const int mode = g_modSearchPrevTaskMode;
+    g_modSearchPrevTaskMode = -1;
+    if (!restore || mode < 0) return;
+    // Leave the panel alone if the user already switched it during the search.
+    Interface* ip = GetCOREInterface();
+    if (ip && ip->GetCommandPanelTaskMode() == TASK_MODE_MODIFY)
+        SetCommandPanelModeKeepFocus(ip, mode);
+}
+
 // Mirrors Max's modifier list: only classes the modify panel can insert at its
 // current stack item for the current selection (an Extrude above a Shell is not).
-static std::vector<char> ModValidityForSelection() {
-    std::vector<char> valid(g_modCache.size(), 0);
+static void RefreshModSearchValidity() {
     Interface7* ip = GetCOREInterface7();
-    if (!ip || ip->GetSelNodeCount() == 0) return valid;
-    // Validity is only defined in the modify panel, and the add switches there
-    // anyway. Keep typing focus in the search field across the switch.
-    if (ip->GetCommandPanelTaskMode() != TASK_MODE_MODIFY) {
-        HWND focus = GetFocus();
-        ip->SetCommandPanelTaskMode(TASK_MODE_MODIFY);
-        if (focus && GetFocus() != focus) SetFocus(focus);
-    }
+    if (!ip || ip->GetSelNodeCount() == 0) { g_modSearchValid.assign(g_modCache.size(), 0); return; }
+    // Keep the last result while the user has the panel in another mode.
+    if (ip->GetCommandPanelTaskMode() != TASK_MODE_MODIFY &&
+        g_modSearchValid.size() == g_modCache.size()) return;
+    std::vector<char> valid(g_modCache.size(), 0);
     ClassDirectory& dir = ClassDirectory::GetInstance();
     for (size_t i = 0; i < g_modCache.size(); i++) {
         ClassEntry* ce = dir.FindClassEntry(g_modCache[i].sid, g_modCache[i].cid);
         valid[i] = (ce && ip->IsValidModForSelection(ce)) ? 1 : 0;
     }
-    return valid;
+    g_modSearchValid = std::move(valid);
 }
 
 static const ModCacheEntry* FindModCacheEntry(const std::wstring& name) {
@@ -1015,7 +1058,8 @@ static const ModCacheEntry* FindModCacheEntry(const std::wstring& name) {
 
 static void FilterModSearch(const std::wstring& query) {
     g_modSearchResults.clear();
-    const std::vector<char> valid = ModValidityForSelection();
+    const std::vector<char>& valid = g_modSearchValid;
+    if (valid.size() != g_modCache.size()) return;
     if (query.empty()) { for (int i = 0; i < (int)g_modCache.size(); i++) if (valid[i]) g_modSearchResults.push_back(i); return; }
     std::wstring norm; for (auto c : query) { wchar_t lc = towlower(c); if (iswalnum(lc)) norm += lc; else if (!norm.empty() && norm.back() != L' ') norm += L' '; }
     std::vector<std::wstring> tokens; size_t s = 0;
@@ -1033,16 +1077,18 @@ static void FilterModSearch(const std::wstring& query) {
     g_modSearchSel = 0; g_modSearchScrollY = 0;
 }
 
-static void ApplyModSearchResult() {
-    if (g_modSearchSel < 0 || g_modSearchSel >= (int)g_modSearchResults.size()) return;
+static bool ApplyModSearchResult() {
+    if (g_modSearchSel < 0 || g_modSearchSel >= (int)g_modSearchResults.size()) return false;
     auto& mc = g_modCache[g_modSearchResults[g_modSearchSel]];
     Interface* ip = GetCOREInterface();
-    if (!ip || ip->GetSelNodeCount() == 0) return;
+    if (!ip || ip->GetSelNodeCount() == 0) return false;
 
     // Script-only add. Do not fall back to a raw C++ Modifier* here; that
     // path can crash Max for spline modifiers.
-    AddModifierViaModPanelScript(mc.sid, mc.cid);
+    const bool added = AddModifierViaModPanelScript(mc.sid, mc.cid);
+    if (!added) ShowOSD(L"Could not add " + mc.label);
     ip->RedrawViews(ip->GetTime());
+    return added;
 }
 
 static void UpdateModSearch() {
@@ -1056,18 +1102,27 @@ static void UpdateModSearch() {
         g_hoverParam = -1;
         g_modSearchScrollY = 0;
         BuildLayout();
-    }
-    if (g_modSearch) {
         EnsureModCache();
-        FilterModSearch(buf);
+        BeginModSearchPanel();
+        g_modSearchValid.clear();
+        RefreshModSearchValidity();
+        // The mode switch can pump messages; filter what the field holds now.
+        GetWindowText(g_modSearchEdit, buf, 256);
+    } else if (!g_modSearch && wasSearch) {
+        // Search text cleared without an add
+        EndModSearchPanel(true);
     }
+    if (g_modSearch) FilterModSearch(buf);
     InvalidateRect(g_panel, nullptr, FALSE);
 }
 
-static void ExitModSearch() {
+// restorePanel: the search was cancelled or its add failed, so switch the
+// command panel back to the mode the search started from.
+static void ExitModSearch(bool restorePanel = false) {
     g_modSearch = false;
     if (g_modSearchEdit) SetWindowText(g_modSearchEdit, _T(""));
     g_modSearchResults.clear();
+    EndModSearchPanel(restorePanel);
     InvalidateRect(g_panel, nullptr, FALSE);
 }
 
@@ -1166,7 +1221,7 @@ static PanelNodeWatcher* g_panelNodeWatcher = nullptr;
 static PanelTimeChangeCallback g_panelTimeChangeCallback;
 
 static unsigned g_panelSelectionNotifyFlags = PANEL_REFRESH_SELECTION | PANEL_REFRESH_VALUES;
-static unsigned g_panelValueNotifyFlags = PANEL_REFRESH_VALUES;
+static unsigned g_panelValueNotifyFlags = PANEL_REFRESH_VALUES | PANEL_REFRESH_STACK;
 static unsigned g_panelStructureNotifyFlags = PANEL_REFRESH_STRUCTURE;
 
 static void PanelRefreshNotifyCB(void* param, NotifyInfo*) {
@@ -4260,12 +4315,11 @@ static LRESULT CALLBACK ModSearchEditProc(HWND h, UINT m, WPARAM w, LPARAM l,
     }
     if (m == WM_KEYDOWN) {
         if (w == VK_RETURN) {
-            ApplyModSearchResult();
-            ExitModSearch();
+            ExitModSearch(!ApplyModSearchResult());
             GatherParams(); BuildLayout();
             return 0;
         }
-        if (w == VK_ESCAPE) { ExitModSearch(); InvalidateRect(g_panel, nullptr, FALSE); return 0; }
+        if (w == VK_ESCAPE) { ExitModSearch(true); InvalidateRect(g_panel, nullptr, FALSE); return 0; }
         if (w == VK_DOWN) {
             if (g_modSearchSel < (int)g_modSearchResults.size() - 1) g_modSearchSel++;
             InvalidateRect(g_panel, nullptr, FALSE); return 0;
@@ -5123,6 +5177,30 @@ static int MaxPanelScaleForMonitor(UINT dpi) {
     return kMinPanelScale;
 }
 
+static void ClampModSearchScroll() {
+    g_modSearchScrollY = std::clamp(g_modSearchScrollY, 0,
+        std::max(0, std::min(200, (int)g_modSearchResults.size()) * kLineH - g_viewH));
+}
+
+// Re-filters an open search after the stack item or stack changed, keeping the
+// highlighted modifier when it can still be inserted.
+static void RefreshModSearchForStack() {
+    if (!g_modSearch || !g_modSearchEdit) return;
+    const int selIdx = (g_modSearchSel >= 0 && g_modSearchSel < (int)g_modSearchResults.size())
+        ? g_modSearchResults[g_modSearchSel] : -1;
+    const int scrollY = g_modSearchScrollY;
+    RefreshModSearchValidity();
+    TCHAR buf[256]; GetWindowText(g_modSearchEdit, buf, 256);
+    FilterModSearch(buf);
+    auto it = std::find(g_modSearchResults.begin(), g_modSearchResults.end(), selIdx);
+    if (it != g_modSearchResults.end()) {
+        g_modSearchSel = (int)(it - g_modSearchResults.begin());
+        g_modSearchScrollY = scrollY;
+        ClampModSearchScroll();
+    }
+    InvalidateRect(g_panel, nullptr, FALSE);
+}
+
 static void BuildLayout(bool preserveEdit) {
     PanelDpiScope dpiScope;
     const int scaleLimit = MaxPanelScaleForMonitor(g_panelDpi);
@@ -5202,8 +5280,7 @@ static void BuildLayout(bool preserveEdit) {
                 g_scrollY = editTop + kLineH - g_viewH;
         }
     }
-    g_modSearchScrollY = std::clamp(g_modSearchScrollY, 0,
-        std::max(0, std::min(200, (int)g_modSearchResults.size()) * kLineH - g_viewH));
+    ClampModSearchScroll();
 
     if (!preserveEdit) KillActiveEdit(false);
     g_hoverParam = -1;
@@ -5319,7 +5396,13 @@ static LRESULT CALLBACK BtnStripProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                     const ModCacheEntry* mc = FindModCacheEntry(g_quickMods[hit].internalName);
                     if (!mc) mc = FindModCacheEntry(g_quickMods[hit].label);
                     bool added = mc && AddModifierViaModPanelScript(mc->sid, mc->cid);
-                    if (added) { GatherParams(); BuildLayout(); }
+                    if (added) {
+                        // An open search must not switch the panel back after this add.
+                        g_modSearchPrevTaskMode = -1;
+                        GatherParams(); BuildLayout();
+                    } else {
+                        ShowOSD(L"Could not add " + g_quickMods[hit].label);
+                    }
                     if (auto* ip = GetCOREInterface()) ip->RedrawViews(ip->GetTime());
                     return 0;
                 }
@@ -5911,6 +5994,9 @@ static void ProcessPanelRefresh() {
         return;
     }
 
+    if (flags & (PANEL_REFRESH_STACK | PANEL_REFRESH_STRUCTURE))
+        RefreshModSearchForStack();
+
     if (flags & PANEL_REFRESH_STRUCTURE) {
         KillActiveEdit(false);
         CancelPanelValueDrag();
@@ -6098,8 +6184,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int ri = (pt.y - g_contentStartY + g_modSearchScrollY) / kLineH;
             if (ri >= 0 && ri < (int)g_modSearchResults.size()) {
                 g_modSearchSel = ri;
-                ApplyModSearchResult();
-                ExitModSearch();
+                ExitModSearch(!ApplyModSearchResult());
                 GatherParams(); BuildLayout();
                 RefreshFavoritesStrip();
             }
