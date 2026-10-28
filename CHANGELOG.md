@@ -9,6 +9,9 @@
 - Typing in the modifier search switches the command panel to Modify once, and switches it back if you cancel the search with Esc or by clearing the text.
 - A modifier the modify panel rejects at a stack item below the top is no longer added to the top of the stack instead. The search and quick buttons show a message when an add fails.
 - Adding a modifier from the floating panel is a single "Add Modifier" undo step and counts every selected object, as Macro Search already did.
+- The first Tab in a session no longer stalls before the shader palette appears. The shader and map list, which loads every deferred material and map plugin and parses the OSL folders, is now built once 3ds Max finishes starting. Classes registered later, such as scripted materials, are picked up the next time the palette opens.
+- Closing the shader palette with Tab, Esc, the close button or by inserting a shader returns focus to the window it was opened from, so Tab toggles it repeatedly from the Slate Material Editor. Previously focus fell back to the main 3ds Max window and the next Tab did nothing.
+- Double-clicking a shader no longer leaves focus in a viewport. The palette closed on the second press, so the button release fell through to whatever was under it; where the palette overlapped a viewport, that viewport took focus from SME. The palette now waits for the release. Materials with Qt parameter panels, such as Standard and Physical, happened to hide the problem.
 
 ## 1.5.1 - 2026-09-22
 

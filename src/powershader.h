@@ -9,6 +9,7 @@ namespace PowerShader {
     bool Init(HINSTANCE hInst, bool lightTheme = false);
     void Shutdown();
     void Toggle();
+    void Prewarm();     // build the shader list ahead of the first open
     bool IsOpen();
     bool OwnsFocus();   // palette or one of its controls has keyboard focus
     void ReloadTheme(bool lightTheme);

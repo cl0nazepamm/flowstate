@@ -1840,6 +1840,15 @@ public:
 
     bool IsOpen() const { return wnd_ && IsWindowVisible(wnd_); }
 
+    // Builds the class list ahead of the first open. That first build is
+    // what made the first Tab lag: FullCD() loads every deferred material
+    // and map plugin DLL, and the OSL folders are parsed file by file.
+    void Prewarm()
+    {
+        EnsureClassCache();
+        EnsureOSLCategories();
+    }
+
     // True while the palette or any of its controls holds keyboard focus, so
     // the Tab binding can close what it opened. Without this the hook only
     // sees SME focus and Tab does nothing once the palette has taken over —
@@ -1936,6 +1945,9 @@ private:
             break;
 
         case WM_ACTIVATE:
+            // Hide() hands activation back itself; reacting here would
+            // re-enter it.
+            if (self->hiding_) return 0;
             if (LOWORD(w) == WA_INACTIVE && !self->dragging_)
             {
                 if (self->keepOpen_)
@@ -1945,13 +1957,21 @@ private:
                     HidePreview();
                     self->RestoreAccelerators();
                 }
-                else self->Hide();
+                // Focus already went where the user clicked; don't pull it back.
+                else self->Hide(false);
             }
-            else if (LOWORD(w) != WA_INACTIVE && IsWindowVisible(h) &&
-                     !self->acceleratorsDisabled_)
+            else if (LOWORD(w) != WA_INACTIVE)
             {
-                DisableAccelerators();
-                self->acceleratorsDisabled_ = true;
+                // Remember who had focus so closing returns it there (SME,
+                // so the next Tab reopens). lParam is null across threads.
+                HWND prev = reinterpret_cast<HWND>(l);
+                if (prev && prev != h && prev != g_previewWnd)
+                    self->returnFocus_ = prev;
+                if (IsWindowVisible(h) && !self->acceleratorsDisabled_)
+                {
+                    DisableAccelerators();
+                    self->acceleratorsDisabled_ = true;
+                }
             }
             return 0;
 
@@ -2220,6 +2240,8 @@ private:
             break;
         }
         case WM_MOUSEMOVE:
+            // Already activated; only the release is left to swallow.
+            if (self->hideOnButtonUp_) return 0;
             if (GetCapture() == h && (w & MK_LBUTTON))
             {
                 POINT p{}; GetCursorPos(&p);
@@ -2271,6 +2293,8 @@ private:
             break;
         case WM_LBUTTONUP:
         {
+            const bool hideAfter = self->hideOnButtonUp_;
+            self->hideOnButtonUp_ = false;  // before ReleaseCapture below
             const bool wasDragging = self->dragging_;
             if (GetCapture() == h) ReleaseCapture();
             if (wasDragging)
@@ -2287,8 +2311,22 @@ private:
                     RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
             }
             if (wasDragging) return 0;
+            if (hideAfter)
+            {
+                const LRESULT r = DefSubclassProc(h, m, w, l);
+                self->Hide();
+                return r;
+            }
             break;
         }
+        case WM_CAPTURECHANGED:
+            // The release went elsewhere (Alt+Tab, a dialog): close now.
+            if (self->hideOnButtonUp_)
+            {
+                self->hideOnButtonUp_ = false;
+                self->Hide();
+            }
+            break;
         case WM_RBUTTONDOWN:
         {
             // Right-click = file-local pin (toggle at start of list)
@@ -2728,9 +2766,17 @@ private:
     void Show()
     {
         CancelPendingRebuild();
+        HWND fg = GetForegroundWindow();
+        returnFocus_ = (fg && fg != wnd_ &&
+                        GetWindowThreadProcessId(fg, nullptr) == GetCurrentThreadId())
+            ? fg : nullptr;
         // Persistent search restores the last query verbatim; Show() below
         // select-alls it so typing still replaces in one keystroke.
         SetWindowTextW(edit_, persistSearch_ ? savedSearch_.c_str() : L"");
+        // The cache may predate classes registered since startup (scripted
+        // materials, late plugin loads) now that it is prewarmed.
+        if (classCacheReady_ && PublicClassCount() != classCount_)
+            classCacheReady_ = false;
         EnsureClassCache();
         EnsureOSLCategories();
         if (IsSceneOnly()) RefreshSceneCache();
@@ -2828,8 +2874,24 @@ private:
         }
     }
 
-    void Hide()
+    // A double-click activates on the second press. Hiding then lets the
+    // release fall through to whatever is under the palette — usually a
+    // viewport, which takes focus from SME. Swallow the release first.
+    void HideAfterClick()
     {
+        if (list_ && (GetKeyState(VK_LBUTTON) & 0x8000))
+        {
+            // Flag after SetCapture: the listbox may already hold capture
+            // from the click, and a capture-changed notice must not hide.
+            SetCapture(list_);
+            if (GetCapture() == list_) { hideOnButtonUp_ = true; return; }
+        }
+        Hide();
+    }
+
+    void Hide(bool returnFocus = true)
+    {
+        hideOnButtonUp_ = false;    // before the capture release below
         CancelPendingRebuild();
         FinishRename(true);
         HWND capture = GetCapture();
@@ -2840,7 +2902,17 @@ private:
         g_previewGen.fetch_add(1, std::memory_order_release);
         if (wnd_) KillTimer(wnd_, kPreviewTimerId);
         HidePreview();
+        // Hiding the active palette would hand activation to its owner, the
+        // Max main window, so SME lost focus and the next Tab did nothing.
+        // Activate the previous window first, while the palette still has it.
+        hiding_ = true;
+        if (returnFocus && wnd_ && GetActiveWindow() == wnd_ &&
+            returnFocus_ && IsWindow(returnFocus_) &&
+            IsWindowVisible(returnFocus_) && IsWindowEnabled(returnFocus_))
+            SetForegroundWindow(returnFocus_);
+        returnFocus_ = nullptr;
         ShowWindow(wnd_, SW_HIDE);
+        hiding_ = false;
         SetLayeredWindowAttributes(wnd_, 0, 255, LWA_ALPHA);
         dragging_ = false;
         dragIndex_ = -1;
@@ -3136,9 +3208,20 @@ private:
                 return a.favoriteKey < b.favoriteKey;
             });
 
+        // Counted after the build: FullCD() can load DLLs that register more.
+        classCount_ = PublicClassCount();
         classCacheReady_ = true;
         oslCategoryReady_ = false;
         classCacheBuilding_ = false;
+    }
+
+    static int PublicClassCount()
+    {
+        int count = 0;
+        for (SClass_ID sid : { MATERIAL_CLASS_ID, TEXMAP_CLASS_ID })
+            if (SubClassList* list = ClassDirectory::GetInstance().GetClassList(sid))
+                count += list->Count(ACC_PUBLIC);
+        return count;
     }
 
     void EnsureOSLCategories()
@@ -3763,7 +3846,7 @@ private:
                 for (int i = 0; i < selectedCount; ++i)
                     if (INode* node = ip->GetSelNode(i)) node->SetMtl(mtl);
             }
-            if (!keepOpen_) Hide();
+            if (!keepOpen_) HideAfterClick();
         }
 
         theHold.Accept(_T("Assign Material"));
@@ -4212,6 +4295,7 @@ private:
     bool lastSceneOnly_ = false;
     bool classCacheReady_ = false;
     bool classCacheBuilding_ = false;
+    int  classCount_ = 0;       // public material + map classes at last build
     bool oslCategoryReady_ = false;
     bool oslCategoryBuilding_ = false;
     bool forcedAliasRetry_ = false;
@@ -4227,6 +4311,9 @@ private:
     bool  favsOnly_   = false;  // Favorites filter — brick pins stay above the list
     bool  applyToSel_ = false;  // Persisted Auto Apply for clicked materials
     bool  acceleratorsDisabled_ = false;
+    HWND  returnFocus_ = nullptr; // window that had focus before the palette
+    bool  hiding_      = false;
+    bool  hideOnButtonUp_ = false; // double-click activated; hide on release
     int   listBaseY_  = 0;
     int   brickAreaH_ = 0;      // height of the brick rows between filters and list
     // Dual favorites
@@ -4290,6 +4377,7 @@ static void ClearPersistentImpl() {
 bool Init(HINSTANCE, bool lightTheme) { return Palette::Get().Init(lightTheme); }
 void Shutdown()      { Palette::Get().Shutdown(); }
 void Toggle()        { Palette::Get().Toggle(); }
+void Prewarm()       { Palette::Get().Prewarm(); }
 bool IsOpen()        { return Palette::Get().IsOpen(); }
 bool OwnsFocus()     { return Palette::Get().OwnsFocus(); }
 void ReloadTheme(bool lightTheme) { Palette::Get().ReloadTheme(lightTheme); }

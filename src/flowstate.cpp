@@ -2592,6 +2592,14 @@ static bool IsMaterialEditorFocused() {
 static const UINT WM_PP_SHADER   = WM_USER + 104;
 static const UINT WM_FS_ORBIT_EVAL = WM_USER + 110;
 static const UINT WM_PP_MODSTACK = WM_USER + 105;
+static const UINT WM_PS_PREWARM  = WM_USER + 111;
+
+// Builds the PowerShader list once Max is live, so the first Tab opens as
+// fast as later ones. Posted so the build runs after the startup broadcast.
+static void StartupNotifyCB(void*, NotifyInfo*) {
+    UnRegisterNotification(StartupNotifyCB, nullptr, NOTIFY_SYSTEM_STARTUP);
+    if (g_panel) PostMessage(g_panel, WM_PS_PREWARM, 0, 0);
+}
 
 // ── Forward declarations ────────────────────────────────────────
 static void TogglePanel();
@@ -6748,6 +6756,10 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PP_SHADER:
         PowerShader::Toggle(); return 0;
 
+    case WM_PS_PREWARM:
+        if (g_enablePowerShader) PowerShader::Prewarm();
+        return 0;
+
     case WM_PP_MODSTACK:
         ModStack::Toggle(); return 0;
 
@@ -7179,11 +7191,13 @@ public:
             Stop();
             return GUPRESULT_NOKEEP;
         }
+        RegisterNotification(StartupNotifyCB, nullptr, NOTIFY_SYSTEM_STARTUP);
 
         return GUPRESULT_KEEP;
     }
 
     void Stop() override {
+        UnRegisterNotification(StartupNotifyCB, nullptr, NOTIFY_SYSTEM_STARTUP);
         DisableAutoSilent();
         CancelHookDrags();
         if (Interface* ip = GetCOREInterface()) {
