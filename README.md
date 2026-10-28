@@ -2,7 +2,7 @@
 
 <img src="images/flowstate_logo.png" alt="flowstate" width="360">
 
-flowstate 1.5.1 is a collection of 3ds Max tools for faster parameter editing, shader creation, modifier access, modeling, and mouse-driven viewport workflows.
+flowstate 1.5.2 is a collection of 3ds Max tools for faster parameter editing, shader creation, modifier access, modeling, and mouse-driven viewport workflows.
 
 ## Install
 
