@@ -96,6 +96,7 @@ static int kEditH     = 22;
 static const int kMaxParams = 50;
 static int kMinW      = 320;
 static const UINT_PTR kPB1FallbackTimerId = 0x4653;
+static const UINT_PTR kRetuneSetTimerId = 0x4654;
 static const UINT kPB1FallbackMs = 2000;
 static int kBtnW      = 30;    // side button width
 static int kBtnH      = 20;    // side button height
@@ -764,10 +765,7 @@ struct EditField {
     ParamID      id   = 0;
     ParamType2   type = (ParamType2)0;
     int          logY = 0;   // logical Y before scroll
-    // Item of the active caddy (IBaseGrip) shown in the panel, or -1.
-    int          caddyItem = -1;
-    IBaseGrip::Type caddyType = IBaseGrip::eInvalid;
-    std::vector<std::wstring> caddyOptions;  // combo item labels
+    bool         retune = false;  // parameter of the operation group
 };
 
 // Old saved keys continue to address the first occurrence. Repeated modifiers
@@ -805,7 +803,7 @@ struct GroupHeader {
     int actionStart = 0;
     int actionCount = 0;
     Modifier* mod = nullptr;
-    bool caddy = false;
+    bool retune = false;  // the operation group
 };
 
 static const std::wstring& GroupCollapseKey(const GroupHeader& group) {
@@ -1189,18 +1187,8 @@ public:
     }
 };
 
-// A caddy opening, closing or being replaced changes the panel's first group.
-class PanelCaddyChangedCallback final : public GripChangedCallback {
-public:
-    void GripChanged(IBaseGrip*) override {
-        if (g_panelObserversActive.load(std::memory_order_acquire))
-            QueuePanelRefresh(PANEL_REFRESH_STRUCTURE);
-    }
-};
-
 static PanelNodeWatcher* g_panelNodeWatcher = nullptr;
 static PanelTimeChangeCallback g_panelTimeChangeCallback;
-static PanelCaddyChangedCallback g_panelCaddyChangedCallback;
 
 static unsigned g_panelSelectionNotifyFlags = PANEL_REFRESH_SELECTION | PANEL_REFRESH_VALUES;
 static unsigned g_panelValueNotifyFlags = PANEL_REFRESH_VALUES | PANEL_REFRESH_STACK;
@@ -1234,8 +1222,6 @@ static void StartPanelObservers() {
     RegisterNotification(PanelRefreshNotifyCB, &g_panelStructureNotifyFlags,
                          NOTIFY_POST_MODIFIER_DELETED);
     if (ip) ip->RegisterTimeChangeCallback(&g_panelTimeChangeCallback);
-    if (IGripManager* gm = GetIGripManager())
-        gm->RegisterGripChangedCallback(&g_panelCaddyChangedCallback);
     g_panelObserversActive.store(true, std::memory_order_release);
 }
 
@@ -1255,30 +1241,12 @@ static void StopPanelObservers() {
                                NOTIFY_POST_MODIFIER_DELETED);
         if (Interface* ip = GetCOREInterface())
             ip->UnRegisterTimeChangeCallback(&g_panelTimeChangeCallback);
-        if (IGripManager* gm = GetIGripManager())
-            gm->UnRegisterGripChangedCallback(&g_panelCaddyChangedCallback);
     }
     if (g_panelNodeWatcher) g_panelNodeWatcher->SetRef(nullptr);
     g_panelRefreshFlags.store(0, std::memory_order_release);
     g_panelRefreshPosted.store(false, std::memory_order_release);
 }
 
-// Caddy shown in the panel. Max owns it; the pointer is only compared against
-// the grip manager's active grip, never called once that grip has changed.
-static IBaseGrip* g_caddy = nullptr;
-static bool g_caddyHidMax = false;   // the panel turned Max's caddy display off
-static bool g_caddyMenuOpen = false;
-static std::wstring g_caddyLayout;   // items and labels the rows were built from
-
-// One caddy value change, bracketed the way Max's caddy spinners bracket it.
-struct CaddyEdit {
-    IBaseGrip* grip = nullptr;
-    int item = -1;
-    bool started = false;   // StartSetValue accepted it; the grip owns the undo hold
-    bool ownHold = false;
-    bool changed = false;
-};
-static CaddyEdit g_caddyEdit;
 
 // Context-aware tool system
 enum ObjContext { CTX_NONE, CTX_EPOLY, CTX_SPLINE };
@@ -2603,6 +2571,7 @@ static int  FindParamAtY(int clickY);
 static LRESULT CALLBACK ModSearchEditProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
 static void RefreshPB1ValueCache();
 static bool HandleModifierWheel(const MOUSEHOOKSTRUCTEX* ms);
+static std::wstring g_retuneGroupShown;  // the panel's operation group, or empty
 
 // ── Mouse hook — Mouse5=panel, Mouse4=pin ───────────────────────
 // Uses WH_MOUSE (thread-level) instead of WH_MOUSE_LL (system-wide)
@@ -2638,7 +2607,7 @@ static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
         return 1;
 
     // Click outside panel = instant close
-    if (g_open && !g_caddy && !g_scaleMenuOpen &&
+    if (g_open && g_retuneGroupShown.empty() && !g_scaleMenuOpen &&
         (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN)) {
         if (ms->hwnd != g_panel && !IsChild(g_panel, ms->hwnd) &&
             ms->hwnd != g_btnLeft && ms->hwnd != g_btnRight &&
@@ -3899,25 +3868,12 @@ static bool FinishSplineFakeDrag(bool accept) {
     return true;
 }
 
-// ── Caddy ───────────────────────────────────────────────────────
-// The panel's first group edits Max's active caddy through IBaseGrip, the
-// interface Max's own in-viewport caddy uses. Max keeps the operation, its
-// preview and its undo; the panel reads items and forwards edits, so a panel
-// rebuild never strands a preview.
-enum CaddyCommand { kCaddyOkay = 1, kCaddyApply, kCaddyCancel };
-
-// The panel leaves caddies to Max for now; modifier + wheel steps Max's own.
-static constexpr bool kCaddyTakeover = false;
-
+// ── Caddy grips ─────────────────────────────────────────────────
+// Max's caddies are grips. Modifier + wheel steps an open one through the
+// same IBaseGrip calls Max's in-viewport caddy spinners use.
 static IBaseGrip* ActiveCaddy() {
     IGripManager* gm = GetIGripManager();
     return gm ? gm->GetActiveGrip() : nullptr;
-}
-
-// The caddy the rows were built from, or null once Max has closed or replaced it.
-static IBaseGrip* BoundCaddy() {
-    IBaseGrip* grip = ActiveCaddy();
-    return grip && grip == g_caddy ? grip : nullptr;
 }
 
 static TimeValue CaddyTime() {
@@ -3938,123 +3894,6 @@ static IBaseGrip::GripValue EmptyGripValue() {
 
 static bool IsCaddyFloat(IBaseGrip::Type type) {
     return type == IBaseGrip::eFloat || type == IBaseGrip::eUniverse;
-}
-
-static bool IsCaddyNumber(IBaseGrip::Type type) {
-    return IsCaddyFloat(type) || type == IBaseGrip::eInt || type == IBaseGrip::eTime;
-}
-
-// Type used to parse typed entries; frames for time items.
-static ParamType2 CaddyParamType(IBaseGrip::Type type) {
-    switch (type) {
-    case IBaseGrip::eFloat:    return (ParamType2)TYPE_FLOAT;
-    case IBaseGrip::eUniverse: return (ParamType2)TYPE_WORLD;
-    case IBaseGrip::eToggle:
-    case IBaseGrip::eCommand:  return (ParamType2)TYPE_BOOL;
-    default:                   return (ParamType2)TYPE_INT;
-    }
-}
-
-static std::wstring CaddyItemText(IBaseGrip* grip, int item) {
-    MSTR text;
-    if (!grip->GetText(item, text) || !text.data()) return L"";
-    return text.data();
-}
-
-static std::vector<std::wstring> CaddyComboOptions(IBaseGrip* grip, int item) {
-    std::vector<std::wstring> labels;
-    Tab<IBaseGrip::ComboLabel*> options;
-    grip->GetComboOptions(item, options);
-    // The grip allocates fresh labels for the caller (MaxHeapOperators).
-    for (int i = 0; i < options.Count(); ++i) {
-        IBaseGrip::ComboLabel* option = options[i];
-        labels.push_back(option && option->mLabel.data() ? option->mLabel.data() : L"");
-        delete option;
-    }
-    return labels;
-}
-
-// Items and their labels. The rows are rebuilt when this changes, as when
-// a bridge pick item's label turns into the picked edge.
-static std::wstring CaddyLayoutSignature() {
-    IBaseGrip* grip = ActiveCaddy();
-    if (!grip) return L"";
-    std::wstring signature = std::to_wstring((uintptr_t)grip);
-    const int count = grip->GetNumGripItems();
-    for (int i = 0; i < count; ++i)
-        signature += L"|" + std::to_wstring(i) + L":" + CaddyItemText(grip, i);
-    return signature;
-}
-
-static bool CaddyLayoutChanged() {
-    return CaddyLayoutSignature() != g_caddyLayout;
-}
-
-static void CaddyEdited() {
-    RedrawCaddy();
-    if (!g_open) return;
-    InvalidateRect(g_panel, nullptr, FALSE);
-    if (CaddyLayoutChanged()) QueuePanelRefresh(PANEL_REFRESH_STRUCTURE);
-}
-
-static void EndCaddyEdit(bool accept) {
-    const CaddyEdit edit = g_caddyEdit;
-    g_caddyEdit = CaddyEdit();
-    if (!edit.grip) return;
-    const bool keep = accept && edit.changed;
-    if (edit.started) {
-        if (edit.grip == ActiveCaddy()) {
-            edit.grip->EndSetValue(edit.item, CaddyTime(), keep);
-        } else if (theHold.Holding()) {
-            // Max closed the caddy mid-edit; resolve the hold StartSetValue opened.
-            if (keep) theHold.Accept(_T("Caddy Parameter"));
-            else theHold.Cancel();
-        }
-    }
-    if (edit.ownHold && theHold.Holding()) {
-        if (keep) theHold.Accept(_T("Caddy Parameter"));
-        else theHold.Cancel();
-    }
-    CaddyEdited();
-}
-
-static bool BeginCaddyEdit(int item) {
-    EndCaddyEdit(false);
-    IBaseGrip* grip = BoundCaddy();
-    if (!grip) return false;
-    g_caddyEdit.grip = grip;
-    g_caddyEdit.item = item;
-    g_caddyEdit.started = grip->StartSetValue(item, CaddyTime());
-    // Grips start holds only for spinners. Toggles and combos get one here so
-    // they undo like other panel edits; commands and actions only switch modes.
-    const IBaseGrip::Type type = grip->GetType(item);
-    if (!g_caddyEdit.started && type != IBaseGrip::eAction &&
-        type != IBaseGrip::eCommand && !theHold.Holding()) {
-        theHold.Begin();
-        g_caddyEdit.ownHold = true;
-    }
-    return true;
-}
-
-static bool SetCaddyEditValue(IBaseGrip::GripValue value) {
-    if (!g_caddyEdit.grip || g_caddyEdit.grip != ActiveCaddy()) return false;
-    if (!g_caddyEdit.grip->SetValue(g_caddyEdit.item, CaddyTime(), value)) return false;
-    g_caddyEdit.changed = true;
-    RedrawCaddy();
-    return true;
-}
-
-static bool ApplyCaddyValue(int item, const IBaseGrip::GripValue& value) {
-    if (!BeginCaddyEdit(item)) return false;
-    const bool changed = SetCaddyEditValue(value);
-    EndCaddyEdit(changed);
-    return changed;
-}
-
-static bool GetCaddyValue(const EditField& ef, IBaseGrip::GripValue& value) {
-    value = EmptyGripValue();
-    IBaseGrip* grip = BoundCaddy();
-    return grip && grip->GetValue(ef.caddyItem, CaddyTime(), value);
 }
 
 // Grips may report success without filling an unranged bound, so the bounds
@@ -4081,306 +3920,6 @@ static void ClampGripValue(IBaseGrip* grip, int item, IBaseGrip::Type type,
         value.mFloat = std::clamp(value.mFloat, low.mFloat, high.mFloat);
     else if (type == IBaseGrip::eInt || type == IBaseGrip::eTime)
         value.mInt = std::clamp(value.mInt, low.mInt, high.mInt);
-}
-
-static void ClampCaddyValue(const EditField& ef, IBaseGrip::GripValue& value) {
-    ClampGripValue(BoundCaddy(), ef.caddyItem, ef.caddyType, value);
-}
-
-static void FormatCaddyValue(const EditField& ef, TCHAR* buf, int len) {
-    if (ef.caddyType == IBaseGrip::eStatus) { buf[0] = 0; return; }
-    if (ef.caddyType == IBaseGrip::eAction) { wcsncpy_s(buf, len, L"Run", _TRUNCATE); return; }
-    IBaseGrip::GripValue value;
-    if (!GetCaddyValue(ef, value)) { wcsncpy_s(buf, len, L"--", _TRUNCATE); return; }
-    switch (ef.caddyType) {
-    case IBaseGrip::eFloat:
-    case IBaseGrip::eUniverse:
-        swprintf(buf, len, _T("%.4g"), value.mFloat);
-        break;
-    case IBaseGrip::eTime:
-        swprintf(buf, len, _T("%d"), value.mInt / GetTicksPerFrame());
-        break;
-    case IBaseGrip::eToggle:
-        wcsncpy_s(buf, len, value.mbool ? L"On" : L"Off", _TRUNCATE);
-        break;
-    case IBaseGrip::eCommand:
-        wcsncpy_s(buf, len, value.mbool ? L"Picking" : L"Pick", _TRUNCATE);
-        break;
-    case IBaseGrip::eCombo:
-        if (value.mCombo >= 0 && value.mCombo < (int)ef.caddyOptions.size() &&
-            !ef.caddyOptions[value.mCombo].empty())
-            wcsncpy_s(buf, len, ef.caddyOptions[value.mCombo].c_str(), _TRUNCATE);
-        else
-            swprintf(buf, len, _T("%d"), value.mCombo);
-        break;
-    default:
-        swprintf(buf, len, _T("%d"), value.mInt);
-        break;
-    }
-}
-
-static IBaseGrip::GripValue CaddyValueFromParsed(const EditField& ef, const ParsedParamValue& parsed) {
-    IBaseGrip::GripValue value = EmptyGripValue();
-    if (IsCaddyFloat(ef.caddyType)) {
-        value.mFloat = parsed.real;
-    } else if (ef.caddyType == IBaseGrip::eTime) {
-        const int ticks = GetTicksPerFrame();
-        value.mInt = std::clamp(parsed.integer, INT_MIN / ticks, INT_MAX / ticks) * ticks;
-    } else if (ef.caddyType == IBaseGrip::eToggle || ef.caddyType == IBaseGrip::eCommand) {
-        value.mbool = parsed.integer != 0;
-    } else {
-        value.mInt = parsed.integer;
-    }
-    ClampCaddyValue(ef, value);
-    return value;
-}
-
-// Scrubbing matches parameter scrubbing: floats move 1% of their magnitude per
-// pixel, never slower than 1% of the caddy spinner's step; ints step every 3px.
-static bool ScrubCaddyValue(const EditField& ef, int dx, int& intAccum, bool shift, bool ctrl) {
-    IBaseGrip* grip = BoundCaddy();
-    IBaseGrip::GripValue value;
-    if (!grip || !GetCaddyValue(ef, value)) return false;
-    IBaseGrip::GripValue step = EmptyGripValue();
-    const bool hasStep = grip->GetScale(ef.caddyItem, step);
-    if (IsCaddyFloat(ef.caddyType)) {
-        const float minScale = hasStep && step.mFloat != 0.0f ? std::fabs(step.mFloat) * 0.01f : 0.001f;
-        float scale = std::max(std::fabs(value.mFloat) * 0.01f, minScale);
-        if (shift) scale *= 10.0f;
-        if (ctrl) scale *= 0.1f;
-        value.mFloat += (float)dx * scale;
-    } else if (ef.caddyType == IBaseGrip::eInt || ef.caddyType == IBaseGrip::eTime) {
-        intAccum += dx;
-        int steps = intAccum / 3;
-        if (steps == 0) return false;
-        intAccum -= steps * 3;
-        if (shift) steps *= 10;
-        const int unit = ef.caddyType == IBaseGrip::eTime ? GetTicksPerFrame()
-                       : hasStep && step.mInt > 0 ? step.mInt : 1;
-        value.mInt += steps * unit;
-    } else {
-        return false;
-    }
-    ClampCaddyValue(ef, value);
-    return SetCaddyEditValue(value);
-}
-
-static bool WheelCaddyValue(const EditField& ef, float step, bool shift, bool ctrl) {
-    IBaseGrip* grip = BoundCaddy();
-    IBaseGrip::GripValue value;
-    if (!grip || !GetCaddyValue(ef, value)) return false;
-    int intStep = (int)step;
-    if (shift) intStep *= 10;
-    if (ctrl && intStep != 0) intStep = intStep > 0 ? 1 : -1;
-    if (intStep == 0) intStep = step > 0 ? 1 : -1;
-    switch (ef.caddyType) {
-    case IBaseGrip::eFloat:
-    case IBaseGrip::eUniverse: {
-        const float a = std::fabs(value.mFloat);
-        float scale = a > 100.f ? 10.f : a > 10.f ? 1.f : a > 1.f ? 0.1f : 0.01f;
-        if (shift) scale *= 10.0f;
-        if (ctrl) scale *= 0.1f;
-        value.mFloat += step * scale;
-        break;
-    }
-    case IBaseGrip::eInt: {
-        IBaseGrip::GripValue unit = EmptyGripValue();
-        value.mInt += intStep * (grip->GetScale(ef.caddyItem, unit) && unit.mInt > 0 ? unit.mInt : 1);
-        break;
-    }
-    case IBaseGrip::eTime:
-        value.mInt += intStep * GetTicksPerFrame();
-        break;
-    case IBaseGrip::eToggle:
-        value.mbool = !value.mbool;
-        break;
-    case IBaseGrip::eCombo: {
-        const int count = (int)ef.caddyOptions.size();
-        if (count <= 0) return false;
-        value.mCombo = ((value.mCombo + (step > 0 ? 1 : -1)) % count + count) % count;
-        break;
-    }
-    default:
-        return false;
-    }
-    ClampCaddyValue(ef, value);
-    return ApplyCaddyValue(ef.caddyItem, value);
-}
-
-// Toggles flip, combos open their options, commands and actions run.
-static void ClickCaddyItem(int editIdx) {
-    if (editIdx < 0 || editIdx >= (int)g_edits.size()) return;
-    const EditField ef = g_edits[editIdx];  // a menu loop can rebuild g_edits
-    IBaseGrip* grip = BoundCaddy();
-    if (!grip) return;
-    IBaseGrip::GripValue value = EmptyGripValue();
-    switch (ef.caddyType) {
-    case IBaseGrip::eToggle:
-    case IBaseGrip::eCommand:
-        if (!GetCaddyValue(ef, value)) return;
-        value.mbool = !value.mbool;
-        ApplyCaddyValue(ef.caddyItem, value);
-        break;
-    case IBaseGrip::eAction:
-        value.mbool = true;
-        ApplyCaddyValue(ef.caddyItem, value);
-        break;
-    case IBaseGrip::eCombo: {
-        if (ef.caddyOptions.empty() || !GetCaddyValue(ef, value)) return;
-        HMENU menu = CreatePopupMenu();
-        if (!menu) return;
-        for (int i = 0; i < (int)ef.caddyOptions.size(); ++i)
-            AppendMenu(menu, MF_STRING | (i == value.mCombo ? MF_CHECKED : 0),
-                i + 1, ef.caddyOptions[i].c_str());
-        RECT rc; GetClientRect(g_panel, &rc);
-        POINT pt = { rc.right - kPad - kEditW, ef.logY - g_scrollY + kEditH + UiPx(2) };
-        ClientToScreen(g_panel, &pt);
-        g_caddyMenuOpen = true;
-        const int selected = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN,
-            pt.x, pt.y, 0, g_panel, nullptr);
-        g_caddyMenuOpen = false;
-        DestroyMenu(menu);
-        // The menu loop dispatches messages; the caddy may have closed meanwhile.
-        if (selected > 0 && BoundCaddy() == grip) {
-            value.mCombo = selected - 1;
-            ApplyCaddyValue(ef.caddyItem, value);
-        }
-        break;
-    }
-    default:
-        break;
-    }
-}
-
-// Right-click resets an item, as on the caddy's own spinners.
-static void ResetCaddyItem(int item) {
-    IBaseGrip* grip = BoundCaddy();
-    if (!grip) return;
-    EndCaddyEdit(false);
-    const bool ownHold = !theHold.Holding();
-    if (ownHold) theHold.Begin();
-    const bool changed = grip->ResetValue(CaddyTime(), item);
-    if (ownHold) {
-        if (changed) theHold.Accept(_T("Reset Caddy Parameter"));
-        else theHold.Cancel();
-    }
-    CaddyEdited();
-}
-
-static void RunCaddyCommand(int command) {
-    IBaseGrip* grip = BoundCaddy();
-    if (!grip) return;
-    EndCaddyEdit(false);
-    const TimeValue t = CaddyTime();
-    switch (command) {
-    case kCaddyOkay:   grip->Okay(t);  break;
-    case kCaddyApply:  grip->Apply(t); break;
-    case kCaddyCancel: grip->Cancel(); break;
-    }
-    RedrawCaddy();
-    QueuePanelRefresh(PANEL_REFRESH_STRUCTURE);
-}
-
-// Panel close and stack edits end the caddy the way its OK button does.
-static void AcceptCaddy() {
-    RunCaddyCommand(kCaddyOkay);
-}
-
-// While the panel shows a caddy, Max's in-viewport copy of it is hidden.
-static void BindCaddy(IBaseGrip* grip) {
-    if (grip != g_caddy) EndCaddyEdit(false);
-    g_caddy = grip;
-    IGripManager* gm = GetIGripManager();
-    if (gm && !g_caddyHidMax && gm->GetShow()) {
-        gm->SetShow(false);
-        g_caddyHidMax = true;
-    }
-}
-
-static void ForgetCaddy() {
-    EndCaddyEdit(false);
-    g_caddy = nullptr;
-    g_caddyLayout.clear();
-    if (g_caddyHidMax) {
-        if (IGripManager* gm = GetIGripManager()) gm->SetShow(true);
-        g_caddyHidMax = false;
-    }
-}
-
-// An Editable Poly tool drag still in progress is handed to its operation's
-// caddy. Opening the caddy exits the command mode, which aborts the drag; the
-// values the drag wrote to the parameter block stay and the caddy previews
-// them. A tool that is armed but not dragging is left alone.
-static void HandToolDragToCaddy() {
-    if constexpr (!kCaddyTakeover) return;
-    Interface* ip = GetCOREInterface();
-    if (!ip || !GetIGripManager() || ActiveCaddy()) return;
-    BaseObject* edited = ip->GetCurEditObject();
-    EPoly* ep = edited ? (EPoly*)edited->GetInterface(EPOLY_INTERFACE) : nullptr;
-    if (!ep) return;
-    // Extrude, bevel, inset and chamfer drags hold a super hold from the first
-    // click to the last; the outline drag is a preview instead.
-    bool dragging = theHold.GetSuperBeginDepth() > 0;
-    int op = -1;
-    switch (ep->EpActionGetCommandMode()) {
-    case epmode_chamfer_vertex:
-    case epmode_chamfer_edge:   op = epop_chamfer; break;
-    case epmode_extrude_vertex:
-    case epmode_extrude_edge:
-    case epmode_extrude_face:   op = epop_extrude; break;
-    case epmode_bevel:          op = epop_bevel;   break;
-    case epmode_inset_face:     op = epop_inset;   break;
-    case epmode_outline: {
-        op = epop_outline;
-        FPValue previewOn;
-        ep->Invoke(epfn_preview_on, previewOn);
-        dragging = previewOn.b;
-        break;
-    }
-    default: return;
-    }
-    if (!dragging) return;
-    FPValue opened;
-    FPParams popupParams(1, TYPE_ENUM, op);
-    ep->Invoke(epfn_popup_dialog, opened, &popupParams);
-}
-
-// The active caddy, if any, is the panel's first group. Every item the grip
-// reports gets a row: Max keeps per-item visible and enabled flags in its own
-// caddy UI, and those read false while the panel has that UI hidden.
-static void AddCaddyGroup() {
-    IBaseGrip* grip = kCaddyTakeover ? ActiveCaddy() : nullptr;
-    if (!grip) { ForgetCaddy(); return; }
-    BindCaddy(grip);
-    g_caddyLayout = CaddyLayoutSignature();
-
-    GroupHeader gh;
-    MSTR name; grip->GetGripName(name);
-    gh.title = name.data() && name.data()[0] ? name.data() : L"Caddy";
-    gh.collapseKey = L"caddy:" + gh.title;  // never collapsed or saved
-    gh.caddy = true;
-    gh.startIdx = (int)g_edits.size();
-    gh.actionStart = (int)g_actions.size();
-    if (grip->SupportsOkayApplyCancel()) {
-        g_actions.push_back({L"\x2713", nullptr, (FunctionID)kCaddyOkay, 0});
-        g_actions.push_back({L"+", nullptr, (FunctionID)kCaddyApply, 0});
-        g_actions.push_back({L"\x2717", nullptr, (FunctionID)kCaddyCancel, 0});
-        gh.actionCount = 3;
-    }
-    const int count = grip->GetNumGripItems();
-    for (int i = 0; i < count; ++i) {
-        const IBaseGrip::Type type = grip->GetType(i);
-        if (type == IBaseGrip::eInvalid) continue;
-        EditField ef;
-        ef.label = CaddyItemText(grip, i);
-        ef.type = CaddyParamType(type);
-        ef.caddyItem = i;
-        ef.caddyType = type;
-        if (type == IBaseGrip::eCombo) ef.caddyOptions = CaddyComboOptions(grip, i);
-        g_edits.push_back(std::move(ef));
-    }
-    gh.count = (int)g_edits.size() - gh.startIdx;
-    g_groups.push_back(gh);
 }
 
 // ── Caddy wheel ─────────────────────────────────────────────────
@@ -4486,11 +4025,12 @@ static void MaskAltMenu() {
 }
 
 // ── Last-operation retune ───────────────────────────────────────
-// With no caddy open, Ctrl, Shift or Alt + wheel over a viewport retunes the
-// Editable Poly operation just applied by hotkey, button or drag: it undoes
-// that one operation, steps a parameter and applies the operation again. It
-// acts only while that operation is still the newest undo entry: the selected
-// object is watched, and nothing undoable may have been recorded since.
+// The Editable Poly operation just applied, by hotkey, button, drag or the
+// panel's takeover, can be retuned: undo that one operation, change one of
+// its parameters and apply it again. Modifier + wheel and the panel's
+// operation group both do this. It acts only while the operation is still
+// the newest undo entry: the selected object is watched, and nothing
+// undoable may have been recorded since.
 struct RetuneState {
     EPoly* ep = nullptr;  // compared by address; called only while it is edited
     int op = -1;          // operation that is the newest undo entry, or -1
@@ -4501,6 +4041,7 @@ struct RetuneState {
 };
 static RetuneState g_retune;
 static bool g_retuning = false;  // the retune's own undo must not clear it
+static bool g_retuneUndone = false;  // that undo was carried out
 static bool g_retuneSettlePosted = false;
 
 static EPoly* EditedEPoly() {
@@ -4526,6 +4067,144 @@ static void RememberRetuneSeen(EPoly* ep, MNMesh* mesh, int op, int puts) {
     g_retune.seenFaces = mesh->numf;
 }
 
+// The operation just applied to ep is the newest undo entry.
+static void RecordRetuneOp(EPoly* ep) {
+    MNMesh* mesh = ep->GetMeshPtr();
+    g_retune.ep = ep;
+    g_retune.op = EPolyInt(ep, epfn_get_last_operation);
+    g_retune.puts = theHold.GetGlobalPutCount();
+    if (mesh) RememberRetuneSeen(ep, mesh, g_retune.op, g_retune.puts);
+}
+
+struct RetuneRow { const wchar_t* label; int param; int key; };  // key: CaddyWheelKey or -1
+
+// The parameters of each operation that can be retuned, at the current
+// sub-object level, and the title the panel gives it. Ctrl, Shift and Alt +
+// wheel step the keyed rows, after KeyHydra's defaults. Empty if the
+// operation has none.
+static std::wstring RetuneRows(EPoly* ep, int op, std::vector<RetuneRow>& rows) {
+    rows.clear();
+    const int level = EPolyInt(ep, epfn_get_epoly_sel_level);
+    const bool vertex = level == EP_SL_VERTEX;
+    const bool edge = level == EP_SL_EDGE || level == EP_SL_BORDER;
+    auto add = [&rows](const wchar_t* label, int param, int key = -1) {
+        rows.push_back({label, param, key});
+    };
+    switch (op) {
+    case epop_connect_edges:
+        add(L"Segments", ep_connect_edge_segments, kWheelCtrl);
+        add(L"Pinch", ep_connect_edge_pinch, kWheelShift);
+        add(L"Slide", ep_connect_edge_slide, kWheelAlt);
+        return L"Connect";
+    case epop_chamfer:
+        if (vertex) {
+            add(L"Amount", ep_vertex_chamfer, kWheelShift);
+            add(L"Segments", ep_vertex_chamfer_num_segments, kWheelCtrl);
+            add(L"Depth", ep_vertex_chamfer_depth, kWheelAlt);
+            add(L"Open", ep_vertex_chamfer_open);
+            return L"Chamfer Vertices";
+        }
+        add(L"Amount", ep_edge_chamfer, kWheelShift);
+        add(L"Segments", ep_edge_chamfer_segments, kWheelCtrl);
+        // Uniform, Radial and Patch mitering (2..4) shape with depth; Quad and
+        // Tri with tension.
+        if (ep->getParamBlock()->GetInt(ep_edge_chamfer_mitering_type) >= 2)
+            add(L"Depth", ep_edge_chamfer_depth, kWheelAlt);
+        else
+            add(L"Tension", ep_edge_chamfer_tension, kWheelAlt);
+        add(L"Open", ep_edge_chamfer_open);
+        return L"Chamfer Edges";
+    case epop_extrude:
+        if (vertex) {
+            add(L"Height", ep_vertex_extrude_height, kWheelShift);
+            add(L"Width", ep_vertex_extrude_width, kWheelAlt);
+            return L"Extrude Vertices";
+        }
+        if (edge) {
+            add(L"Height", ep_edge_extrude_height, kWheelShift);
+            add(L"Width", ep_edge_extrude_width, kWheelAlt);
+            return L"Extrude Edges";
+        }
+        add(L"Height", ep_face_extrude_height, kWheelShift);
+        return L"Extrude Polygons";
+    case epop_bevel:
+        add(L"Height", ep_bevel_height, kWheelShift);
+        add(L"Outline", ep_bevel_outline, kWheelAlt);
+        return L"Bevel";
+    case epop_inset:
+        add(L"Amount", ep_inset, kWheelShift);
+        return L"Inset";
+    case epop_outline:
+        add(L"Amount", ep_outline, kWheelShift);
+        return L"Outline";
+    case epop_bridge_edge:
+        add(L"Segments", ep_bridge_segments, kWheelCtrl);
+        add(L"Smooth", ep_bridge_smooth_thresh, kWheelShift);
+        add(L"Adjacent", ep_bridge_adjacent, kWheelAlt);
+        return L"Bridge Edges";
+    case epop_bridge_border:
+    case epop_bridge_polygon:
+        add(L"Segments", ep_bridge_segments, kWheelCtrl);
+        add(L"Taper", ep_bridge_taper, kWheelShift);
+        add(L"Bias", ep_bridge_bias, kWheelAlt);
+        add(L"Smooth", ep_bridge_smooth_thresh);
+        add(L"Twist 1", ep_bridge_twist_1);
+        add(L"Twist 2", ep_bridge_twist_2);
+        return L"Bridge";
+    case epop_lift_from_edge:
+        add(L"Angle", ep_lift_angle, kWheelShift);
+        add(L"Segments", ep_lift_segments, kWheelCtrl);
+        return L"Hinge";
+    case epop_weld_sel:
+        add(L"Threshold", vertex ? ep_weld_threshold : ep_edge_weld_threshold, kWheelShift);
+        return L"Weld";
+    case epop_relax:
+        add(L"Amount", ep_relax_amount, kWheelShift);
+        add(L"Iterations", ep_relax_iters, kWheelCtrl);
+        return L"Relax";
+    case epop_meshsmooth:
+        add(L"Smoothness", ep_ms_smoothness, kWheelAlt);
+        return L"MeshSmooth";
+    case epop_tessellate:
+        add(L"Tension", ep_tess_tension, kWheelAlt);
+        return L"Tessellate";
+    case epop_extrude_along_spline:
+        add(L"Segments", ep_extrude_spline_segments, kWheelCtrl);
+        add(L"Taper", ep_extrude_spline_taper, kWheelShift);
+        add(L"Twist", ep_extrude_spline_twist, kWheelAlt);
+        return L"Extrude Along Spline";
+    default:
+        return L"";
+    }
+}
+
+// The Editable Poly whose last operation can be retuned now, or null.
+static EPoly* RetuneCandidate() {
+    EPoly* ep = EditedEPoly();
+    if (!ep || ep != g_retune.ep || g_retune.op < 0 || theHold.Holding() ||
+        g_retune.puts != theHold.GetGlobalPutCount() ||
+        EPolyInt(ep, epfn_get_last_operation) != g_retune.op) return nullptr;
+    FPValue previewOn;
+    ep->Invoke(epfn_preview_on, previewOn);
+    std::vector<RetuneRow> rows;
+    return !previewOn.b && !RetuneRows(ep, g_retune.op, rows).empty() ? ep : nullptr;
+}
+
+// Identifies the operation group the panel would show now.
+static std::wstring RetuneGroupSignature() {
+    EPoly* ep = RetuneCandidate();
+    if (!ep) return L"";
+    std::vector<RetuneRow> rows;
+    std::wstring signature = std::to_wstring((uintptr_t)ep) + L":" + RetuneRows(ep, g_retune.op, rows);
+    for (const RetuneRow& row : rows) signature += L"|" + std::to_wstring(row.param);
+    return signature;
+}
+
+static void NotifyRetuneGroup() {
+    if (g_open && RetuneGroupSignature() != g_retuneGroupShown)
+        QueuePanelRefresh(PANEL_REFRESH_STRUCTURE);
+}
+
 static void PostRetuneSettle() {
     if (g_retuneSettlePosted || !g_panel) return;
     g_retuneSettlePosted = PostMessage(g_panel, WM_FS_RETUNE_SETTLE, 0, 0) != FALSE;
@@ -4541,6 +4220,7 @@ static void SettleRetune() {
     MNMesh* mesh = ep ? ep->GetMeshPtr() : nullptr;
     if (!mesh) {
         g_retune = RetuneState();
+        NotifyRetuneGroup();
         return;
     }
     if (theHold.Holding()) return;
@@ -4558,72 +4238,73 @@ static void SettleRetune() {
         g_retune.puts = puts;
     }
     RememberRetuneSeen(ep, mesh, op, puts);
-}
-
-// The parameter each key steps, after KeyHydra's defaults: Ctrl a count,
-// Shift the main amount, Alt the second one. -1 when the key has none.
-static int RetuneParam(EPoly* ep, int op, CaddyWheelKey key) {
-    const bool ctrl = key == kWheelCtrl, shift = key == kWheelShift, alt = key == kWheelAlt;
-    const int level = EPolyInt(ep, epfn_get_epoly_sel_level);
-    switch (op) {
-    case epop_connect_edges:
-        return ctrl ? ep_connect_edge_segments : shift ? ep_connect_edge_pinch : ep_connect_edge_slide;
-    case epop_chamfer:
-        if (level == EP_SL_VERTEX)
-            return ctrl ? ep_vertex_chamfer_num_segments : shift ? ep_vertex_chamfer : ep_vertex_chamfer_depth;
-        if (ctrl) return ep_edge_chamfer_segments;
-        if (shift) return ep_edge_chamfer;
-        // Uniform, Radial and Patch mitering (2..4) shape with depth; Quad and
-        // Tri with tension.
-        return ep->getParamBlock()->GetInt(ep_edge_chamfer_mitering_type) >= 2
-            ? ep_edge_chamfer_depth : ep_edge_chamfer_tension;
-    case epop_extrude:
-        if (level == EP_SL_VERTEX)
-            return shift ? ep_vertex_extrude_height : alt ? ep_vertex_extrude_width : -1;
-        if (level == EP_SL_EDGE || level == EP_SL_BORDER)
-            return shift ? ep_edge_extrude_height : alt ? ep_edge_extrude_width : -1;
-        return shift ? ep_face_extrude_height : -1;
-    case epop_bevel:
-        return shift ? ep_bevel_height : alt ? ep_bevel_outline : -1;
-    case epop_inset:
-        return shift ? ep_inset : -1;
-    case epop_outline:
-        return shift ? ep_outline : -1;
-    case epop_bridge_edge:
-        return ctrl ? ep_bridge_segments : shift ? ep_bridge_smooth_thresh : ep_bridge_adjacent;
-    case epop_bridge_border:
-    case epop_bridge_polygon:
-        return ctrl ? ep_bridge_segments : shift ? ep_bridge_taper : ep_bridge_bias;
-    case epop_lift_from_edge:
-        return ctrl ? ep_lift_segments : shift ? ep_lift_angle : -1;
-    case epop_weld_sel:
-        return shift ? (level == EP_SL_VERTEX ? ep_weld_threshold : ep_edge_weld_threshold) : -1;
-    default:
-        return -1;
-    }
-}
-
-// The parameter to step, or -1 unless the last operation can be retuned now.
-static int RetuneTarget(CaddyWheelKey key, EPoly*& ep) {
-    ep = EditedEPoly();
-    if (!ep || ep != g_retune.ep || g_retune.op < 0 || theHold.Holding() ||
-        g_retune.puts != theHold.GetGlobalPutCount() ||
-        EPolyInt(ep, epfn_get_last_operation) != g_retune.op) return -1;
-    FPValue previewOn;
-    ep->Invoke(epfn_preview_on, previewOn);
-    return previewOn.b ? -1 : RetuneParam(ep, g_retune.op, key);
+    NotifyRetuneGroup();
 }
 
 struct RetuneValue { ParamType2 type; float f; int i; };
 
+static RetuneValue ReadRetuneValue(IParamBlock2* pb, ParamID id, TimeValue t) {
+    RetuneValue value = { (ParamType2)pb->GetParamDef(id).type, 0.0f, 0 };
+    if (IsFloat(value.type)) value.f = pb->GetFloat(id, t);
+    else value.i = pb->GetInt(id, t);
+    return value;
+}
+
+static void WriteRetuneValue(IParamBlock2* pb, ParamID id, TimeValue t, const RetuneValue& value) {
+    if (IsFloat(value.type)) pb->SetValue(id, t, ClampPB2Float(pb, id, value.type, value.f));
+    else if (value.type == TYPE_BOOL) pb->SetValue(id, t, value.i ? 1 : 0);
+    else pb->SetValue(id, t, ClampPB2Int(pb, id, value.type, value.i));
+}
+
+// Undoes the operation, sets one of its parameters and applies it again.
+// Changes nothing unless the operation is still the newest undo entry.
+static bool ApplyRetune(ParamID id, const RetuneValue& value) {
+    Interface* ip = GetCOREInterface();
+    EPoly* ep = RetuneCandidate();
+    IParamBlock2* pb = ep ? ep->getParamBlock() : nullptr;
+    if (!ip || !pb) return false;
+    const TimeValue t = ip->GetTime();
+    const int op = g_retune.op;
+    // Undoing an operation applied by a drag also restores the values the drag
+    // set, so every parameter of the operation is carried across the undo.
+    std::vector<RetuneRow> rows;
+    RetuneRows(ep, op, rows);
+    std::vector<RetuneValue> kept;
+    for (const RetuneRow& row : rows) kept.push_back(ReadRetuneValue(pb, (ParamID)row.param, t));
+
+    g_retuning = true;
+    g_retuneUndone = false;
+    ip->ExecuteMAXCommand(MAXCOM_EDIT_UNDO);
+    // Max skips Undo while a mouse button is held; applying the operation
+    // then would stack it on itself.
+    const bool undone = g_retuneUndone;
+    if (undone && EditedEPoly() == ep) {
+        for (size_t i = 0; i < rows.size(); ++i) WriteRetuneValue(pb, (ParamID)rows[i].param, t, kept[i]);
+        WriteRetuneValue(pb, id, t, value);
+        FPValue result;
+        FPParams opParam(1, TYPE_ENUM, op);
+        ep->Invoke(epfn_button_op, result, &opParam);
+    }
+    g_retuning = false;
+
+    // The reapplied operation is the newest undo entry; record that so the
+    // settle its notifications queue sees no other change.
+    if (EditedEPoly() == ep) RecordRetuneOp(ep);
+    else g_retune = RetuneState();
+    ip->RedrawViews(t);
+    NotifyRetuneGroup();
+    if (g_open) InvalidateRect(g_panel, nullptr, FALSE);
+    return undone && EditedEPoly() == ep;
+}
+
 // Counts step by one and signed whole numbers such as pinch by a fortieth of
 // their range. 0..1 values step 0.05, angles 5% but at least a degree, other
-// amounts 5% of their size but at least 0.01.
+// amounts 5% of their size but at least 0.01. Switches flip.
 static bool NextRetuneValue(IParamBlock2* pb, ParamID id, int notches, TimeValue t, RetuneValue& next) {
     const ParamDef& def = pb->GetParamDef(id);
-    next.type = (ParamType2)def.type;
+    next = ReadRetuneValue(pb, id, t);
     if (IsFloat(next.type)) {
-        const float value = pb->GetFloat(id, t);
+        const float value = next.f;
         float step;
         if (next.type == TYPE_ANGLE)
             step = std::max(std::fabs(value) * 0.05f, DegToRad(1.0f));
@@ -4634,8 +4315,12 @@ static bool NextRetuneValue(IParamBlock2* pb, ParamID id, int notches, TimeValue
         next.f = ClampPB2Float(pb, id, next.type, value + (float)notches * step);
         return next.f != value;
     }
+    if (next.type == TYPE_BOOL) {
+        next.i = next.i ? 0 : 1;
+        return true;
+    }
     if (IsInt(next.type)) {
-        const int value = pb->GetInt(id, t);
+        const int value = next.i;
         int step = 1;
         if ((def.flags & P_HAS_RANGE) && def.range_low.i < 0)
             step = std::max(1, (def.range_high.i - def.range_low.i) / 40);
@@ -4645,41 +4330,242 @@ static bool NextRetuneValue(IParamBlock2* pb, ParamID id, int notches, TimeValue
     return false;
 }
 
+// The parameter a modifier key steps, or -1 unless the last operation can be
+// retuned now.
+static int RetuneTarget(CaddyWheelKey key, EPoly*& ep) {
+    ep = RetuneCandidate();
+    if (!ep) return -1;
+    std::vector<RetuneRow> rows;
+    RetuneRows(ep, g_retune.op, rows);
+    for (const RetuneRow& row : rows)
+        if (row.key == key) return row.param;
+    return -1;
+}
+
 static void RunRetuneStep(CaddyWheelKey key, int notches) {
-    Interface* ip = GetCOREInterface();
-    if (!ip) return;
     EPoly* ep = nullptr;
     const int param = RetuneTarget(key, ep);
-    IParamBlock2* pb = param >= 0 ? ep->getParamBlock() : nullptr;
-    if (!pb) return;
-    const TimeValue t = ip->GetTime();
     RetuneValue next;
-    if (!NextRetuneValue(pb, (ParamID)param, notches, t, next)) return;
+    if (param >= 0 && NextRetuneValue(ep->getParamBlock(), (ParamID)param, notches, CaddyTime(), next))
+        ApplyRetune((ParamID)param, next);
+}
 
-    // Undo restores the mesh and selection the operation started from; a drag
-    // also restores the values it set, so the new value is applied after it.
-    const int op = g_retune.op;
-    g_retuning = true;
-    ip->ExecuteMAXCommand(MAXCOM_EDIT_UNDO);
-    if (EditedEPoly() == ep) {
-        if (IsFloat(next.type)) pb->SetValue((ParamID)param, t, next.f);
-        else pb->SetValue((ParamID)param, t, next.i);
-        FPValue result;
-        FPParams opParam(1, TYPE_ENUM, op);
+// ── Operation takeover ──────────────────────────────────────────
+// Opening the panel takes over an Editable Poly operation still in progress,
+// whatever Max shows for it: a caddy or settings dialog is accepted as its OK
+// would, and a tool drag is applied with the values it reached. The panel's
+// operation group then retunes the result.
+
+// The operation a tool is dragging, or -1. Extrude, bevel, inset and chamfer
+// drags hold a super hold from the first click to the last; the outline drag
+// is a preview instead.
+static int ToolDragOperation(EPoly* ep) {
+    const bool dragging = theHold.GetSuperBeginDepth() > 0;
+    switch (ep->EpActionGetCommandMode()) {
+    case epmode_chamfer_vertex:
+    case epmode_chamfer_edge:  return dragging ? epop_chamfer : -1;
+    case epmode_extrude_vertex:
+    case epmode_extrude_edge:
+    case epmode_extrude_face:  return dragging ? epop_extrude : -1;
+    case epmode_bevel:         return dragging ? epop_bevel : -1;
+    case epmode_inset_face:    return dragging ? epop_inset : -1;
+    case epmode_outline: {
+        FPValue previewOn;
+        ep->Invoke(epfn_preview_on, previewOn);
+        return previewOn.b ? epop_outline : -1;
+    }
+    default:
+        return -1;
+    }
+}
+
+static void TakeOverOperation() {
+    Interface* ip = GetCOREInterface();
+    EPoly* ep = EditedEPoly();
+    IParamBlock2* pb = ep ? ep->getParamBlock() : nullptr;
+    if (!ip || !pb) return;
+    const TimeValue t = ip->GetTime();
+    FPValue result;
+    const int dragOp = ToolDragOperation(ep);
+    if (dragOp >= 0) {
+        // Exiting the tool aborts its drag, which restores the values the drag
+        // set; they are put back before the operation is applied with them.
+        std::vector<RetuneRow> rows;
+        RetuneRows(ep, dragOp, rows);
+        std::vector<RetuneValue> reached;
+        for (const RetuneRow& row : rows) reached.push_back(ReadRetuneValue(pb, (ParamID)row.param, t));
+        ep->Invoke(epfn_exit_command_modes, result);
+        for (size_t i = 0; i < rows.size(); ++i) WriteRetuneValue(pb, (ParamID)rows[i].param, t, reached[i]);
+        FPParams opParam(1, TYPE_ENUM, dragOp);
         ep->Invoke(epfn_button_op, result, &opParam);
+    } else {
+        FPValue previewOn;
+        ep->Invoke(epfn_preview_on, previewOn);
+        if (!previewOn.b) return;
+        if (IBaseGrip* grip = ActiveCaddy()) {
+            grip->Okay(t);
+        } else {
+            // A settings dialog: accepting first keeps closing it from cancelling.
+            ep->Invoke(epfn_preview_accept, result);
+            ep->Invoke(epfn_close_popup_dialog, result);
+        }
     }
-    g_retuning = false;
-
-    // The reapplied operation is the newest undo entry; record that so the
-    // settle its notifications queue sees no other change.
-    MNMesh* mesh = EditedEPoly() == ep ? ep->GetMeshPtr() : nullptr;
-    if (!mesh) {
-        g_retune = RetuneState();
-        return;
-    }
-    g_retune.puts = theHold.GetGlobalPutCount();
-    RememberRetuneSeen(ep, mesh, EPolyInt(ep, epfn_get_last_operation), g_retune.puts);
+    RecordRetuneOp(ep);
     ip->RedrawViews(t);
+}
+
+// ── Panel operation group ───────────────────────────────────────
+// The panel's first group shows the parameters of the operation that can be
+// retuned. Every edit undoes the operation and applies it again, so the
+// group needs no preview, caddy or dialog and never leaves one open.
+
+static void AddRetuneGroup() {
+    g_retuneGroupShown = RetuneGroupSignature();
+    EPoly* ep = g_retuneGroupShown.empty() ? nullptr : RetuneCandidate();
+    if (!ep) return;
+    IParamBlock2* pb = ep->getParamBlock();
+    std::vector<RetuneRow> rows;
+    GroupHeader gh;
+    gh.title = RetuneRows(ep, g_retune.op, rows);
+    gh.collapseKey = L"retune:" + gh.title;  // never collapsed or saved
+    gh.retune = true;
+    gh.startIdx = (int)g_edits.size();
+    gh.actionStart = (int)g_actions.size();
+    g_actions.push_back({L"\x2717", nullptr, (FunctionID)0, 0});  // remove the operation
+    gh.actionCount = 1;
+    for (const RetuneRow& row : rows) {
+        EditField ef;
+        ef.label = row.label;
+        ef.pb = pb;
+        ef.id = (ParamID)row.param;
+        ef.type = (ParamType2)pb->GetParamDef(ef.id).type;
+        ef.retune = true;
+        g_edits.push_back(std::move(ef));
+    }
+    gh.count = (int)g_edits.size() - gh.startIdx;
+    g_groups.push_back(gh);
+}
+
+// The group's ✗ removes the operation, like Ctrl+Z.
+static void UndoRetuneOp() {
+    Interface* ip = GetCOREInterface();
+    if (ip && RetuneCandidate()) ip->ExecuteMAXCommand(MAXCOM_EDIT_UNDO);
+}
+
+static IParamBlock2* RetuneRowBlock(const EditField& ef) {
+    EPoly* ep = ef.retune ? RetuneCandidate() : nullptr;
+    IParamBlock2* pb = ep ? ep->getParamBlock() : nullptr;
+    return pb == ef.pb ? pb : nullptr;
+}
+
+// Clicks, drags and typing that change a parameter wait for the mouse
+// buttons to be released, as Max skips Undo while one is held. Until then the
+// row shows the value that will be applied.
+struct RetunePending { bool active = false; ParamID id = 0; RetuneValue value = {}; };
+static RetunePending g_retunePending;
+
+static void QueueRetuneSet(ParamID id, const RetuneValue& value) {
+    g_retunePending.active = true;
+    g_retunePending.id = id;
+    g_retunePending.value = value;
+    if (g_panel) SetTimer(g_panel, kRetuneSetTimerId, 15, nullptr);
+    if (g_open) InvalidateRect(g_panel, nullptr, FALSE);
+}
+
+static void RunRetuneSet() {
+    const bool buttonDown = GetAsyncKeyState(VK_LBUTTON) < 0 ||
+        GetAsyncKeyState(VK_RBUTTON) < 0 || GetAsyncKeyState(VK_MBUTTON) < 0;
+    if (g_retunePending.active && (buttonDown || g_panelStackEditing)) return;
+    KillTimer(g_panel, kRetuneSetTimerId);
+    if (!g_retunePending.active) return;
+    const RetunePending pending = g_retunePending;
+    g_retunePending = RetunePending();
+    ApplyRetune(pending.id, pending.value);
+}
+
+static bool PendingRetuneValue(const EditField& ef, RetuneValue& value) {
+    if (!ef.retune || !g_retunePending.active || g_retunePending.id != ef.id) return false;
+    value = g_retunePending.value;
+    return true;
+}
+
+// The value a row edit starts from: the one waiting to be applied, if any.
+static RetuneValue CurrentRetuneValue(IParamBlock2* pb, const EditField& ef) {
+    RetuneValue value;
+    return PendingRetuneValue(ef, value) ? value : ReadRetuneValue(pb, ef.id, CaddyTime());
+}
+
+// Typed values are in degrees for angles, like Max's own spinners.
+static void TypeRetuneRow(const EditField& ef, const ParsedParamValue& parsed) {
+    IParamBlock2* pb = RetuneRowBlock(ef);
+    if (!pb) return;
+    RetuneValue value = ReadRetuneValue(pb, ef.id, CaddyTime());
+    if (value.type == TYPE_ANGLE) value.f = DegToRad(parsed.real);
+    else if (IsFloat(value.type)) value.f = parsed.real;
+    else value.i = parsed.integer;
+    QueueRetuneSet(ef.id, value);
+}
+
+static void WheelRetuneRow(const EditField& ef, float step) {
+    IParamBlock2* pb = RetuneRowBlock(ef);
+    const int notches = step > 0 ? std::max(1, (int)step) : std::min(-1, (int)step);
+    RetuneValue next;
+    if (pb && NextRetuneValue(pb, ef.id, notches, CaddyTime(), next)) ApplyRetune(ef.id, next);
+}
+
+static void ToggleRetuneRow(const EditField& ef) {
+    IParamBlock2* pb = RetuneRowBlock(ef);
+    if (!pb) return;
+    RetuneValue value = CurrentRetuneValue(pb, ef);
+    value.i = value.i ? 0 : 1;
+    QueueRetuneSet(ef.id, value);
+}
+
+// Right-click resets a parameter to its default, as on Max's spinners.
+static void ResetRetuneRow(const EditField& ef) {
+    IParamBlock2* pb = RetuneRowBlock(ef);
+    if (!pb) return;
+    const ParamDef& def = pb->GetParamDef(ef.id);
+    RetuneValue value = ReadRetuneValue(pb, ef.id, CaddyTime());
+    if (IsFloat(value.type)) value.f = def.def.f;
+    else value.i = def.def.i;
+    QueueRetuneSet(ef.id, value);
+}
+
+// Scrubbing measures from the value at the press, 1% of its size per pixel
+// (at least 0.001, or 0.5 degrees for angles), whole numbers every 3 pixels.
+struct RetuneScrub { bool active = false; ParamID id = 0; RetuneValue start = {}; int pixels = 0; };
+static RetuneScrub g_retuneScrub;
+
+static void BeginRetuneScrub(const EditField& ef) {
+    IParamBlock2* pb = RetuneRowBlock(ef);
+    g_retuneScrub = RetuneScrub();
+    if (!pb) return;
+    g_retuneScrub.active = true;
+    g_retuneScrub.id = ef.id;
+    g_retuneScrub.start = CurrentRetuneValue(pb, ef);
+}
+
+static bool ScrubRetuneRow(const EditField& ef, int dx, bool shift, bool ctrl) {
+    IParamBlock2* pb = RetuneRowBlock(ef);
+    if (!pb || !g_retuneScrub.active || g_retuneScrub.id != ef.id) return false;
+    g_retuneScrub.pixels += dx;
+    const RetuneValue& start = g_retuneScrub.start;
+    RetuneValue next = start;
+    if (IsFloat(start.type)) {
+        const float floor = start.type == TYPE_ANGLE ? DegToRad(0.5f) : 0.001f;
+        float scale = std::max(std::fabs(start.f) * 0.01f, floor);
+        if (shift) scale *= 10.0f;
+        if (ctrl) scale *= 0.1f;
+        next.f = ClampPB2Float(pb, ef.id, start.type, start.f + (float)g_retuneScrub.pixels * scale);
+    } else if (IsInt(start.type)) {
+        next.i = ClampPB2Int(pb, ef.id, start.type,
+                             start.i + g_retuneScrub.pixels / 3 * (shift ? 10 : 1));
+    } else {
+        return false;
+    }
+    QueueRetuneSet(ef.id, next);
+    return IsFloat(start.type) ? next.f != start.f : next.i != start.i;
 }
 
 // ── Creation wheel ──────────────────────────────────────────────
@@ -4809,8 +4695,11 @@ static void RetuneNotifyCB(void*, NotifyInfo* info) {
     switch (info->intcode) {
     case NOTIFY_SCENE_UNDO:
     case NOTIFY_SCENE_REDO:
+        if (g_retuning) {
+            g_retuneUndone = info->intcode == NOTIFY_SCENE_UNDO;
+            return;
+        }
         // Undo and redo record no puts, so the newest entry changes unseen.
-        if (g_retuning) return;
         g_retune = RetuneState();
         PostRetuneSettle();
         return;
@@ -4911,6 +4800,7 @@ static void GatherParams() {
     g_pb1ValueCache.clear();
     g_nodeName.clear();
     g_nodeHandle = 0;
+    g_retuneGroupShown.clear();
     g_ctx = CTX_NONE;
     g_epolyForButtons = nullptr;
     g_splineForButtons = nullptr;
@@ -4931,7 +4821,7 @@ static void GatherParams() {
     Object* obj = node->GetObjectRef();
     if (!obj) return;
 
-    AddCaddyGroup();
+    AddRetuneGroup();
 
     // ── EPoly detection (sub-object buttons and tool tooltip) ──
     if (EPoly* ep = FindEPoly(node)) {
@@ -5134,7 +5024,20 @@ static void UpdatePB1FallbackTimer() {
 }
 
 static void FormatValue(const EditField& ef, TimeValue t, TCHAR* buf, int len) {
-    if (ef.caddyItem >= 0) { FormatCaddyValue(ef, buf, len); return; }
+    // Operation rows show a value waiting for the mouse release, and angles
+    // in degrees, like Max's own spinners.
+    RetuneValue pending;
+    if (PendingRetuneValue(ef, pending)) {
+        if (pending.type == TYPE_ANGLE) swprintf(buf, len, _T("%.4g"), RadToDeg(pending.f));
+        else if (IsFloat(pending.type)) swprintf(buf, len, _T("%.4g"), pending.f);
+        else if (pending.type == TYPE_BOOL) swprintf(buf, len, _T("%s"), pending.i ? _T("On") : _T("Off"));
+        else swprintf(buf, len, _T("%d"), pending.i);
+        return;
+    }
+    if (ef.retune && ef.type == TYPE_ANGLE && ef.pb) {
+        swprintf(buf, len, _T("%.4g"), RadToDeg(ef.pb->GetFloat(ef.id, t)));
+        return;
+    }
     // Spline op values — read from local storage (sentinel-marked IDs)
     if (!ef.pb && (int)ef.id >= kSpSentinel && (int)ef.id < kSpSentinel + kSpCount) {
         swprintf(buf, len, _T("%.4g"), g_splineVals[(int)ef.id - kSpSentinel]);
@@ -5749,12 +5652,12 @@ static void PaintPanel(HWND hwnd) {
         if (gh.mod) modActive = gh.mod->TestAFlag(A_MOD_BEING_EDITED);
 
         // Title — dim if disabled, accent if active
-        COLORREF titleClr = gh.caddy ? kAccent
+        COLORREF titleClr = gh.retune ? kAccent
                           : !modEnabled ? RGB(100, 100, 100)
                           : modActive ? kAccent
                           : kGroupClr;
         SetTextColor(mem, titleClr);
-        std::wstring hdr = gh.caddy ? gh.title
+        std::wstring hdr = gh.retune ? gh.title
             : (collapsed ? L"\x25B8 " : L"\x25BE ") + gh.title;
         if (!modEnabled) hdr += L"  [OFF]";
         int titleRight = rEdge;
@@ -5797,11 +5700,10 @@ static void PaintPanel(HWND hwnd) {
             int editX = rEdge - kEditW;
             for (int fi = gh.startIdx; fi < gh.startIdx + gh.count; fi++) {
                 auto& ef = g_edits[fi];
-                const bool isCaddy = ef.caddyItem >= 0;
-                bool isFav = !isCaddy && g_favorites.count(FieldKey(ef)) > 0;
+                bool isFav = g_favorites.count(FieldKey(ef)) > 0;
                 bool isHover = (fi == g_hoverParam);
                 bool isEditing = (fi == g_editParam && g_editHwnd);
-                bool isHidden = !isCaddy && g_visEditMode && g_hidden.count(ef.key) > 0;
+                bool isHidden = !ef.retune && g_visEditMode && g_hidden.count(ef.key) > 0;
 
                 // In vis edit mode: dim hidden params, show eye indicator
                 COLORREF lblClr = isHidden ? RGB(80, 80, 80) : kLabelClr;
@@ -5809,15 +5711,7 @@ static void PaintPanel(HWND hwnd) {
 
                 // Label
                 SelectObject(mem, g_font);
-                if (isCaddy && ef.caddyType == IBaseGrip::eStatus) {
-                    // Status items are text only, across the row.
-                    SetTextColor(mem, lblClr);
-                    RECT statusRect = { x + UiPx(8), y, rEdge, y + kLineH };
-                    DrawText(mem, ef.label.c_str(), -1, &statusRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-                    y += kLineH;
-                    continue;
-                }
-                if (g_visEditMode && !isCaddy) {
+                if (g_visEditMode && !ef.retune) {
                     // Eye icon: open for visible, closed for hidden
                     SetTextColor(mem, isHidden ? RGB(100, 50, 50) : RGB(50, 100, 50));
                     TextOut(mem, x, y + UiPx(3), isHidden ? _T("\u25CB") : _T("\u25C9"), 1);
@@ -5825,7 +5719,7 @@ static void PaintPanel(HWND hwnd) {
                     SetTextColor(mem, kAccent); TextOut(mem, x, y + UiPx(3), _T("\u2605"), 1);
                 }
                 SetTextColor(mem, lblClr);
-                RECT labelRect = { x + UiPx(((g_visEditMode && !isCaddy) || isFav) ? 14 : 8), y,
+                RECT labelRect = { x + UiPx(((g_visEditMode && !ef.retune) || isFav) ? 14 : 8), y,
                     editX - UiPx(6), y + kLineH };
                 DrawText(mem, ef.label.c_str(), -1, &labelRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
@@ -5841,7 +5735,7 @@ static void PaintPanel(HWND hwnd) {
                     TCHAR buf[64]; FormatValue(ef, tv, buf, 64);
                     SelectObject(mem, g_fontBold);
                     SetTextColor(mem, valClr);
-                    DrawText(mem, buf, -1, &vr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+                    DrawText(mem, buf, -1, &vr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
                 }
                 y += kLineH;
             }
@@ -5900,8 +5794,8 @@ static void KillActiveEdit(bool apply) {
             EnableAccelerators();
             return;
         }
-        if (ef.caddyItem >= 0) {
-            ApplyCaddyValue(ef.caddyItem, CaddyValueFromParsed(ef, value));
+        if (ef.retune) {
+            TypeRetuneRow(ef, value);
         } else if (!ef.pb && (int)ef.id >= kSpSentinel && (int)ef.id < kSpSentinel + kSpCount) {
             // Spline op values (sentinel-marked IDs)
             int idx = (int)ef.id - kSpSentinel;
@@ -6493,7 +6387,7 @@ static void CancelFavDrag() {
 static void CancelPanelValueDrag() {
     if (!g_lmbDragging) return;
     HWND capture = GetCapture();
-    EndCaddyEdit(false);
+    g_retuneScrub = RetuneScrub();
     FinishSplineFakeDrag(false);
     g_lmbDragging = false;
     g_lmbDragIdx = -1;
@@ -6859,9 +6753,9 @@ static void ProcessPanelRefresh() {
     if (flags & (PANEL_REFRESH_STACK | PANEL_REFRESH_STRUCTURE))
         RefreshModSearchForStack();
 
-    // Caddies show and hide items and relabel them as values change; rebuild
-    // when the rows no longer match, unless a caddy value is being scrubbed.
-    if (!g_caddyEdit.grip && CaddyLayoutChanged())
+    // The operation group comes and goes with the operation that can be
+    // retuned; keep it while one of its values is being scrubbed.
+    if (!g_retuneScrub.active && RetuneGroupSignature() != g_retuneGroupShown)
         flags |= PANEL_REFRESH_STRUCTURE;
 
     if (flags & PANEL_REFRESH_STRUCTURE) {
@@ -6916,9 +6810,6 @@ static void MovePanelModifier(int index, int direction, Modifier* expectedModifi
     if (theHold.Holding()) return;
     INode* node = ip->GetSelNode(0);
     if (!node || node->GetHandle() != g_nodeHandle) return;
-
-    // Suspending the modify panel ends the caddy; commit it as its OK would.
-    AcceptCaddy();
 
     // Real references keep the original objects alive across remove/insert and
     // any rollback. They are released only after editing has resumed.
@@ -7079,11 +6970,12 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int editX = rc2.right - kPad - kEditW;
             if (idx >= 0 && pt.x >= editX && pt.y >= g_contentStartY) {
                 const EditField& clicked = g_edits[idx];
-                if (clicked.caddyItem >= 0 && !IsCaddyNumber(clicked.caddyType)) {
-                    ClickCaddyItem(idx);
-                } else if (clicked.caddyItem >= 0) {
-                    // Caddy spinners scrub too; StartSetValue opens the hold
-                    // once the drag moves, so a plain click only types.
+                if (clicked.retune && clicked.type == TYPE_BOOL) {
+                    ToggleRetuneRow(clicked);
+                } else if (clicked.retune) {
+                    // Operation values scrub too; each step retunes the
+                    // operation, so no hold is opened. A plain click types.
+                    BeginRetuneScrub(clicked);
                     g_lmbDragging = true;
                     g_lmbDragIdx  = idx;
                     g_lmbDragStartX = pt.x;
@@ -7116,7 +7008,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Vis edit mode: click on param toggles its visibility
         if (g_visEditMode) {
             int idx = FindParamAtY(pt.y);
-            if (idx >= 0 && idx < (int)g_edits.size() && g_edits[idx].caddyItem < 0) {
+            if (idx >= 0 && idx < (int)g_edits.size() && !g_edits[idx].retune) {
                 const std::wstring& key = g_edits[idx].key;
                 if (g_hidden.count(key)) g_hidden.erase(key);
                 else g_hidden.insert(key);
@@ -7132,10 +7024,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             const GroupHeader& clickedGroup = g_groups[gIdx];
             int headerY = GroupHeaderY(gIdx);
             int actionIdx = HitGroupAction(clickedGroup, headerY, pw - kPad, pt);
-            if (clickedGroup.caddy) {
-                const int globalActionIdx = clickedGroup.actionStart + actionIdx;
-                if (actionIdx >= 0 && globalActionIdx < (int)g_actions.size())
-                    RunCaddyCommand((int)g_actions[globalActionIdx].fnId);
+            if (clickedGroup.retune) {
+                if (actionIdx >= 0) UndoRetuneOp();
                 return 0;
             }
             if (actionIdx >= 0) {
@@ -7202,7 +7092,6 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     int mi = findModIdx(g_groups[gIdx].mod);
                     if (mi > 0) {
                         std::wstring s = L"deleteModifier $ " + std::to_wstring(mi);
-                        AcceptCaddy();
                         ExecuteMAXScriptScript(s.c_str(), MAXScript::ScriptSource::Dynamic);
                         GatherParams(); BuildLayout();
                         RefreshFavoritesStrip();
@@ -7276,8 +7165,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         // Right-click on param → toggle favorite
         int idx = FindParamAtY(rpt.y);
-        if (idx >= 0 && idx < (int)g_edits.size() && g_edits[idx].caddyItem >= 0) {
-            ResetCaddyItem(g_edits[idx].caddyItem);
+        if (idx >= 0 && idx < (int)g_edits.size() && g_edits[idx].retune) {
+            ResetRetuneRow(g_edits[idx]);
             return 0;
         }
         if (idx >= 0 && idx < (int)g_edits.size()) {
@@ -7302,7 +7191,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_lmbDragIdx  = -1;
             ReleaseCapture();
             HideDragTip();
-            EndCaddyEdit(moved && changed);
+            g_retuneScrub.active = false;
             bool commit = FinishSplineFakeDrag(moved && changed);
             if (commit) {
                 if (g_lmbDragOwnHold && theHold.Holding())
@@ -7347,13 +7236,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 int selCount = ip ? ip->GetSelNodeCount() : 0;
                 bool splineFakeDrag = IsSplineValueField(ef);
 
-                if (ef.caddyItem >= 0) {
-                    if (!g_caddyEdit.grip && !BeginCaddyEdit(ef.caddyItem)) {
-                        CancelPanelValueDrag();
-                        return 0;
-                    }
-                    g_lmbDragChanged |= ScrubCaddyValue(
-                        ef, dx, g_lmbDragAccum, shift, ctrl);
+                if (ef.retune) {
+                    g_lmbDragChanged |= ScrubRetuneRow(ef, dx, shift, ctrl);
                 } else if (splineFakeDrag) {
                     g_lmbDragChanged |= UpdateSplineFakeDrag(
                         ef, dx, shift, ctrl);
@@ -7398,7 +7282,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                 }
 
-                if (ip && !splineFakeDrag && ef.caddyItem < 0) {
+                if (ip && !splineFakeDrag && !ef.retune) {
                     for (int ni = 0; ni < selCount; ni++) {
                         INode* nd = ip->GetSelNode(ni);
                         if (nd) nd->NotifyDependents(FOREVER, PART_ALL, REFMSG_CHANGE);
@@ -7412,7 +7296,7 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 // Show drag tooltip with current value
                 POINT scr; GetCursorPos(&scr);
                 std::wstring tip = ef.label + L": ";
-                if (IsSplineValueField(ef) || ef.caddyItem >= 0) {
+                if (IsSplineValueField(ef) || ef.retune) {
                     wchar_t buf[64];
                     FormatValue(ef, t, buf, 64);
                     tip += buf;
@@ -7532,8 +7416,8 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             Interface* ip = GetCOREInterface();
             TimeValue t = ip ? ip->GetTime() : 0;
 
-            if (ef.caddyItem >= 0) {
-                WheelCaddyValue(ef, step, shift, ctrl);
+            if (ef.retune) {
+                WheelRetuneRow(ef, step);
             } else if (!ef.pb && (int)ef.id >= kSpSentinel && (int)ef.id < kSpSentinel + kSpCount) {
                 // Spline op values (sentinel-marked)
                 int idx = (int)ef.id - kSpSentinel;
@@ -7613,12 +7497,15 @@ static LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             QueuePanelRefresh(PANEL_REFRESH_VALUES);
             return 0;
         }
+        if (wp == kRetuneSetTimerId) {
+            RunRetuneSet();
+            return 0;
+        }
         break;
 
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) {
-            if (BoundCaddy()) RunCaddyCommand(kCaddyCancel);
-            else ClosePanel();
+            ClosePanel();
             return 0;
         }
         break;
@@ -7654,14 +7541,14 @@ static void OpenPanel() {
     SetWindowPos(g_panel, nullptr, cursor.x, cursor.y, 1, 1,
         SWP_NOZORDER | SWP_NOACTIVATE);
     RefreshPanelScale(GetDpiForWindow(g_panel));
-    HandToolDragToCaddy();
+    TakeOverOperation();
     GatherParams();
 
     // Auto-collapse groups with 10+ params on first encounter
     static std::set<std::wstring> g_autoCollapseSeen;
     for (auto& gh : g_groups) {
         const auto& collapseKey = GroupCollapseKey(gh);
-        if (!gh.caddy && gh.count >= 10 && !g_autoCollapseSeen.count(collapseKey)) {
+        if (!gh.retune && gh.count >= 10 && !g_autoCollapseSeen.count(collapseKey)) {
             g_autoCollapseSeen.insert(collapseKey);
             g_collapsed.insert(collapseKey);
         }
@@ -7671,9 +7558,9 @@ static void OpenPanel() {
     HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = { sizeof(mi) }; GetMonitorInfo(hMon, &mi);
 
-    // Offset panel away from cursor when it shows a caddy so the model stays visible
+    // Offset panel away from cursor when it shows an operation so the model stays visible
     int ox, oy;
-    if (g_caddy) {
+    if (!g_retuneGroupShown.empty()) {
         ox = pt.x + UiPx(120);  oy = pt.y - UiPx(60);
     } else {
         ox = pt.x - kMinW / 2;  oy = pt.y;
@@ -7722,22 +7609,20 @@ static void OpenPanel() {
     }
     g_modSearch = false;
 
-    // A caddy leaves focus in the viewport so Max's shortcuts keep working
-    if (!g_caddy) SetFocus(g_panel);
+    // An operation leaves focus in the viewport so Max's shortcuts keep working
+    if (g_retuneGroupShown.empty()) SetFocus(g_panel);
 }
 
 static void ClosePanel() {
     if (!g_open) return;
-    if (g_scaleMenuOpen || g_caddyMenuOpen) EndMenu();
+    if (g_scaleMenuOpen) EndMenu();
     StopPanelObservers();
     KillTimer(g_panel, kPB1FallbackTimerId);
     if (g_screenGrabState != SCREEN_GRAB_NONE)
         EndScreenGrab(false);
     ExitModSearch();
     if (g_modSearchEdit) ShowWindow(g_modSearchEdit, SW_HIDE);
-    // Closing the panel accepts the caddy it showed, like the caddy's OK.
-    AcceptCaddy();
-    ForgetCaddy();
+    g_retuneGroupShown.clear();
 
     KillActiveEdit(false);
     CancelPanelValueDrag();
@@ -8070,7 +7955,6 @@ public:
         if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
         ModStack::Shutdown();
         PowerShader::Shutdown();
-        ForgetCaddy();
         ClosePanel();
         StopPanelObservers();
         if (g_panelNodeWatcher) {
